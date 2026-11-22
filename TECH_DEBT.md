@@ -56,6 +56,24 @@ registered in the Env. The error says what to do.
 - *Fix:* record which adapter owns each converted position, and call a `decode_value`
   hook there.
 
+### Field readers run eagerly, for every reachable field
+Each evaluation converts every object reachable from the variables, so every field's
+`reader` runs even when the expression never reads that field. With Django, that means
+one query per reverse relation per object (N+1 across lists) unless the caller
+prefetches. This is documented on `schema.Field` as the contract.
+- *Fix:* convert only the field paths the program references (`Program.references`),
+  or convert struct fields lazily on first access. Either changes when, and how often,
+  readers run, so do it before cortado depends on the current behaviour.
+- *Found:* M3 review.
+
+### Host function results ignore the declared result type
+A function annotated `-> Order` has its result converted by `infer_value`, so the
+`Order` struct's readers (and its field types) are not used, and a non-dict object
+fails with "returned an unsupported value".
+- *Fix:* convert results with `value_from_py` against the declared result type and the
+  readers, or reject struct result types.
+- *Found:* M3 review (predates M3).
+
 ## Verifier
 
 ### Comprehensions over a nullable list are not modeled

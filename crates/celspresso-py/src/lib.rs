@@ -211,14 +211,24 @@ fn date_from_py(obj: &Bound<'_, PyAny>) -> PyResult<i64> {
     Ok(date::days_from_civil(y, m, d))
 }
 
-/// Custom field readers: struct name -> field name -> callable(containing object) -> value.
-type Readers = HashMap<String, HashMap<String, Py<PyAny>>>;
+/// Custom field readers, passed per call from Python (never stored here, so the GC
+/// sees them): {struct name: {field name: callable(containing object) -> value}}.
+type Readers<'a, 'py> = Option<&'a Bound<'py, PyDict>>;
 
 /// Read field `name` from a mapping or an object (Pydantic model, dataclass, ...), or
-/// with the field's custom reader if it has one.
-fn get_field<'py>(obj: &Bound<'py, PyAny>, name: &str, reader: Option<&Py<PyAny>>) -> PyResult<Option<Bound<'py, PyAny>>> {
+/// with the field's custom reader if it has one. A reader's exception propagates, with
+/// a note naming the field (a schema path, never a value).
+fn get_field<'py>(
+    obj: &Bound<'py, PyAny>,
+    name: &str,
+    reader: Option<Bound<'py, PyAny>>,
+    path: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
     if let Some(f) = reader {
-        return f.bind(obj.py()).call1((obj,)).map(Some);
+        return f.call1((obj,)).map(Some).map_err(|e| {
+            let _ = e.value(obj.py()).call_method1("add_note", (format!("while reading field '{path}'"),));
+            e
+        });
     }
     if let Ok(d) = obj.cast::<PyDict>() {
         return d.get_item(name);
@@ -229,7 +239,7 @@ fn get_field<'py>(obj: &Bound<'py, PyAny>, name: &str, reader: Option<&Py<PyAny>
     }
 }
 
-fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers: &Readers, path: &str) -> PyResult<Value> {
+fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers: Readers, path: &str) -> PyResult<Value> {
     match ty {
         CelType::Nullable(inner) => {
             if obj.is_none() {
@@ -346,10 +356,17 @@ fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers:
                 return Err(conv_err(path, name, obj));
             }
             let mut fields = BTreeMap::new();
-            let struct_readers = readers.get(name);
+            let struct_readers = match readers {
+                Some(r) => r.get_item(name)?.map(|d| d.cast_into::<PyDict>()).transpose()?,
+                None => None,
+            };
             for f in &sd.fields {
                 let fpath = format!("{path}.{}", f.name);
-                match get_field(obj, &f.name, struct_readers.and_then(|r| r.get(&f.name)))? {
+                let reader = match &struct_readers {
+                    Some(d) => d.get_item(&f.name)?,
+                    None => None,
+                };
+                match get_field(obj, &f.name, reader, &fpath)? {
                     Some(v) => {
                         fields.insert(f.name.clone(), value_from_py(&v, &f.ty, schema, readers, &fpath)?);
                     }
@@ -476,7 +493,6 @@ fn compile_source(schema: &Arc<Schema>, defs: &BTreeMap<String, Definition>, src
 struct Core {
     schema: Arc<Schema>,
     defs: BTreeMap<String, Definition>,
-    readers: Arc<Readers>,
 }
 
 /// One tabulated call: (arguments, returned normally, result value or error message).
@@ -500,7 +516,8 @@ fn value_literal(v: &Value) -> Option<Literal> {
 impl Core {
     /// structs: [(name, [(field, type, constraints)])]; vars: [(name, type, constraints)];
     /// functions: [(name, overload_id, receiver, [param types], result type)]; defs: [(name, source)];
-    /// readers: {struct: {field: callable}}
+    /// readers: {struct: [fields with a custom reader]}, checked here; the callables
+    /// themselves are passed to each evaluate call
     #[new]
     #[pyo3(signature = (structs, vars, functions, defs, readers=None))]
     fn new(
@@ -508,7 +525,7 @@ impl Core {
         vars: Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>,
         functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>, Option<ContractSpec<'_>>)>,
         defs: Vec<(String, String, Option<Vec<(String, Bound<'_, PyAny>)>>)>,
-        readers: Option<HashMap<String, HashMap<String, Py<PyAny>>>>,
+        readers: Option<HashMap<String, Vec<String>>>,
     ) -> PyResult<Self> {
         let mut s = Schema::with_stdlib();
         for (name, fields) in structs {
@@ -522,7 +539,6 @@ impl Core {
             s.vars.insert(name.clone(), VarDecl { name, ty: type_from_py(&t)?, constraints: constraints_from_py(c.as_ref())? });
         }
         let mut contracts = Vec::new();
-        let no_readers = Readers::new(); // table values are scalars
         for (name, id, receiver, params, result, ensures) in functions {
             let params = params.iter().map(type_from_py).collect::<PyResult<Vec<_>>>()?;
             let result = type_from_py(&result)?;
@@ -534,13 +550,10 @@ impl Core {
                         for (args, ok, r) in rows {
                             let mut lits = Vec::new();
                             for (a, t) in args.iter().zip(&params) {
-                                lits.extend(value_from_py(a, t, &s, &no_readers, &name).ok().as_ref().and_then(value_literal));
+                                lits.extend(value_from_py(a, t, &s, None, &name).ok().as_ref().and_then(value_literal));
                             }
-                            let res = if ok {
-                                value_from_py(&r, &result, &s, &no_readers, &name).ok().as_ref().and_then(value_literal)
-                            } else {
-                                None
-                            };
+                            let res =
+                                if ok { value_from_py(&r, &result, &s, None, &name).ok().as_ref().and_then(value_literal) } else { None };
                             if lits.len() != params.len() || (ok && res.is_none()) {
                                 out.clear();
                                 break;
@@ -613,17 +626,17 @@ impl Core {
             let Some(decl) = s.structs.get(st) else {
                 return Err(PyValueError::new_err(format!("readers given for unknown struct '{st}'")));
             };
-            if let Some(f) = fields.keys().find(|f| !decl.fields.iter().any(|d| &d.name == *f)) {
+            if let Some(f) = fields.iter().find(|f| !decl.fields.iter().any(|d| &d.name == *f)) {
                 return Err(PyValueError::new_err(format!("reader given for unknown field '{st}.{f}'")));
             }
         }
         let schema = Arc::new(s);
-        Ok(Core { schema, defs: defmap, readers: Arc::new(readers) })
+        Ok(Core { schema, defs: defmap })
     }
 
     fn compile(&self, source: &str) -> PyResult<Program> {
         let checked = compile_source(&self.schema, &self.defs, source)?;
-        Ok(Program { checked: Arc::new(checked), source: source.to_string(), readers: self.readers.clone() })
+        Ok(Program { checked: Arc::new(checked), source: source.to_string() })
     }
 
     /// Type of a definition (for diagnostics / docs).
@@ -636,7 +649,6 @@ impl Core {
 struct Program {
     checked: Arc<CheckedExpr>,
     source: String,
-    readers: Arc<Readers>,
 }
 
 /// (max_cost, max_iterations, max_string_len, max_list_len, max_regex_size) from Python.
@@ -651,7 +663,7 @@ fn limits(spec: Option<LimitsSpec>) -> Limits {
     }
 }
 
-fn activation(py_vars: &Bound<'_, PyDict>, schema: &Schema, readers: &Readers) -> PyResult<HashMap<String, Value>> {
+fn activation(py_vars: &Bound<'_, PyDict>, schema: &Schema, readers: Readers) -> PyResult<HashMap<String, Value>> {
     let mut act = HashMap::new();
     for (k, v) in py_vars.iter() {
         let name: String = k.extract()?;
@@ -705,15 +717,16 @@ impl Program {
             .collect()
     }
 
-    #[pyo3(signature = (vars, functions=None, limits=None))]
+    #[pyo3(signature = (vars, functions=None, limits=None, readers=None))]
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
         vars: &Bound<'py, PyDict>,
         functions: Option<&Bound<'py, PyDict>>,
         limits: Option<LimitsSpec>,
+        readers: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let act = activation(vars, &self.checked.schema, &self.readers)?;
+        let act = activation(vars, &self.checked.schema, readers)?;
         let funcs = PyFunctions::from_dict(functions)?;
         match evaluate(&self.checked, &act, &funcs, self::limits(limits)) {
             Ok(v) => value_to_py(py, &v),
@@ -722,15 +735,16 @@ impl Program {
     }
 
     /// Returns (ok, value_or_message, [(start, end, ok, value_or_message)] in pre-order).
-    #[pyo3(signature = (vars, functions=None, limits=None))]
+    #[pyo3(signature = (vars, functions=None, limits=None, readers=None))]
     fn explain<'py>(
         &self,
         py: Python<'py>,
         vars: &Bound<'py, PyDict>,
         functions: Option<&Bound<'py, PyDict>>,
         limits: Option<LimitsSpec>,
+        readers: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let act = activation(vars, &self.checked.schema, &self.readers)?;
+        let act = activation(vars, &self.checked.schema, readers)?;
         let funcs = PyFunctions::from_dict(functions)?;
         let (r, trace) = evaluate_traced(&self.checked, &act, &funcs, self::limits(limits));
         let nodes = PyList::empty(py);

@@ -241,8 +241,14 @@ class Field:
     `reader`, if given, is called with the containing object instead and returns the
     value, e.g. `lambda claim: list(claim.lines.all())` for a related-object manager
     that isn't itself a list. Whatever it returns is converted and validated against the
-    field's type as usual; an exception it raises propagates. Readers affect evaluation
-    only: proofs are about the field's type and constraints."""
+    field's type as usual; an exception it raises propagates, with a note naming the
+    field. Readers affect evaluation only: proofs are about the field's type and
+    constraints, and a verdict's `Witness` (raw solver data) is evaluated without them.
+
+    Conversion is eager: on each evaluation, every reader of every object reachable from
+    the variables passed runs once, whether or not the expression reads that field. Make
+    readers cheap (prefetch related rows first) or leave expensive data out of the
+    variables."""
 
     name: str
     type: TypeRef

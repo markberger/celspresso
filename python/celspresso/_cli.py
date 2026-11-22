@@ -42,7 +42,7 @@ from ._env import Env, Predicate, Problem, RuleCheck
 from ._errors import CelError, CelEvaluationError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from ._verdict import Witness
 
@@ -386,7 +386,7 @@ class Change:
         return f"{_SINGULAR[self.section]} {self.name}"
 
 
-def _outcome(p: Predicate, data: dict[str, Any]) -> str:
+def _outcome(p: Predicate, data: Mapping[str, Any]) -> str:
     try:
         return "true" if p.evaluate(data) else "false"
     except CelEvaluationError as e:
@@ -450,11 +450,10 @@ def _rule_change(
         return Change(name, "unchanged", a, b, reason="rewritten, but proved equivalent")
     if v.unknown:
         return Change(name, "undecided", a, b, reason=v.reason)
-    examples = []
     witnesses = pa.diff(pb, limit=limit, assuming=assuming, timeout=timeout)
-    for w in witnesses or ([v.witness] if v.witness else []):
-        data = w.to_python()
-        examples.append(Example(w, _outcome(pa, data), _outcome(pb, data)))
+    examples = [
+        Example(w, _outcome(pa, w), _outcome(pb, w)) for w in witnesses or ([v.witness] if v.witness else [])
+    ]
     return Change(name, "changed", a, b, examples)
 
 

@@ -239,7 +239,8 @@ class Env:
         ]
         try:
             defs = [(n, src, None if ps is None else list(ps)) for n, src, ps in self._defs]
-            self._core = _core.Core(structs, variables, fns, defs, self._builder.readers)
+            readers = {n: list(fs) for n, fs in self._builder.readers.items()}
+            self._core = _core.Core(structs, variables, fns, defs, readers)
         except _core.CompileError as exc:
             # a definition (or a function's ensures contract) failed to compile
             _raise_compile(exc)
@@ -255,6 +256,8 @@ class Env:
                     for n, (k, a) in self._builder.owners.items()
                 )
             ),
+            # ...nor does the schema alone: readers change what evaluate sees
+            tuple(sorted((n, f, id(r)) for n, fs in self._builder.readers.items() for f, r in fs.items())),
             tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
             tuple((n, src, repr(ps)) for n, src, ps in self._defs),
         )
@@ -529,7 +532,7 @@ class Env:
         (a boolean sub-expression with no boolean sub-expression inside) the way `w`
         does. Conditions over macro loop variables are skipped; the clause must
         exclude `w` itself, or None is returned."""
-        data = dict(w)
+        data = w  # raw solver values: replayed without field readers
         values: dict[str, bool | None] = {}
         for e in exprs:
             ex = e.explain(data)
@@ -654,7 +657,7 @@ def _failure(pred: Predicate, v: Verdict) -> str:
     cause = ""
     if v.witness is not None:
         try:
-            pred.evaluate(v.witness.to_python())
+            pred.evaluate(v.witness)
         except CelEvaluationError as e:
             cause = f" ({e.message})"
         except Exception:  # noqa: BLE001 - the cause is a nicety; the witness is the evidence
@@ -884,9 +887,14 @@ class Expr(Generic[T]):
     # -- evaluation -------------------------------------------------------
 
     def evaluate(self, data: Mapping[str, Any] | None = None) -> T:
-        """Evaluate against a mapping of variable values (models, dicts, scalars)."""
+        """Evaluate against a mapping of variable values (models, dicts, scalars).
+
+        A `Witness` from a verdict can be passed as is: its values are the solver's raw
+        data, so fields are read by name, not by their custom readers."""
         try:
-            raw = self._prog.evaluate(dict(data or {}), self._env._fn_impls, self._env._limits)
+            raw = self._prog.evaluate(
+                dict(data or {}), self._env._fn_impls, self._env._limits, self._readers(data)
+            )
         except _core.EvalError as exc:
             msg, eid, a, b, rendered = exc.args
             raise CelEvaluationError(msg, eid, (a, b), rendered) from None
@@ -894,8 +902,15 @@ class Expr(Generic[T]):
 
     def explain(self, data: Mapping[str, Any] | None = None) -> Explanation:
         """Evaluate and record the value of every sub-expression."""
-        ok, value, nodes = self._prog.explain(dict(data or {}), self._env._fn_impls, self._env._limits)
+        ok, value, nodes = self._prog.explain(
+            dict(data or {}), self._env._fn_impls, self._env._limits, self._readers(data)
+        )
         return Explanation(self.source, ok, value, [(a, b, k, v) for (a, b, k, v) in nodes])
+
+    def _readers(self, data: Mapping[str, Any] | None) -> dict[str, dict[str, Any]] | None:
+        if isinstance(data, Witness) or not self._env._builder.readers:
+            return None
+        return self._env._builder.readers
 
     # -- comparisons that build predicates --------------------------------
 

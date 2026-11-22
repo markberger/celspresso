@@ -1,6 +1,5 @@
 """Native core (Rust). Private: use the `celspresso` package API instead."""
 
-from collections.abc import Callable
 from typing import Any, TypeAlias
 
 TypeSpec: TypeAlias = Any
@@ -26,12 +25,14 @@ class Program:
         vars: dict[str, Any],
         functions: dict[str, Any] | None = None,
         limits: tuple[int, int, int, int, int] | None = None,
+        readers: dict[str, dict[str, Any]] | None = None,
     ) -> Any: ...
     def explain(
         self,
         vars: dict[str, Any],
         functions: dict[str, Any] | None = None,
         limits: tuple[int, int, int, int, int] | None = None,
+        readers: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[bool, Any, list[tuple[int, int, bool, Any]]]: ...
 
 #: (parameter names, ensures source, total, table rows of (args, ok, result or error))
@@ -44,7 +45,7 @@ class Core:
         vars: list[tuple[str, TypeSpec, Constraints]],
         functions: list[tuple[str, str, bool, list[TypeSpec], TypeSpec, _ContractSpec | None]],
         defs: list[tuple[str, str, list[tuple[str, TypeSpec]] | None]],
-        readers: dict[str, dict[str, Callable[[Any], Any]]] | None = None,
+        readers: dict[str, list[str]] | None = None,
     ) -> None: ...
     def compile(self, source: str) -> Program: ...
     def definition_names(self) -> list[str]: ...
