@@ -10,7 +10,16 @@ from typing import Any, Generic, Literal, TypeVar, overload
 
 from . import _celspresso as _core
 from ._errors import CelError, CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
-from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, lower, type_name
+from ._types import (
+    SchemaBuilder,
+    TypeSpec,
+    cel_literal,
+    contains_fixed,
+    from_cel,
+    lower,
+    type_name,
+    witness_to_host,
+)
 from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness, lookup
 from .schema import Struct, TypeRef, _contains_fixed
 
@@ -341,7 +350,7 @@ class Env:
                     raise ValueError(f"invalid parameter name {p!r}")
             specs = tuple((p, e._builder.convert(tp, f"{name}({p})")[0]) for p, tp in params.items())
             for p, sp in specs:
-                _no_fixed(sp, f"define '{name}' parameter '{p}'")
+                _no_fixed(sp, f"define '{name}' parameter '{p}'", e._builder)
         e._defs = (*self._defs, (name, source, specs))
         e._build()
         return e
@@ -813,8 +822,8 @@ def _tabulate(name: str, f: Callable[..., Any], domains: list[list[Any] | None])
     return tuple(_call_row(name, f, args) for args in itertools.product(*finite))
 
 
-def _no_fixed(spec: TypeSpec, where: str) -> None:
-    if _contains_fixed(spec):
+def _no_fixed(spec: TypeSpec, where: str, builder: SchemaBuilder) -> None:
+    if contains_fixed(spec, builder):
         raise TypeError(
             f"{where}: fixed-point (Decimal) values can't cross a function boundary yet; pass cents as int"
         )
@@ -830,13 +839,13 @@ def _function_decl(f: Callable[..., Any], builder: SchemaBuilder) -> _Fn:
         if p.name not in hints:
             raise TypeError(f"function '{name}': parameter '{p.name}' needs a type hint")
         spec, cons = builder.convert(hints[p.name], f"{name}({p.name})")
-        _no_fixed(spec, f"function '{name}' parameter '{p.name}'")
+        _no_fixed(spec, f"function '{name}' parameter '{p.name}'", builder)
         params.append(spec)
         domains.append(_domain(spec, cons))
     if "return" not in hints:
         raise TypeError(f"function '{name}' needs a return type hint")
     result = builder.convert(hints["return"], f"{name} result")[0]
-    _no_fixed(result, f"function '{name}' result")
+    _no_fixed(result, f"function '{name}' result", builder)
     names = tuple(sig.parameters)
     ensures = getattr(f, "__cel_ensures__", None)
     if ensures is not None and "result" in names:
@@ -909,7 +918,7 @@ class Expr(Generic[T]):
         return f"{type(self).__name__}({self.source!r}, type={self.output_type})"
 
     def __hash__(self) -> int:
-        return hash((self._env._fingerprint, self.canonical))
+        return hash((self._env._fingerprint, self.canonical, repr(self._spec)))
 
     def __eq__(self, other: object) -> bool:
         """Syntactic identity: same environment and same canonical text.
@@ -924,7 +933,11 @@ class Expr(Generic[T]):
 
     def same_as(self, other: Expr[Any]) -> bool:
         """Syntactic identity (same env, same canonical text); the same as `==`."""
-        return self._env._fingerprint == other._env._fingerprint and self.canonical == other.canonical
+        return (
+            self._env._fingerprint == other._env._fingerprint
+            and self.canonical == other.canonical
+            and self._spec == other._spec
+        )
 
     # -- evaluation -------------------------------------------------------
 
@@ -937,7 +950,7 @@ class Expr(Generic[T]):
         and readers run on it."""
         try:
             raw = self._prog.evaluate(
-                dict(data or {}), self._env._fn_impls, self._env._limits, self._readers(data)
+                self._host(data), self._env._fn_impls, self._env._limits, self._readers(data)
             )
         except _core.EvalError as exc:
             msg, eid, a, b, rendered = exc.args
@@ -947,9 +960,18 @@ class Expr(Generic[T]):
     def explain(self, data: Mapping[str, Any] | None = None) -> Explanation:
         """Evaluate and record the value of every sub-expression."""
         ok, value, nodes = self._prog.explain(
-            dict(data or {}), self._env._fn_impls, self._env._limits, self._readers(data)
+            self._host(data), self._env._fn_impls, self._env._limits, self._readers(data)
         )
         return Explanation(self.source, ok, value, [(a, b, k, v) for (a, b, k, v) in nodes])
+
+    def _host(self, data: Mapping[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(data, Witness):
+            return dict(data or {})
+        # a witness holds raw CEL values: give fixed-point units back as Decimals
+        specs = self._env._specs()
+        return {
+            k: witness_to_host(v, specs[k], self._env._builder) if k in specs else v for k, v in data.items()
+        }
 
     def _readers(self, data: Mapping[str, Any] | None) -> dict[str, dict[str, Any]] | None:
         if isinstance(data, Witness) or not self._env._builder.readers:

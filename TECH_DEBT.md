@@ -82,6 +82,23 @@ otherwise. CEL also lets a rule add a `fixed(8, 2)` to a `fixed(8, 3)` or to a c
   itself and int literals), so results and mistakes are found without a hint.
 - *Found:* M4.
 
+### `T.fixed` allows at most 15 digits
+`NUMERIC(18, 2)` and `NUMERIC(19, 4)`, common money columns, are rejected. The digit
+bound ±(10**digits − 1) becomes a constraint, and constraints are doubles (see the
+first entry), which are exact only up to 2**53.
+- *Fix:* the exact-bounds fix above; then allow up to 18 digits (int64 units).
+- *Found:* M4 review.
+
+### Fixed-point values have rough edges outside the main path
+- `adapters.constraints_from` turns a Decimal bound into an unscaled float and drops
+  `max_digits`/`decimal_places`; a third-party adapter should pass the annotation
+  (`Annotated[Decimal, ...]`) to `ctx.field` instead, as the Pydantic adapter does.
+- `Annotated[T.fixed(8, 2), Field(ge=Decimal("1.00"))]` reads the Decimal bound as units.
+- Witnesses and messages print raw units (`order.total = 35538376`), not `355383.76`.
+- *Fix:* scale or reject Decimal bounds on `T.fixed`; render fixed witness values with
+  their decimal form.
+- *Found:* M4 review.
+
 ## Verifier
 
 ### Comprehensions over a nullable list are not modeled

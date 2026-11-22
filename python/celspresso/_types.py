@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import decimal
 import enum
+import fractions
 import functools
 import math
 import sys
@@ -117,12 +118,15 @@ class SchemaContext:
         return self._b.type_hints(cls)
 
     def _convert(self, tp: Any, constraints: Constraints | None, where: str) -> tuple[TypeRef, Constraints]:
-        cons: dict[str, Any] = dict(constraints._spec() or {}) if constraints is not None else {}
+        # explicit constraints apply to the converted type, in its own terms (units for a
+        # fixed-point Decimal), so they are merged after the annotation's own metadata
+        explicit: dict[str, Any] = dict(constraints._spec() or {}) if constraints is not None else {}
         if isinstance(tp, TypeRef):  # e.g. T.list(ref) of a ref this context returned
             self._b._check_refs(tp._spec, where, by_name=False)
-            return tp, _constraints_of(cons)
+            return tp, _constraints_of(explicit)
+        cons: dict[str, Any] = {}
         spec = self._b._convert(tp, cons, where)
-        return TypeRef._unchecked(spec), _constraints_of(cons)
+        return TypeRef._unchecked(spec), _constraints_of({**cons, **explicit})
 
 
 class _Id:
@@ -296,6 +300,9 @@ class SchemaBuilder:
         """Return (type spec, constraints) for a Python annotation."""
         cons: dict[str, Any] = {}
         spec = self._convert(tp, cons, where)
+        cons = {k: v for k, v in cons.items() if not k.startswith("_")}  # unused precision
+        if "items" in cons:
+            cons["items"] = {k: v for k, v in cons["items"].items() if not k.startswith("_")}
         return spec, (cons or None)
 
     # -- adapter support ----------------------------------------------------
@@ -475,6 +482,11 @@ class SchemaBuilder:
 _NUMERIC = {"int", "uint", "double", "fixed"}
 
 
+def _scaled(d: decimal.Decimal, places: int) -> fractions.Fraction:
+    """`d * 10**places`, exactly (Decimal arithmetic rounds to the context's precision)."""
+    return fractions.Fraction(d) * 10**places
+
+
 def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
     """`Decimal` with Pydantic's `max_digits` and `decimal_places`: `fixed`, with its
     bounds (given in the field's own terms, e.g. `le=Decimal("999.99")`) moved to units."""
@@ -492,15 +504,19 @@ def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
         if key not in cons:
             continue
         raw = cons.pop(key)
-        units = (decimal.Decimal(repr(raw)) if isinstance(raw, float) else decimal.Decimal(raw)).scaleb(
-            places
+        units = _scaled(
+            decimal.Decimal(repr(raw)) if isinstance(raw, float) else decimal.Decimal(raw), places
         )
-        if units == units.to_integral_value():
-            cons[key] = float(units)
+        if units.denominator == 1:
+            new_key, val = key, units.numerator
         elif key in ("ge", "gt"):  # x > 1.005 with cents means x >= 101
-            cons["ge"] = float(math.ceil(units))
+            new_key, val = "ge", math.ceil(units)
         else:
-            cons["le"] = float(math.floor(units))
+            new_key, val = "le", math.floor(units)
+        # several bounds may land on one key; keep the strongest
+        if new_key in cons:
+            val = max(val, cons[new_key]) if new_key in ("ge", "gt") else min(val, cons[new_key])
+        cons[new_key] = float(val)
     return ("fixed", digits, places)
 
 
@@ -584,6 +600,44 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None
             _metadata_constraints(inner, cons)
 
 
+def _from_units(units: int, places: int) -> decimal.Decimal:
+    """`units * 10**-places` as a Decimal, exactly (no context rounding)."""
+    return decimal.Decimal((int(units < 0), tuple(int(c) for c in str(abs(units))), -places))
+
+
+def witness_to_host(value: Any, spec: TypeSpec, schema: SchemaBuilder) -> Any:
+    """A raw witness value as `evaluate` accepts it with no readers: fixed-point units
+    become Decimals, structs stay dicts."""
+    if value is None or isinstance(spec, str):
+        return value
+    kind = spec[0]
+    if kind == "nullable":
+        return witness_to_host(value, spec[1], schema)
+    if kind == "fixed":
+        return _from_units(value, spec[2])
+    if kind == "list":
+        return [witness_to_host(v, spec[1], schema) for v in value]
+    if kind == "map":
+        return {k: witness_to_host(v, spec[2], schema) for k, v in value.items()}
+    if kind == "struct":
+        fields = {f: s for f, s, _ in schema.structs.get(spec[1], [])}
+        return {k: witness_to_host(v, fields.get(k, "dyn"), schema) for k, v in value.items()}
+    return value
+
+
+def contains_fixed(spec: TypeSpec, schema: SchemaBuilder, seen: frozenset[str] = frozenset()) -> bool:
+    """Whether a fixed-point value can occur anywhere in `spec`, structs included."""
+    if isinstance(spec, str):
+        return False
+    if spec[0] == "fixed":
+        return True
+    if spec[0] == "struct":
+        if spec[1] in seen:
+            return False
+        return any(contains_fixed(s, schema, seen | {spec[1]}) for _, s, _ in schema.structs.get(spec[1], []))
+    return any(contains_fixed(a, schema, seen) for a in spec[1:])
+
+
 def from_cel(value: Any, spec: TypeSpec, schema: SchemaBuilder) -> Any:
     """Convert a raw CEL value (structs as dicts) back into Python classes."""
     if value is None or isinstance(spec, str):
@@ -592,7 +646,9 @@ def from_cel(value: Any, spec: TypeSpec, schema: SchemaBuilder) -> Any:
     if kind == "nullable":
         return from_cel(value, spec[1], schema)
     if kind == "fixed":
-        return decimal.Decimal(value).scaleb(-spec[2])
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"a fixed-point result must be an int count of units, got {type(value).__name__}")
+        return _from_units(value, spec[2])
     if kind == "list":
         return [from_cel(v, spec[1], schema) for v in value]
     if kind == "map":
@@ -618,6 +674,11 @@ def cel_literal(value: Any) -> str:
         return "false"
     if isinstance(value, enum.Enum):
         return cel_literal(value.value)
+    if isinstance(value, decimal.Decimal):
+        raise TypeError(
+            "a Decimal has no CEL literal: fixed-point values are int counts of units in CEL "
+            "(write 1234 for 12.34 with 2 places)"
+        )
     if isinstance(value, int):
         return str(value) if value <= 2**63 - 1 else f"{value}u"
     if isinstance(value, float):

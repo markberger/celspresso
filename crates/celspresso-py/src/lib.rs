@@ -259,12 +259,35 @@ fn fixed_from_py(obj: &Bound<'_, PyAny>, scale: u32, path: &str) -> PyResult<Val
     if !obj.call_method0("is_finite")?.extract::<bool>()? {
         return Err(PyValueError::new_err(format!("Decimal at '{path}' is not finite")));
     }
-    let units = obj.call_method1("scaleb", (scale,))?;
-    if !units.eq(units.call_method0("to_integral_value")?)? {
-        return Err(PyValueError::new_err(format!("Decimal at '{path}' has more than {scale} decimal places")));
+    // exact integer arithmetic on (sign, digits, exponent): Decimal's own operations
+    // round to the caller's context precision
+    let (sign, digits, exp): (u8, Vec<u8>, i64) = obj.call_method0("as_tuple")?.extract()?;
+    let mut digits: Vec<u8> = digits.into_iter().skip_while(|d| *d == 0).collect();
+    let mut e = exp + i64::from(scale);
+    while e < 0 {
+        match digits.last() {
+            None => break,
+            Some(0) => {
+                digits.pop();
+                e += 1;
+            }
+            Some(_) => return Err(PyValueError::new_err(format!("Decimal at '{path}' has more than {scale} decimal places"))),
+        }
     }
-    let n = units.call_method0("__int__")?;
-    n.extract::<i64>().map(Value::Int).map_err(|_| PyValueError::new_err(format!("Decimal at '{path}' is out of range")))
+    let out_of_range = || PyValueError::new_err(format!("Decimal at '{path}' is out of range"));
+    if digits.is_empty() {
+        return Ok(Value::Int(0));
+    }
+    // checked before any digits are materialized, so 1e999999 costs nothing
+    if digits.len() as i64 + e.max(0) > 19 {
+        return Err(out_of_range());
+    }
+    let mut n: i128 = 0;
+    for d in digits.iter().copied().chain(std::iter::repeat_n(0, e.max(0) as usize)) {
+        n = n * 10 + i128::from(d);
+    }
+    let n = if sign == 1 { -n } else { n };
+    i64::try_from(n).map(Value::Int).map_err(|_| out_of_range())
 }
 
 /// `cons` are the constraints at this position (a field's, a variable's, or a list's

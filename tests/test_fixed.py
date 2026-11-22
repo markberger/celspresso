@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import pickle
 from decimal import Decimal
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import pytest
 from pydantic import BaseModel
@@ -13,6 +13,9 @@ from pydantic import Field as PField
 
 from celspresso import Env, function
 from celspresso.schema import Constraints, Field, Struct, T
+
+if TYPE_CHECKING:
+    from celspresso.adapters import SchemaContext
 
 Price = Annotated[Decimal, PField(max_digits=8, decimal_places=2, ge=Decimal(0), le=Decimal("999.99"))]
 
@@ -148,3 +151,97 @@ def test_expr_type_check_and_plain_int_results() -> None:
 
 def test_typeref_pickles() -> None:
     assert pickle.loads(pickle.dumps(T.fixed(8, 2))) == T.fixed(8, 2)
+
+
+def test_conversion_is_exact_in_any_decimal_context() -> None:
+    import decimal
+
+    st = Struct("Refund", [Field("amount", T.fixed(10, 2), Constraints(le=1234000))])
+    env = Env(structs=[st], r=T.struct("Refund"))
+    p = env.predicate("r.amount == 1234000")
+    with pytest.raises(ValueError, match="decimal places"):  # 29 significant digits, not 12340.00
+        p.evaluate({"r": {"amount": Decimal("12340.000000000000000000000001")}})
+    with decimal.localcontext() as ctx:
+        ctx.prec = 3
+        assert p.evaluate({"r": {"amount": Decimal("12340.00")}})
+        got = Env(x=T.fixed(10, 2)).expr("x", T.fixed(10, 2)).evaluate({"x": Decimal("12345.67")})
+        assert got == Decimal("12345.67")
+        assert str(got) == "12345.67"
+
+
+def test_huge_exponents_fail_fast() -> None:
+    import time
+
+    p = Env(x=T.fixed(8, 2)).predicate("x > 0")
+    start = time.perf_counter()
+    for v in ("1e999990", "1e5000000", "-1e19", "1e-999999"):
+        with pytest.raises(ValueError, match=r"out of range|decimal places"):
+            p.evaluate({"x": Decimal(v)})
+    assert time.perf_counter() - start < 1
+    assert Env(x=T.fixed(8, 2)).predicate("x == 0").evaluate({"x": Decimal("0E-50")})
+    assert Env(x=T.fixed(8, 2)).predicate("x == 100").evaluate({"x": Decimal("1.000000000")})
+
+
+def test_witnesses_replay_and_diff_work_on_fixed_values() -> None:
+    env = Env(order=Order, x=T.fixed(8, 2))
+    p = env.predicate("x > 500 && order.lines.exists(l, l.price == 1234)")
+    w = p.satisfiable().witness
+    assert p.evaluate(w)
+    assert p.explain(w).value is True
+    changes = env.predicate("x > 500").diff(env.predicate("x >= 500"))
+    assert changes
+
+
+def test_pydantic_bounds_keep_the_strongest() -> None:
+    a = Annotated[Decimal, PField(max_digits=8, decimal_places=2, ge=Decimal("5.001"), gt=Decimal("0.005"))]
+    b = Annotated[Decimal, PField(max_digits=8, decimal_places=2, le=Decimal("5.009"), lt=Decimal("100.001"))]
+    assert "x: fixed(8, 2), >= 501" in Env(x=a).describe()
+    assert "x: fixed(8, 2), <= 500" in Env(x=b).describe()
+
+
+def test_structs_with_fixed_fields_cannot_cross_function_boundaries() -> None:
+    @function
+    def tf(line: Line) -> int:
+        return 0
+
+    with pytest.raises(TypeError, match="function boundary"):
+        Env(x=int).extend(functions=[tf])
+    with pytest.raises(TypeError, match="function boundary"):
+        Env(x=int).define("p", "l.qty", params={"l": Line})
+
+
+def test_explicit_constraints_are_in_units() -> None:
+    class Fee:
+        pass
+
+    class FeeAdapter:
+        def schema_for(self, tp: object, ctx: SchemaContext) -> object:
+            if tp is not Fee:
+                return None
+            return ctx.struct(
+                tp,
+                lambda: [
+                    ctx.field(
+                        "p", Annotated[Decimal, PField(max_digits=8, decimal_places=2)], Constraints(le=5000)
+                    )
+                ],
+            )
+
+        def decode(self, key: object, data: dict[str, object]) -> object:
+            return data
+
+    assert "p: fixed(8, 2), <= 5000" in Env(f=Fee, adapters=[FeeAdapter()]).describe()
+
+
+def test_expr_identity_includes_the_requested_scale() -> None:
+    env = Env(x=T.fixed(8, 2))
+    assert env.expr("x", T.fixed(8, 2)) != env.expr("x", T.fixed(8, 4))
+    assert env.expr("x", T.fixed(8, 2)) == env.expr("x", T.fixed(8, 2))
+    with pytest.raises(TypeError, match="int count of units"):
+        env.expr("dyn(1.5)", T.fixed(8, 2)).evaluate({"x": Decimal(1)})
+
+
+def test_unused_precision_and_decimal_literals() -> None:
+    assert Env(i=Annotated[int, PField(max_digits=5)]).predicate("i > 0").evaluate({"i": 3})
+    with pytest.raises(TypeError, match="no CEL literal"):
+        Env(x=T.fixed(8, 2)).expr("x", T.fixed(8, 2)).gt(Decimal("1.00"))
