@@ -114,6 +114,27 @@ def test_nested_models_and_name_collisions() -> None:
     assert isinstance(out.addr, Addr)
 
 
+def test_classes_sharing_module_and_qualname_stay_distinct() -> None:
+    # Django's migration models all live in one fake module, with the same qualnames
+    def model(field: str) -> type:
+        cls = dataclasses.make_dataclass("Order", [(field, int)])
+        cls.__module__ = "__fake__"
+        return cls
+
+    a, b, c = model("a"), model("b"), model("c")
+    env = Env(x=a, y=b, z=c, again=c)
+    assert len({env.variables[v] for v in ("x", "y", "z")}) == 3
+    assert env.variables["again"] == env.variables["z"]
+    assert env.predicate("x.a + y.b + z.c + again.c > 0").evaluate(
+        {"x": a(a=1), "y": b(b=1), "z": c(c=1), "again": c(c=1)}
+    )
+    w = env.predicate("z.c > 5").satisfiable().witness
+    assert w is not None
+    z = w.to_python()["z"]
+    assert type(z) is c
+    assert z.c > 5
+
+
 def test_type_name_helper() -> None:
     assert type_name(("map", "string", ("list", "int"))) == "map(string, list(int))"
     assert type_name(("nullable", ("struct", "User"))) == "User?"

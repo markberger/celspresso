@@ -805,7 +805,9 @@ class Expr(Generic[T]):
 
     @property
     def canonical(self) -> str:
-        """Normalized CEL text (definitions expanded)."""
+        """Normalized text of the expression, with definitions expanded, for display and
+        comparison. It is not guaranteed to parse as CEL: expanded definitions appear as
+        internal bindings (`cel.bind(@arg:...)`)."""
         return self._prog.canonical
 
     @property

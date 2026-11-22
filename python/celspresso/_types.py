@@ -88,11 +88,21 @@ class SchemaBuilder:
     # -- internals --------------------------------------------------------
 
     def _struct_name(self, cls: type) -> str:
-        name = cls.__name__
-        existing = self.classes.get(name)
-        if existing is not None and existing is not cls:
-            name = f"{cls.__module__}.{cls.__qualname__}"
-        return name
+        """The class's struct name: its own if registered already, else the first free one
+        of `Name`, `module.Qualname`, `module.Qualname#2`, ... Distinct classes never share
+        a name (Django migration models, for one, all live in the same fake module)."""
+        for name, known in self.classes.items():
+            if known is cls:
+                return name
+        qualified = f"{cls.__module__}.{cls.__qualname__}"
+        candidates = [cls.__name__, qualified]
+        n = 2
+        while True:
+            for name in candidates:
+                if name not in self.classes:
+                    return name
+            candidates = [f"{qualified}#{n}"]
+            n += 1
 
     def _register(self, cls: type) -> str:
         name = self._struct_name(cls)
