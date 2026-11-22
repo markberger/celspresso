@@ -620,3 +620,12 @@ fn unknown_reasons_name_unmodeled_builtins() {
         st => panic!("{st:?}"),
     }
 }
+
+#[test]
+fn operator_names_in_reasons_are_as_written() {
+    // a builtin operator on unmodeled operands is named as in the source, never '_>_'
+    match run(Query::Satisfiable(&c("[1] + [2] == [3] && s.split(' ').size() > 1"))).status {
+        Status::Unknown(r) => assert!(!r.contains("'_"), "{r}"),
+        st => panic!("{st:?}"),
+    }
+}

@@ -573,13 +573,21 @@ class Env:
 
         v = pred.satisfiable(assuming=assuming, timeout=timeout)
         if v.unsat:
-            problems.append(Problem("never_fires", "the rule can never be true for any valid input", None, v))
+            # never true: often because it fails instead (division by zero, overflow, ...)
+            err = pred.can_error(assuming=assuming, timeout=timeout)
+            if err.sat:
+                msg = f"the rule is never true for any valid input: evaluation {_failure(pred, err)}"
+                problems.append(Problem("never_fires", msg, None, err))
+            else:
+                problems.append(
+                    Problem("never_fires", "the rule can never be true for any valid input", None, v)
+                )
             return RuleCheck(src, pred, tuple(problems))
         if v.unknown:
             undecided("that the rule can fire", v)
         v = pred.can_error(assuming=assuming, timeout=timeout)
         if v.sat:
-            problems.append(Problem("can_error", f"evaluation fails when {v.witness}", None, v))
+            problems.append(Problem("can_error", f"evaluation {_failure(pred, v)}", None, v))
         elif v.unknown:
             undecided("that the rule never errors", v)
         for name, inv in named.items():
@@ -611,6 +619,19 @@ ProblemKind = Literal[
     "too_narrow",
     "unverified",
 ]
+
+
+def _failure(pred: Predicate, v: Verdict) -> str:
+    """'fails (division by zero) when x = 0': the witness, and the error it really raises."""
+    cause = ""
+    if v.witness is not None:
+        try:
+            pred.evaluate(v.witness.to_python())
+        except CelEvaluationError as e:
+            cause = f" ({e.message})"
+        except Exception:  # noqa: BLE001 - the cause is a nicety; the witness is the evidence
+            cause = ""
+    return f"fails{cause} when {v.witness}"
 
 
 def _named(items: Mapping[str, str | Predicate] | Iterable[str | Predicate]) -> dict[str, str | Predicate]:

@@ -409,3 +409,50 @@ def test_limits_cap_evaluation_cost() -> None:
         Limits(max_cost=0)
     with pytest.raises(TypeError, match="limits"):
         Env(x=int, limits=5)  # type: ignore[arg-type]
+
+
+# -- honest semantics: null fields, dyn values, runtime failures ----------------
+
+
+def test_has_is_false_for_null_fields() -> None:
+    class Ticket(BaseModel):
+        note: str | None = None
+
+    env = Env(o=Ticket)
+    guarded = env.predicate("has(o.note) && o.note.startsWith('x')")
+    assert env.predicate("has(o.note)").evaluate({"o": {"note": None}}) is False
+    assert guarded.evaluate({"o": {"note": None}}) is False
+    assert guarded.evaluate({"o": {"note": "xy"}}) is True
+    # the prover agrees with the evaluator: the guard really guards
+    assert guarded.can_error().unsat
+    assert env.predicate("has(o.note) == (o.note != null)").always_true().proved
+    assert env.predicate("o.note.startsWith('x')").can_error().sat
+
+
+def test_dyn_values_get_an_honest_reason() -> None:
+    from typing import Any
+
+    class Call(BaseModel):
+        args: dict[str, Any]
+
+    env = Env(call=Call)
+    p = env.predicate("call.args.amount > 5")
+    assert p.evaluate({"call": {"args": {"amount": 9}}}) is True
+    v = p.satisfiable()
+    assert v.unknown
+    assert v.reason is not None
+    assert "dyn" in v.reason
+    assert "concrete type" in v.reason
+    assert "_>_" not in v.reason
+    assert not v.bounded
+    assert "unroll" not in str(v)
+
+
+def test_check_rule_names_the_runtime_failure() -> None:
+    env = Env(n=Annotated[int, Field(ge=0, le=10)])
+    r = env.check_rule("100 / n > 1000 / 0")
+    assert [p.kind for p in r.problems] == ["never_fires"]
+    assert "evaluation fails (division by zero)" in str(r)
+    r = env.check_rule("100 / n > 1")
+    assert [p.kind for p in r.problems] == ["can_error"]
+    assert "evaluation fails (division by zero) when n = 0" in str(r)

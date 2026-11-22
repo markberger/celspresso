@@ -141,11 +141,12 @@ for _ in range(5):
 | [`cel-python`](https://github.com/cloud-custodian/cel-python) | ✓ | | |
 | **celspresso** | ✓ | ✓ | ✓ |
 
-A Rust core parses, checks and evaluates CEL, and encodes its exact semantics into [Z3](https://github.com/Z3Prover/z3). A typical proof takes 2–20 ms, and the GIL is released while solving.
+A Rust core parses, checks and evaluates CEL, and encodes its exact semantics into [Z3](https://github.com/Z3Prover/z3). Proofs about numbers, enums, dates and string prefixes or suffixes typically take 2–20 ms, and the GIL is released while solving. Rules that mix `contains` and regexes can take hundreds of milliseconds. Some regex questions reach the timeout and come back `UNKNOWN`, never with a wrong answer.
 
 ## More
 
 - **Types:** Pydantic models, dataclasses, `Optional`, lists, maps, `date`, timezone-aware `datetime` and `timedelta`. Store money as integer cents; `Decimal` is rejected.
+- **`None` is `null`:** an `Optional` field holding `None` is `null` in CEL, and `has(m.f)` is false for it. Guard with `has(m.note) && m.note.startsWith('x')` or `m.note != null && ...`. Calling a method on `null` is an evaluation error.
 - **Extensions:** strings, math, lists, sets, base64, optionals, `cel.bind`, `cel.block` and the Kubernetes network library.
 - **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions. The prover never runs your Python while it solves. Each function is handled in one of three ways:
   - **Written in CEL**, so it is fully verified: `env.define("clamp", "v < 0 ? 0 : (v > 100 ? 100 : v)", params={"v": int})`, called as `clamp(x)`.
@@ -153,7 +154,7 @@ A Rust core parses, checks and evaluates CEL, and encodes its exact semantics in
   - **Opaque** otherwise. Tell the prover what holds with `@function(ensures="result >= 0 && result <= 100", total=True)`. If an answer depends on what the function returns, the verdict is `UNKNOWN`, and its reason says which of these three ways would fix that.
 - **Rule sets:** `RuleSet({...}).verify_all(invariants)` vets every rule at once; `unreachable()`, `can_error()` and `check_pairwise(...)` find dead, crashing and overlapping rules.
 - **Debugging and tests:** `expr.explain(data)` shows the value of every sub-expression; `celspresso.testing` has `assert_equivalent`, `assert_implies`, `assert_never` and more.
-- **Not yet supported:** protobuf messages and JSON values. The verifier models ints, doubles (IEEE, NaN included), strings, lists, maps, optionals, dates, timestamps and durations; bytes and named time zones return `UNKNOWN` with the reason. Proofs over a list or map need a `max_length` (or a larger `unroll_limit`), so the prover can cover every length.
+- **Not yet supported:** protobuf messages and JSON values. Fields typed `Any` or `dict[str, Any]` can be evaluated, but the verifier can't see into them: checks that depend on them return `UNKNOWN`, and the reason suggests a concrete type. The verifier models ints, doubles (IEEE, NaN included), strings, lists, maps, optionals, dates, timestamps and durations; bytes and named time zones return `UNKNOWN` with the reason. Proofs over a list or map need a `max_length` (or a larger `unroll_limit`), so the prover can cover every length.
 - **Contributing:** `scripts/check.sh` runs every lint, type-check and test gate.
 
 ## License

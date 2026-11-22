@@ -217,7 +217,7 @@ class Verdict:
         if self.reason:
             lines.append(f"  reason: {self.reason}")
         if self.bounded:
-            lines.append("  (result relied on the comprehension unroll limit)")
+            lines.append("  (result relied on the unroll limit)")
         if self.assumptions:
             lines.append("  assuming: " + " && ".join(f"({a})" for a in self.assumptions))
         return "\n".join(lines)

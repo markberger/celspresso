@@ -601,7 +601,8 @@ fn strictly_matches(p: &CelType, a: &CelType, s: &Subst) -> bool {
     !a.is_dyn_like() || p.is_dyn_like()
 }
 
-fn display_fn(f: &str) -> &str {
+/// How an operator is written in source (`_>_` is `>`); other names are returned as-is.
+pub fn display_fn(f: &str) -> &str {
     match f {
         ops::ADD => "+",
         ops::SUBTRACT => "-",

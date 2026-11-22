@@ -37,6 +37,8 @@ pub struct Encoder {
     opaque_host: BTreeSet<String>,
     /// Standard-library functions the verifier doesn't model yet.
     unmodeled_builtins: BTreeSet<String>,
+    /// Whether the answer depends on `dyn` values (from `Any`), which are opaque.
+    reads_dyn: bool,
     fresh: u32,
     /// The first date input, which later dates prefer to stay near (readable witnesses).
     first_date: Option<Int>,
@@ -81,6 +83,7 @@ impl Encoder {
             func_overloads: HashMap::new(),
             opaque_host: BTreeSet::new(),
             unmodeled_builtins: BTreeSet::new(),
+            reads_dyn: false,
             fresh: 0,
             first_date: None,
             index_terms: Vec::new(),
@@ -453,8 +456,8 @@ impl Encoder {
                     Sym::Struct { fields, .. } => {
                         let err = or(&[&o.err, &is_null]);
                         if *test_only {
-                            // declared fields are always present (Pydantic semantics)
-                            return SV { v: Sym::Bool(tt()), err };
+                            // a declared field is set unless it holds null
+                            return SV { v: Sym::Bool(Self::field_set(fields.get(field))), err };
                         }
                         match fields.get(field) {
                             Some(v) => SV { v: v.clone(), err },
@@ -701,7 +704,7 @@ impl Encoder {
         match self.builtin(c, e, function, &syms) {
             Some(Ok((v, err))) => SV { v, err: or(&[&err_in, &err]) },
             Some(Err(why)) => {
-                self.unmodeled_builtins.insert(function.to_string());
+                let why = self.unmodeled(function, &syms).unwrap_or(why);
                 let mut r = self.approx(c, e, why);
                 r.err = or(&[&r.err, &err_in]);
                 r
@@ -711,6 +714,15 @@ impl Encoder {
                 r.err = or(&[&r.err, &err_in]);
                 r
             }
+        }
+    }
+
+    /// `has()` of a struct field: declared fields are set unless they hold null.
+    fn field_set(f: Option<&Sym>) -> Bool {
+        match f {
+            None | Some(Sym::Null) => ff(),
+            Some(Sym::Nullable { is_null, .. }) => is_null.not(),
+            Some(_) => tt(),
         }
     }
 
@@ -766,7 +778,7 @@ impl Encoder {
     /// `has(v.field)` on a non-optional value.
     fn select_test(&mut self, v: &Sym, field: &str) -> Option<Bool> {
         match v {
-            Sym::Struct { fields, .. } => Some(Bool::from_bool(fields.contains_key(field))),
+            Sym::Struct { fields, .. } => Some(Self::field_set(fields.get(field))),
             Sym::Map { slots, trunc, .. } => {
                 if *trunc {
                     self.bounded = true;
@@ -1223,9 +1235,18 @@ impl Encoder {
         let others: Vec<&String> = self
             .approximations
             .iter()
-            .filter(|a| !a.starts_with("function '") && !a.starts_with("relies on") && !a.starts_with("builtin '"))
+            .filter(|a| {
+                !a.starts_with("function '") && !a.starts_with("relies on") && !a.starts_with("builtin '") && !a.starts_with("dyn ")
+            })
             .collect();
         let mut parts = Vec::new();
+        if self.reads_dyn {
+            parts.push(
+                "the answer depends on values of type dyn (from Any or dict[str, Any]), which the verifier can't see into; \
+                 give them a concrete type, such as a Pydantic model for a tool's arguments"
+                    .to_string(),
+            );
+        }
         if !self.unmodeled_builtins.is_empty() {
             let names: Vec<String> = self.unmodeled_builtins.iter().map(|n| format!("'{n}'")).collect();
             parts.push(format!(
@@ -1256,11 +1277,25 @@ impl Encoder {
         }
     }
 
+    /// Why builtin `function` on `args` can't be encoded: a `dyn` operand, or the builtin
+    /// itself. Records which, for `unreplayed_reason`; None means "keep the caller's reason".
+    fn unmodeled(&mut self, function: &str, args: &[Sym]) -> Option<String> {
+        let name = celspresso_check::display_fn(function);
+        if args.iter().any(|a| matches!(a, Sym::Opaque { ty: CelType::Dyn, .. })) {
+            self.reads_dyn = true;
+            return Some(format!("dyn values in '{name}' are not modeled"));
+        }
+        self.unmodeled_builtins.insert(name.to_string());
+        None
+    }
+
     /// Note that `function` (overload `overload`) is opaque here; returns how to describe it.
-    fn note_opaque(&mut self, function: &str, overload: &str) -> String {
+    fn note_opaque(&mut self, function: &str, overload: &str, args: &[Sym]) -> String {
         if celspresso_check::is_builtin_overload(overload) {
-            self.unmodeled_builtins.insert(function.to_string());
-            format!("builtin '{function}' is not modeled by the verifier")
+            if let Some(why) = self.unmodeled(function, args) {
+                return why;
+            }
+            format!("builtin '{}' is not modeled by the verifier", celspresso_check::display_fn(function))
         } else {
             self.opaque_host.insert(function.to_string());
             format!("function '{function}' is uninterpreted")
@@ -1288,14 +1323,14 @@ impl Encoder {
                 Sym::Str(s) => (Dynamic::from_ast(s), Sort::string()),
                 Sym::Double(d) => (Dynamic::from_ast(d), Sort::double()),
                 _ => {
-                    let why = self.note_opaque(function, &overload);
+                    let why = self.note_opaque(function, &overload, args);
                     return self.approx(c, e, why);
                 }
             };
             arg_asts.push(d);
             sorts.push(s);
         }
-        let why = self.note_opaque(function, &overload);
+        let why = self.note_opaque(function, &overload, args);
         let Some(rsort) = sort_of(&result_ty) else {
             return self.approx(c, e, why);
         };

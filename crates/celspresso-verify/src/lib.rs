@@ -126,7 +126,9 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
     };
     let user: Vec<Bool> = assumptions.iter().map(|a| holds(&enc.encode(a))).collect();
     let approximations: Vec<String> = enc.approximations.iter().cloned().collect();
-    let bounded = enc.bounded;
+    // whether the encoding was cut off at the unroll limit; reported only if the result relied on it
+    let truncated = enc.bounded;
+    let mut bounded = false;
 
     let mut params = Params::new();
     params.set_u32("timeout", opts.timeout_ms.min(u32::MAX as u64) as u32);
@@ -161,10 +163,13 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
             }
             match s2.check() {
                 SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
-                _ if bounded => Status::Unknown(format!(
-                    "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
-                    opts.unroll_limit
-                )),
+                _ if truncated => {
+                    bounded = true;
+                    Status::Unknown(format!(
+                        "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
+                        opts.unroll_limit
+                    ))
+                }
                 _ => match sample_proofs(&enc, q, assumptions, &user, &params, funcs, opts) {
                     Some(w) => Status::Found(w),
                     None => Status::NotFound,

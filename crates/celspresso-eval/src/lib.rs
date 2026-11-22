@@ -628,7 +628,8 @@ fn select(e: &Expr, v: &Value, field: &str, test_only: bool) -> EvalResult {
         Value::Optional(_) => opt_select(e, v, field),
         Value::Struct(s) => {
             if test_only {
-                return Ok(Value::Bool(s.fields.contains_key(field)));
+                // a field holding null (Pydantic `X | None = None`) is not set
+                return Ok(Value::Bool(s.fields.get(field).is_some_and(|v| !matches!(v, Value::Null))));
             }
             s.fields.get(field).cloned().ok_or_else(|| err(e, format!("no such field '{field}'")))
         }
