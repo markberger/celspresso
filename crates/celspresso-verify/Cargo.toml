@@ -1,0 +1,11 @@
+[package]
+name = "celspresso-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+celspresso-syntax.workspace = true
+celspresso-check.workspace = true
+celspresso-eval.workspace = true
+z3.workspace = true

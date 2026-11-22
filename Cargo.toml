@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+celspresso-syntax = { path = "crates/celspresso-syntax" }
+celspresso-check = { path = "crates/celspresso-check" }
+celspresso-eval = { path = "crates/celspresso-eval" }
+celspresso-verify = { path = "crates/celspresso-verify" }
+thiserror = "2"
+z3 = { version = "0.24", features = ["gh-release"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py310"] }
+regex = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

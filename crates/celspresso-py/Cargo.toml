@@ -1,0 +1,16 @@
+[package]
+name = "celspresso-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_celspresso"
+crate-type = ["cdylib"]
+
+[dependencies]
+celspresso-syntax.workspace = true
+celspresso-check.workspace = true
+celspresso-eval.workspace = true
+celspresso-verify.workspace = true
+pyo3.workspace = true
