@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 
 import pytest
 from pydantic import BaseModel
@@ -125,11 +126,15 @@ def test_optionals() -> None:
     assert env.compile("m.?a.optMap(v, v + 1)").source == "m.?a.optMap(v, v + 1)"
 
 
-def test_optionals_are_unknown_to_the_verifier() -> None:
-    p = Env(m=dict[str, int]).predicate("m.?a.orValue(0) >= 0")
-    v = p.always_true()
-    assert v.unknown
-    assert "optional" in (v.reason or "")
+def test_the_verifier_reasons_about_optionals_maps_and_doubles() -> None:
+    env = Env(m=dict[str, int], d=float)
+    v = env.predicate("m.?a.orValue(0) >= 0").always_true()
+    assert v.refuted
+    assert v.counterexample == {"m": {"a": -1}} or v.counterexample["m"]["a"] < 0
+    assert env.predicate("m.?a.orValue(1) >= 1 || m.a < 1").always_true().unknown  # m is unbounded
+    nan = env.predicate("d == d").always_true()
+    assert nan.refuted
+    assert math.isnan(nan.counterexample["d"])
 
 
 def test_block() -> None:

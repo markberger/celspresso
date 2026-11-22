@@ -205,7 +205,10 @@ impl<'a> Checker<'a> {
                 let mut vt = self.fresh_param();
                 for (k, v) in entries {
                     let t = self.check(k);
-                    if !matches!(self.resolved(&t), CelType::String | CelType::Int | CelType::Uint | CelType::Bool | CelType::Dyn | CelType::Error | CelType::Param(_)) {
+                    if !matches!(
+                        self.resolved(&t),
+                        CelType::String | CelType::Int | CelType::Uint | CelType::Bool | CelType::Dyn | CelType::Error | CelType::Param(_)
+                    ) {
                         self.error(k, format!("unsupported map key type '{}'", self.resolved(&t)));
                     }
                     kt = join(&kt, &t, &mut self.subst);
@@ -222,8 +225,12 @@ impl<'a> Checker<'a> {
 
     /// A list element or map value; `?e` entries contribute the optional's value type.
     fn entry(&mut self, e: &Expr) -> CelType {
-        let ExprKind::Call { target: None, function, args } = &e.kind else { return self.check(e) };
-        let ([x], true) = (args.as_slice(), function == ops::OPT_ENTRY) else { return self.check(e) };
+        let ExprKind::Call { target: None, function, args } = &e.kind else {
+            return self.check(e);
+        };
+        let ([x], true) = (args.as_slice(), function == ops::OPT_ENTRY) else {
+            return self.check(e);
+        };
         let t = self.check(x);
         let inner = match self.resolved(&t).clone() {
             CelType::Optional(inner) => *inner,
@@ -379,7 +386,10 @@ impl<'a> Checker<'a> {
             CelType::Map(k, v) => (*k, *v),
             CelType::Dyn | CelType::Error | CelType::Param(_) => (CelType::Dyn, CelType::Dyn),
             other => {
-                self.error(&c.iter_range, format!("expression of type '{other}' cannot be the range of a comprehension (must be list, map, or dynamic)"));
+                self.error(
+                    &c.iter_range,
+                    format!("expression of type '{other}' cannot be the range of a comprehension (must be list, map, or dynamic)"),
+                );
                 (CelType::Error, CelType::Error)
             }
         };
@@ -400,7 +410,11 @@ impl<'a> Checker<'a> {
         let step_t = self.check(&c.loop_step);
         self.scopes.pop();
         if !assignable(&accu_t, &step_t, &mut self.subst) {
-            let msg = format!("comprehension step type '{}' does not match accumulator type '{}'", self.resolved(&step_t), self.resolved(&accu_t));
+            let msg = format!(
+                "comprehension step type '{}' does not match accumulator type '{}'",
+                self.resolved(&step_t),
+                self.resolved(&accu_t)
+            );
             self.error(&c.loop_step, msg);
         }
         let result_t = self.check(&c.result);
@@ -453,7 +467,12 @@ impl<'a> Checker<'a> {
     /// Overload resolution for `function` applied to already-checked argument types.
     fn resolve(&mut self, e: &Expr, function: &str, receiver: bool, arg_types: &[CelType]) -> CelType {
         let Some(decl) = self.schema.functions.get(function).cloned() else {
-            let all = self.schema.functions.keys().filter(|k| !k.starts_with('_') && !k.starts_with('@') && !k.starts_with('!') && !k.starts_with('-')).map(|s| s.as_str());
+            let all = self
+                .schema
+                .functions
+                .keys()
+                .filter(|k| !k.starts_with('_') && !k.starts_with('@') && !k.starts_with('!') && !k.starts_with('-'))
+                .map(|s| s.as_str());
             let mut msg = format!("undeclared reference to function '{function}'");
             if let Some(s) = suggest(function, all) {
                 msg.push_str(&format!(" (did you mean '{s}'?)"));
@@ -596,11 +615,7 @@ fn display_fn(f: &str) -> &str {
 /// Closest candidate within a small edit distance.
 pub fn suggest<'s>(name: &str, candidates: impl Iterator<Item = &'s str>) -> Option<&'s str> {
     let max = (name.len() / 3).max(1);
-    candidates
-        .map(|c| (levenshtein(name, c), c))
-        .filter(|(d, _)| *d <= max)
-        .min_by_key(|(d, _)| *d)
-        .map(|(_, c)| c)
+    candidates.map(|c| (levenshtein(name, c), c)).filter(|(d, _)| *d <= max).min_by_key(|(d, _)| *d).map(|(_, c)| c)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {

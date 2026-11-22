@@ -10,13 +10,13 @@ use jiff::Timestamp;
 
 use crate::date;
 
-const NANOS: i128 = 1_000_000_000;
+pub const NANOS: i128 = 1_000_000_000;
 /// 0001-01-01T00:00:00Z
-const MIN_TS: i128 = -62_135_596_800 * NANOS;
+pub const MIN_TS: i128 = -62_135_596_800 * NANOS;
 /// 9999-12-31T23:59:59.999999999Z
-const MAX_TS: i128 = 253_402_300_799 * NANOS + (NANOS - 1);
+pub const MAX_TS: i128 = 253_402_300_799 * NANOS + (NANOS - 1);
 /// ±315,576,000,000.999999999s, the protobuf Duration limit.
-const MAX_DUR: i128 = 315_576_000_000 * NANOS + (NANOS - 1);
+pub const MAX_DUR: i128 = 315_576_000_000 * NANOS + (NANOS - 1);
 
 pub fn ts_in_range(ns: i128) -> bool {
     (MIN_TS..=MAX_TS).contains(&ns)
@@ -217,8 +217,7 @@ pub fn ts_field(ns: i128, field: TsField, tz: Option<&str>) -> Result<i64, Strin
         Some(name) => {
             let zone = parse_zone(name).ok_or_else(|| format!("unknown time zone '{name}'"))?;
             // jiff's range ends a day before CEL's; zone rules are stable at the edges
-            let probe = Timestamp::from_nanosecond(ns)
-                .unwrap_or(if ns < 0 { Timestamp::MIN } else { Timestamp::MAX });
+            let probe = Timestamp::from_nanosecond(ns).unwrap_or(if ns < 0 { Timestamp::MIN } else { Timestamp::MAX });
             i64::from(zone.to_offset(probe).seconds())
         }
     };

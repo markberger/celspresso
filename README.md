@@ -52,6 +52,7 @@ uv sync --group dev && uv run maturin develop --release
 | `a.equivalent(b)` | Do they agree on every input, errors included? | `PROVED` / `REFUTED` + counterexample |
 | `a.diff(b)` | Where do they disagree, and why? | one input per distinct reason |
 | `e.can_error()` | Can evaluation fail (÷0, overflow, missing key)? | `SAT` + example / `UNSAT` |
+| `e.bounds()` | What's the smallest and largest value it can take? | proved `[min, max]` + an input for each |
 | `env.check_rule(src, invariants)` | Is this rule safe to accept? | report |
 
 **Catch a refactor that changes behavior.** Someone tidies `<= 30` into `< 30`:
@@ -133,9 +134,10 @@ A Rust core parses, checks and evaluates CEL, and encodes its exact semantics in
 
 - **Types:** Pydantic models, dataclasses, `Optional`, lists, maps, `date`, timezone-aware `datetime` and `timedelta`. Store money as integer cents; `Decimal` is rejected.
 - **Extensions:** strings, math, lists, sets, base64, optionals, `cel.bind`, `cel.block` and the Kubernetes network library.
-- **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions.
+- **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions. The prover can't see inside a Python function, so tell it what's true: `@function(ensures="result >= 0 && result <= 100", total=True)`.
+- **Rule sets:** `RuleSet({...}).verify_all(invariants)` vets every rule at once; `unreachable()`, `can_error()` and `check_pairwise(...)` find dead, crashing and overlapping rules.
 - **Debugging and tests:** `expr.explain(data)` shows the value of every sub-expression; `celspresso.testing` has `assert_equivalent`, `assert_implies`, `assert_never` and more.
-- **Not yet supported:** protobuf messages and JSON values. The verifier doesn't yet model doubles, maps, bytes, optionals or timestamps; those return `UNKNOWN` with the reason.
+- **Not yet supported:** protobuf messages and JSON values. The verifier models ints, doubles (IEEE, NaN included), strings, lists, maps, optionals, dates, timestamps and durations; bytes and named time zones return `UNKNOWN` with the reason. Proofs over a list or map need a `max_length` (or a larger `unroll_limit`), so the prover can cover every length.
 - **Contributing:** `scripts/check.sh` runs every lint, type-check and test gate.
 
 ## License

@@ -105,9 +105,7 @@ pub fn is_canonical(s: &str) -> Result<bool, String> {
 
 pub fn is_global_unicast(a: &IpAddr) -> bool {
     match a {
-        IpAddr::V4(v4) => {
-            !(v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_link_local() || v4.is_broadcast())
-        }
+        IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_link_local() || v4.is_broadcast()),
         IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() || is_link_local_unicast(a)),
     }
 }

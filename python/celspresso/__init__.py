@@ -15,7 +15,7 @@ from ._errors import (
     VerificationTimeout,
 )
 from ._ruleset import RuleSet
-from ._verdict import Stats, Status, Verdict, Witness
+from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness
 
 try:
     __version__ = version("celspresso")
@@ -23,6 +23,7 @@ except PackageNotFoundError:  # pragma: no cover
     __version__ = "0.0.0"
 
 __all__ = [
+    "Bounds",
     "CelError",
     "CelEvaluationError",
     "CelSyntaxError",
@@ -31,6 +32,7 @@ __all__ = [
     "Env",
     "Explanation",
     "Expr",
+    "Extreme",
     "Predicate",
     "Problem",
     "RuleCheck",

@@ -60,10 +60,7 @@ fn re_literal(s: &str) -> Regexp {
 /// Translate a CEL (RE2) pattern into a Z3 regex matching *whole strings* that
 /// `matches()` would accept (CEL `matches` is an unanchored search).
 pub fn translate_search(pattern: &str) -> Result<Regexp, String> {
-    let hir = regex_syntax::ParserBuilder::new()
-        .build()
-        .parse(pattern)
-        .map_err(|e| format!("regex parse error: {e}"))?;
+    let hir = regex_syntax::ParserBuilder::new().build().parse(pattern).map_err(|e| format!("regex parse error: {e}"))?;
     // peel top-level anchors
     let mut parts: Vec<Hir> = match hir.kind() {
         HirKind::Concat(xs) => xs.clone(),
@@ -140,4 +137,26 @@ fn tr(h: &Hir) -> Result<Regexp, String> {
         HirKind::Concat(xs) => concat(xs.iter().map(tr).collect::<Result<_, _>>()?),
         HirKind::Alternation(xs) => Regexp::union(&xs.iter().map(tr).collect::<Result<Vec<_>, _>>()?),
     })
+}
+
+/// `double(x)` for an integer term: round to nearest, ties to even (Rust's `as f64`).
+pub fn int_to_double(x: &z3::ast::Int) -> z3::ast::Float {
+    use z3::ast::{Ast, Float, Real, RoundingMode};
+    let real = Real::from_int(x);
+    let rm = RoundingMode::round_nearest_ties_to_even();
+    let ctx = z3::Context::thread_local();
+    let sort = z3::Sort::double();
+    // SAFETY: every handle comes from the thread-local context, and the result is
+    // wrapped (and reference counted) immediately.
+    unsafe {
+        let raw = z3_sys::Z3_mk_fpa_to_fp_real(ctx.get_z3_context(), rm.get_z3_ast(), real.get_z3_ast(), sort.get_z3_sort())
+            .expect("fp conversion");
+        Float::wrap(&ctx, raw)
+    }
+}
+
+/// Truncate a finite double to an integer term (meaningful only for finite inputs).
+pub fn double_trunc(d: &z3::ast::Float) -> z3::ast::Int {
+    use z3::ast::{Int, RoundingMode};
+    Int::from_real(&d.round_to_integral_with_rounding_mode(&RoundingMode::round_towards_zero()).to_real())
 }

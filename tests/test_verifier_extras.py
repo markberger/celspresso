@@ -1,0 +1,124 @@
+"""Milestone 3 verifier features: bounds, function contracts, proof sampling, verify_all."""
+
+import datetime as dt
+from typing import Annotated, Literal
+
+import pytest
+from pydantic import BaseModel, Field
+
+from celspresso import Bounds, CelTypeError, Env, RuleSet, VerificationFailed, function
+
+
+class Order(BaseModel):
+    total_cents: Annotated[int, Field(ge=0, le=10_000_000)]
+    days: Annotated[int, Field(ge=0, le=365)]
+    tier: Literal["standard", "gold"]
+    items: Annotated[list[int], Field(max_length=4)]
+    notes: list[str]
+
+
+env = Env(order=Order, today=dt.date)
+
+
+def test_bounds_are_proved_and_attained() -> None:
+    b = env.expr("order.tier == 'gold' ? order.total_cents / 10 : 0", int).bounds()
+    assert isinstance(b, Bounds)
+    assert b.proved
+    assert b.expect() == (0, 1_000_000)
+    assert b.max is not None
+    assert b.max.witness.relevant == {
+        "order.tier": "gold",
+        "order.total_cents": 10_000_000,
+    }
+    assert str(b) == "[0, 1000000]"
+    with pytest.raises(TypeError):
+        bool(b)
+
+
+def test_bounds_respect_assumptions_and_max_length() -> None:
+    assert env.expr("order.days").bounds(assuming="order.days > 100").expect() == (101, 365)
+    b = env.expr("order.items.size()").bounds()
+    assert b.expect() == (0, 4)
+    assert b.max is not None
+    assert b.max.witness.to_python()["order"].items == [0, 0, 0, 0]
+
+
+def test_bounds_explain_what_is_missing() -> None:
+    b = env.expr("size(order.notes)").bounds()
+    assert not b.proved
+    assert "unroll limit" in (b.reason or "")
+    assert str(b).startswith("[0?, 5?] (not proved")
+    with pytest.raises(VerificationFailed):
+        b.expect()
+    assert "integer-valued" in (env.expr("order.tier").bounds().reason or "")
+    assert env.expr("order.days / 0").bounds().min is None
+
+
+def test_ensures_contracts_and_total_functions() -> None:
+    @function(ensures="result >= 0 && result <= 100", total=True)
+    def risk(score: int) -> int:
+        return min(100, max(0, score))
+
+    @function(ensures="result >= 0")
+    def fee(cents: int) -> int:
+        return cents // 100
+
+    e = Env(x=int).extend(functions=[risk, fee])
+    assert e.predicate("risk(x) * 2 <= 200").always_true().proved
+    assert e.predicate("risk(x) > 50").satisfiable().sat
+    # fee's contract is wrong (fee(-100) == -1): every witness is replayed for real,
+    # so a broken contract shows up as a genuine counterexample, never a false proof
+    v = e.predicate("fee(x) >= 0").always_true()
+    assert v.refuted
+    assert v.counterexample is not None
+    assert v.counterexample["x"] < 0
+    assert any(
+        "ensures contract of 'risk'" in a
+        for a in e.predicate("risk(x) >= 0").always_true().stats.approximations
+    )
+
+
+def test_bad_contracts_are_rejected() -> None:
+    @function(ensures="result >= 'a'")
+    def g(x: int) -> int:
+        return x
+
+    with pytest.raises(CelTypeError) as exc:
+        Env(x=int).extend(functions=[g])
+    assert exc.value.source == "result >= 'a'"
+
+    @function(ensures="result + 1")
+    def h(x: int) -> int:
+        return x
+
+    with pytest.raises(ValueError, match="bool expression"):
+        Env(x=int).extend(functions=[h])
+
+    @function(ensures="result > 0")
+    def k(result: int) -> int:
+        return result
+
+    with pytest.raises(TypeError, match="clashes"):
+        Env(x=int).extend(functions=[k])
+
+
+def test_proof_sampling() -> None:
+    sampled = Env(x=int, y=int, debug_sample_proofs=10)
+    assert sampled.predicate("x < y || x >= y").always_true().proved
+    with pytest.raises(TypeError, match="debug_sample_proofs"):
+        Env(x=int, debug_sample_proofs=-1)  # pyright: ignore[reportArgumentType]
+
+
+def test_ruleset_verify_all() -> None:
+    rs = RuleSet(
+        {
+            "small": env.predicate("order.total_cents <= 1000"),
+            "gold": env.predicate("order.tier == 'gold'"),
+            "fee": env.expr("order.days * 2"),
+        },
+        assumptions=["order.days < 30"],
+    )
+    checks = rs.verify_all({"cheap": "order.total_cents <= 5000"})
+    assert set(checks) == {"small", "gold"}
+    assert checks["small"].ok
+    assert not checks["gold"].ok

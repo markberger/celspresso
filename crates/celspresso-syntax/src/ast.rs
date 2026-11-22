@@ -47,13 +47,24 @@ pub enum ExprKind {
     Literal(Literal),
     Ident(String),
     /// `operand.field`; with `test_only` this is the expansion of `has(operand.field)`.
-    Select { operand: Box<Expr>, field: String, test_only: bool },
+    Select {
+        operand: Box<Expr>,
+        field: String,
+        test_only: bool,
+    },
     /// Global call (`target == None`) or receiver-style call.
-    Call { target: Option<Box<Expr>>, function: String, args: Vec<Expr> },
+    Call {
+        target: Option<Box<Expr>>,
+        function: String,
+        args: Vec<Expr>,
+    },
     List(Vec<Expr>),
     Map(Vec<(Expr, Expr)>),
     /// Message construction `Type{field: value}`.
-    Struct { type_name: String, fields: Vec<(String, Expr)> },
+    Struct {
+        type_name: String,
+        fields: Vec<(String, Expr)>,
+    },
     Comprehension(Box<Comprehension>),
 }
 

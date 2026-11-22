@@ -17,7 +17,8 @@ fn schema() -> Arc<Schema> {
     );
     s.vars.insert("user".into(), VarDecl { name: "user".into(), ty: CelType::Struct("User".into()), constraints: Default::default() });
     s.vars.insert("xs".into(), VarDecl { name: "xs".into(), ty: CelType::list(CelType::Int), constraints: Default::default() });
-    s.vars.insert("m".into(), VarDecl { name: "m".into(), ty: CelType::map(CelType::String, CelType::Int), constraints: Default::default() });
+    s.vars
+        .insert("m".into(), VarDecl { name: "m".into(), ty: CelType::map(CelType::String, CelType::Int), constraints: Default::default() });
     s.vars.insert("d".into(), VarDecl { name: "d".into(), ty: CelType::Dyn, constraints: Default::default() });
     Arc::new(s)
 }
@@ -98,10 +99,7 @@ fn definitions() {
     defs.insert("adult".to_string(), parse("user.age >= 18").unwrap());
     defs.insert("ok".to_string(), parse("adult && size(user.roles) > 0").unwrap());
     let e = expand_definitions(parse("ok || xs.exists(adult, adult > 1)").unwrap(), &defs);
-    assert_eq!(
-        celspresso_syntax::unparse(&e),
-        "user.age >= 18 && size(user.roles) > 0 || xs.exists(adult, adult > 1)"
-    );
+    assert_eq!(celspresso_syntax::unparse(&e), "user.age >= 18 && size(user.roles) > 0 || xs.exists(adult, adult > 1)");
     let c = check(e, schema()).unwrap();
     assert_eq!(c.output_type().to_string(), "bool");
 }

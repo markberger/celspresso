@@ -9,7 +9,7 @@ from typing import Any, NoReturn
 from ._errors import VerificationFailed, VerificationTimeout
 from ._types import SchemaBuilder, TypeSpec, from_cel
 
-__all__ = ["Stats", "Status", "Verdict", "Witness"]
+__all__ = ["Bounds", "Extreme", "Stats", "Status", "Verdict", "Witness"]
 
 
 class Status(enum.Enum):
@@ -101,6 +101,55 @@ def _show(v: Any) -> str:
 class Stats:
     elapsed_ms: float
     approximations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Extreme:
+    """One end of an expression's range."""
+
+    value: Any
+    witness: Witness
+    #: the witness replays through the evaluator to exactly `value`
+    attained: bool
+    #: no valid input gives a value beyond this one (an UNSAT check)
+    sound: bool
+
+
+@dataclass(frozen=True)
+class Bounds:
+    """The range of a numeric expression over every valid input on which it does not error.
+
+    `proved` means both ends are exact: sound (nothing lies beyond) and attained (the
+    witness really evaluates to it). Otherwise `reason` says what is missing.
+    """
+
+    question: str
+    min: Extreme | None
+    max: Extreme | None
+    reason: str | None = None
+    bounded: bool = False
+    assumptions: tuple[str, ...] = ()
+    stats: Stats = field(default_factory=lambda: Stats(0.0))
+
+    @property
+    def proved(self) -> bool:
+        return all(x is not None and x.sound and x.attained for x in (self.min, self.max))
+
+    def expect(self) -> tuple[Any, Any]:
+        """`(min, max)` if both ends are proved, otherwise raise VerificationFailed."""
+        if not self.proved or self.min is None or self.max is None:
+            raise VerificationFailed(self, f"{self.question}: not proved ({self.reason or 'unknown'})")
+        return self.min.value, self.max.value
+
+    def __bool__(self) -> NoReturn:
+        raise TypeError("Bounds has no truth value; use .proved or .expect()")
+
+    def __str__(self) -> str:
+        def end(x: Extreme | None) -> str:
+            return "?" if x is None else _show(x.value) + ("" if x.sound and x.attained else "?")
+
+        tail = "" if self.proved else f" (not proved: {self.reason})"
+        return f"[{end(self.min)}, {end(self.max)}]{tail}"
 
 
 @dataclass(frozen=True)

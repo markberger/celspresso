@@ -2,12 +2,11 @@
 //! module exposes a compiled-environment core, compiled programs, and `verify`.
 
 use celspresso_check::{
-    check, expand_definitions, CelType, CheckedExpr, Constraints, FieldDecl, FunctionDecl, Overload, Schema,
-    StructDecl, VarDecl,
+    check, expand_definitions, CelType, CheckedExpr, Constraints, Contract, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl,
 };
-use celspresso_eval::{date, evaluate, time, evaluate_traced, Functions, Key, Limits, StructValue, Value};
+use celspresso_eval::{date, evaluate, evaluate_traced, time, Functions, Key, Limits, StructValue, Value};
 use celspresso_syntax::{parse, render_diagnostic, unparse, Expr, Literal, Span};
-use celspresso_verify::{verify as run_verify, ErrorMode, Options, Query, Status};
+use celspresso_verify::{bounds as run_bounds, verify as run_verify, ErrorMode, Extreme, Options, Query, Status};
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
@@ -365,7 +364,9 @@ fn infer_value(obj: &Bound<'_, PyAny>, path: &str) -> PyResult<Value> {
     } else if obj.is_instance_of::<PyInt>() {
         match obj.extract::<i64>() {
             Ok(i) => Ok(Value::Int(i)),
-            Err(_) => obj.extract::<u64>().map(Value::Uint).map_err(|_| PyValueError::new_err(format!("integer at '{path}' is out of range"))),
+            Err(_) => {
+                obj.extract::<u64>().map(Value::Uint).map_err(|_| PyValueError::new_err(format!("integer at '{path}' is out of range")))
+            }
         }
     } else if obj.is_instance_of::<PyFloat>() {
         Ok(Value::Double(obj.extract()?))
@@ -419,7 +420,8 @@ impl Functions for PyFunctions {
     fn call(&self, function: &str, args: &[Value]) -> Option<Result<Value, String>> {
         let f = self.map.get(function)?;
         Some(Python::attach(|py| {
-            let pyargs: Vec<Bound<'_, PyAny>> = args.iter().map(|a| value_to_py(py, a)).collect::<PyResult<_>>().map_err(|e| e.to_string())?;
+            let pyargs: Vec<Bound<'_, PyAny>> =
+                args.iter().map(|a| value_to_py(py, a)).collect::<PyResult<_>>().map_err(|e| e.to_string())?;
             let tuple = PyTuple::new(py, pyargs).map_err(|e| e.to_string())?;
             match f.bind(py).call1(tuple) {
                 Ok(r) => infer_value(&r, function).map_err(|e| format!("function '{function}' returned an unsupported value: {e}")),
@@ -452,7 +454,7 @@ fn compile_err(kind: &str, src: &str, diags: Vec<(String, Span)>) -> PyErr {
             (m, a, b, rendered)
         })
         .collect();
-    CompileError::new_err((kind.to_string(), items))
+    CompileError::new_err((kind.to_string(), items, src.to_string()))
 }
 
 fn compile_source(schema: &Arc<Schema>, defs: &BTreeMap<String, Expr>, src: &str) -> PyResult<CheckedExpr> {
@@ -475,7 +477,7 @@ impl Core {
     fn new(
         structs: Vec<(String, Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>)>,
         vars: Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>,
-        functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>)>,
+        functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>, Option<(Vec<String>, Option<String>, bool)>)>,
         defs: Vec<(String, String)>,
     ) -> PyResult<Self> {
         let mut s = Schema::with_stdlib();
@@ -489,10 +491,32 @@ impl Core {
         for (name, t, c) in vars {
             s.vars.insert(name.clone(), VarDecl { name, ty: type_from_py(&t)?, constraints: constraints_from_py(c.as_ref())? });
         }
-        for (name, id, receiver, params, result) in functions {
+        let mut contracts = Vec::new();
+        for (name, id, receiver, params, result, ensures) in functions {
             let params = params.iter().map(type_from_py).collect::<PyResult<Vec<_>>>()?;
-            s.add_function(FunctionDecl { name, overloads: vec![Overload { id, receiver, params, result: type_from_py(&result)? }] })
+            let result = type_from_py(&result)?;
+            if let Some((names, src, total)) = ensures {
+                contracts.push((id.clone(), names, params.clone(), result.clone(), src, total));
+            }
+            s.add_function(FunctionDecl { name, overloads: vec![Overload { id, receiver, params, result }] })
                 .map_err(PyValueError::new_err)?;
+        }
+        // contracts see the structs, the parameters and `result`; never other functions (no recursion)
+        for (id, names, params, result, src, total) in contracts {
+            let Some(src) = src else {
+                s.contracts.insert(id, Arc::new(Contract { params: names, ensures: None, total }));
+                continue;
+            };
+            let mut cs = Schema::with_stdlib();
+            cs.structs = s.structs.clone();
+            for (n, t) in names.iter().zip(params).chain([(&"result".to_string(), result)]) {
+                cs.vars.insert(n.clone(), VarDecl { name: n.clone(), ty: t, constraints: Constraints::default() });
+            }
+            let ensures = compile_source(&Arc::new(cs), &BTreeMap::new(), &src)?;
+            if *ensures.output_type() != CelType::Bool {
+                return Err(PyValueError::new_err(format!("ensures for '{id}' must be a bool expression, not {}", ensures.output_type())));
+            }
+            s.contracts.insert(id, Arc::new(Contract { params: names, ensures: Some(ensures), total }));
         }
         let schema = Arc::new(s);
         let mut defmap = BTreeMap::new();
@@ -560,7 +584,12 @@ impl Program {
     }
 
     #[pyo3(signature = (vars, functions=None))]
-    fn evaluate<'py>(&self, py: Python<'py>, vars: &Bound<'py, PyDict>, functions: Option<&Bound<'py, PyDict>>) -> PyResult<Bound<'py, PyAny>> {
+    fn evaluate<'py>(
+        &self,
+        py: Python<'py>,
+        vars: &Bound<'py, PyDict>,
+        functions: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let act = activation(vars, &self.checked.schema)?;
         let funcs = PyFunctions::from_dict(functions)?;
         match evaluate(&self.checked, &act, &funcs, Limits::default()) {
@@ -571,7 +600,12 @@ impl Program {
 
     /// Returns (ok, value_or_message, [(start, end, ok, value_or_message)] in pre-order).
     #[pyo3(signature = (vars, functions=None))]
-    fn explain<'py>(&self, py: Python<'py>, vars: &Bound<'py, PyDict>, functions: Option<&Bound<'py, PyDict>>) -> PyResult<Bound<'py, PyAny>> {
+    fn explain<'py>(
+        &self,
+        py: Python<'py>,
+        vars: &Bound<'py, PyDict>,
+        functions: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let act = activation(vars, &self.checked.schema)?;
         let funcs = PyFunctions::from_dict(functions)?;
         let (r, trace) = evaluate_traced(&self.checked, &act, &funcs, Limits::default());
@@ -620,7 +654,7 @@ impl Program {
 
 /// kind: satisfiable | always_true | equivalent | implies | can_error
 #[pyfunction]
-#[pyo3(signature = (kind, a, b, assumptions, timeout_ms, unroll_limit, schema_constraints, errors, functions=None))]
+#[pyo3(signature = (kind, a, b, assumptions, timeout_ms, unroll_limit, schema_constraints, errors, functions=None, sample_proofs=0))]
 #[allow(clippy::too_many_arguments)]
 fn verify<'py>(
     py: Python<'py>,
@@ -633,6 +667,7 @@ fn verify<'py>(
     schema_constraints: bool,
     errors: &str,
     functions: Option<&Bound<'py, PyDict>>,
+    sample_proofs: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mode = match errors {
         "strict" => ErrorMode::Strict,
@@ -646,7 +681,7 @@ fn verify<'py>(
     let kind_owned = kind.to_string();
     let bb = if matches!(kind, "equivalent" | "implies") { Some(need_b()?) } else { None };
     let funcs = PyFunctions::from_dict(functions)?;
-    let opts = Options { timeout_ms, unroll_limit, schema_constraints };
+    let opts = Options { timeout_ms, unroll_limit, schema_constraints, sample_proofs };
     let out = py.detach(|| {
         let refs: Vec<&CheckedExpr> = asm.iter().map(|x| x.as_ref()).collect();
         let q = match kind_owned.as_str() {
@@ -688,8 +723,53 @@ fn verify<'py>(
     Ok(d)
 }
 
+/// The range of a numeric expression: {min, max: {value, witness, attained, sound} | None, reason, ...}.
+#[pyfunction]
+#[pyo3(signature = (a, assumptions, timeout_ms, unroll_limit, schema_constraints, functions=None))]
+fn bounds<'py>(
+    py: Python<'py>,
+    a: PyRef<'py, Program>,
+    assumptions: Vec<PyRef<'py, Program>>,
+    timeout_ms: u64,
+    unroll_limit: usize,
+    schema_constraints: bool,
+    functions: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let sample_proofs = 0;
+    let ae = a.checked.clone();
+    let asm: Vec<Arc<CheckedExpr>> = assumptions.iter().map(|p| p.checked.clone()).collect();
+    let funcs = PyFunctions::from_dict(functions)?;
+    let opts = Options { timeout_ms, unroll_limit, schema_constraints, sample_proofs };
+    let out = py.detach(|| {
+        let refs: Vec<&CheckedExpr> = asm.iter().map(|x| x.as_ref()).collect();
+        run_bounds(&ae, &refs, opts, &funcs)
+    });
+    let extreme = |x: &Option<Extreme>| -> PyResult<Py<PyAny>> {
+        let Some(x) = x else { return Ok(py.None()) };
+        let d = PyDict::new(py);
+        d.set_item("value", value_to_py(py, &x.value)?)?;
+        let wd = PyDict::new(py);
+        for (k, v) in &x.witness {
+            wd.set_item(k, value_to_py(py, v)?)?;
+        }
+        d.set_item("witness", wd)?;
+        d.set_item("attained", x.attained)?;
+        d.set_item("sound", x.sound)?;
+        Ok(d.into_any().unbind())
+    };
+    let d = PyDict::new(py);
+    d.set_item("min", extreme(&out.min)?)?;
+    d.set_item("max", extreme(&out.max)?)?;
+    d.set_item("reason", out.reason.clone())?;
+    d.set_item("bounded", out.bounded)?;
+    d.set_item("elapsed_ms", out.elapsed_ms)?;
+    d.set_item("approximations", out.approximations.clone())?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _celspresso(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(bounds, m)?)?;
     m.add_class::<Core>()?;
     m.add_class::<Program>()?;
     m.add_function(wrap_pyfunction!(verify, m)?)?;

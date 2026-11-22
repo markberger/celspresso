@@ -24,8 +24,77 @@ fn schema() -> Arc<Schema> {
             ],
         },
     );
-    for (n, t) in [("user", CelType::Struct("User".into())), ("x", CelType::Int), ("y", CelType::Int), ("s", CelType::String), ("xs", CelType::list(CelType::Int)), ("today", CelType::Date)] {
+    for (n, t) in [
+        ("user", CelType::Struct("User".into())),
+        ("x", CelType::Int),
+        ("y", CelType::Int),
+        ("s", CelType::String),
+        ("xs", CelType::list(CelType::Int)),
+        ("today", CelType::Date),
+        ("m", CelType::map(CelType::String, CelType::Int)),
+        ("ids", CelType::map(CelType::Int, CelType::String)),
+    ] {
         s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: Default::default() });
+    }
+    for (n, t) in [
+        ("at", CelType::Timestamp),
+        ("until", CelType::Timestamp),
+        ("dur", CelType::Duration),
+        ("d", CelType::Double),
+        ("e", CelType::Double),
+    ] {
+        s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: Default::default() });
+    }
+    let price = Constraints { ge: Some(0.0), le: Some(1000.0), ..Default::default() };
+    s.vars.insert("price".into(), VarDecl { name: "price".into(), ty: CelType::Double, constraints: price });
+    let lit = |v: i64| celspresso_syntax::Literal::Int(v);
+    let more = [
+        ("n", CelType::Uint, Constraints::default()),
+        ("code", CelType::Int, Constraints { gt: Some(0.0), lt: Some(10.0), ..Default::default() }),
+        ("level", CelType::Int, Constraints { one_of: Some(vec![lit(1), lit(2), lit(3)]), ..Default::default() }),
+        (
+            "zip",
+            CelType::String,
+            Constraints { min_length: Some(5), max_length: Some(5), pattern: Some("^[0-9]+$".into()), ..Default::default() },
+        ),
+        ("blob", CelType::Bytes, Constraints::default()),
+        ("flags", CelType::list(CelType::Bool), Constraints { min_length: Some(1), max_length: Some(2), ..Default::default() }),
+        (
+            "tags",
+            CelType::map(CelType::String, CelType::Bool),
+            Constraints { min_length: Some(1), max_length: Some(2), ..Default::default() },
+        ),
+    ];
+    for (n, t, cons) in more {
+        s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: cons });
+    }
+    let ov =
+        |id: &str, params: Vec<CelType>, result: CelType| celspresso_check::Overload { id: id.into(), receiver: false, params, result };
+    s.functions.insert(
+        "risk".into(),
+        celspresso_check::FunctionDecl { name: "risk".into(), overloads: vec![ov("risk_int", vec![CelType::Int], CelType::Int)] },
+    );
+    s.functions.insert(
+        "scale".into(),
+        celspresso_check::FunctionDecl {
+            name: "scale".into(),
+            overloads: vec![ov("scale_double", vec![CelType::Double], CelType::Double)],
+        },
+    );
+    s.functions.insert(
+        "words".into(),
+        celspresso_check::FunctionDecl {
+            name: "words".into(),
+            overloads: vec![ov("words_string", vec![CelType::String], CelType::list(CelType::String))],
+        },
+    );
+    let small = Constraints { max_length: Some(3), ..Default::default() };
+    for (n, t) in [
+        ("bm", CelType::map(CelType::String, CelType::Int)),
+        ("bids", CelType::map(CelType::Int, CelType::String)),
+        ("bxs", CelType::list(CelType::Int)),
+    ] {
+        s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: small.clone() });
     }
     Arc::new(s)
 }
@@ -65,6 +134,13 @@ fn refuted(src: &str) -> BTreeMap<String, Value> {
         Status::Found(w) => w,
         s => panic!("{src}: expected REFUTED, got {s:?}"),
     }
+}
+#[track_caller]
+fn exact(src: &str) {
+    // proved without relying on the unroll bound
+    let o = run(Query::AlwaysTrue(&c(src)));
+    assert!(matches!(o.status, Status::NotFound), "{src}: expected PROVED, got {:?}", o.status);
+    assert!(!o.bounded, "{src}: proof relied on the unroll bound");
 }
 
 #[test]
@@ -185,17 +261,17 @@ fn vacuous_assumptions_are_unknown() {
 
 #[test]
 fn variables_hidden_by_approximations_never_fake_a_counterexample() {
-    // `s` and `user` appear only under approximated optionals, so the solver's model
-    // omits them; an unbound variable must not be read as "the predicate failed"
-    for src in ["optional.of(s).hasValue()", "optional.of(user).hasValue()", "optional.of(s).orValue('') == s"] {
+    // `at` and `s` appear only under approximated calls, so the solver's model may
+    // omit them; an unbound variable must not be read as "the predicate failed"
+    for src in ["at.getHours('America/New_York') < 24", "at.getHours('Europe/Paris') >= 0 || s != s"] {
         match run(Query::AlwaysTrue(&c(src))).status {
             Status::Unknown(_) => {}
             s => panic!("{src}: expected UNKNOWN, got {s:?}"),
         }
     }
     // any counterexample that is reported must carry every variable and replay
-    if let Status::Found(w) = run(Query::AlwaysTrue(&c("optional.of(s).hasValue() && x > 0"))).status {
-        assert!(w.contains_key("s") && w.contains_key("x"));
+    if let Status::Found(w) = run(Query::AlwaysTrue(&c("at.getHours('Asia/Tokyo') < 24 && x > 0"))).status {
+        assert!(w.contains_key("at") && w.contains_key("x"));
     }
 }
 
@@ -206,4 +282,217 @@ fn block_and_two_variable_macros() {
         Status::Unknown(_) | Status::Found(_) => {}
         s => panic!("two-variable comprehensions must not be PROVED: {s:?}"),
     }
+}
+
+#[test]
+fn maps() {
+    // lookups, membership, presence and size
+    exact("!('a' in bm) || bm['a'] == bm.a");
+    exact("has(bm.a) == ('a' in bm)");
+    exact("size(bm) >= 0 && size(bm) <= 3");
+    // an unbounded map can't support a universal claim: UNKNOWN, never PROVED
+    let o = run(Query::AlwaysTrue(&c("m.all(k, k in m)")));
+    assert!(matches!(o.status, Status::Unknown(_)) && o.bounded, "{:?}", o.status);
+    let w = sat("'a' in m && m['a'] > 5 && size(m) == 2");
+    let Value::Map(mv) = &w["m"] else { panic!("{w:?}") };
+    assert_eq!(mv.len(), 2);
+    // a missing key is an error
+    let w = match run(Query::CanError(&c("m['a'] > 0"))).status {
+        Status::Found(w) => w,
+        s => panic!("{s:?}"),
+    };
+    assert!(matches!(&w["m"], Value::Map(mv) if mv.is_empty() || !mv.keys().any(|k| k.to_value() == Value::str("a"))));
+    // literals: lookups and duplicate keys
+    exact("{'x': 1, 'y': 2}['y'] == 2");
+    exact("{'x': x}.x == x");
+    assert!(matches!(run(Query::CanError(&c("{s: 1, 'k': 2}.k == 2"))).status, Status::Found(_)));
+    exact("size({1: 'a', 2: 'b'}) == 2");
+    exact("{'a': 1} == {'a': 1} && {'a': 1, 'b': 2} == {'b': 2, 'a': 1} && {'a': 1} != {'a': 2}");
+    // comprehensions over maps visit keys
+    exact("bm.all(k, k in bm)");
+    exact("bids.exists(k, bids[k] == s) == (s in bids.map(k, bids[k]))");
+    // transformMap and friends use @mapInsert
+    exact("bm.transformMap(k, v, v + 0) == bm");
+}
+
+#[test]
+fn two_variable_comprehensions() {
+    exact("[10, 20, 30].all(i, v, v == (i + 1) * 10)");
+    exact("[5, 6].exists(i, v, i == 1 && v == 6)");
+    exact("bxs.all(i, v, bxs[i] == v)");
+    exact("bm.all(k, v, bm[k] == v)");
+    let w = refuted("m.all(k, v, v > 0)");
+    assert!(matches!(&w["m"], Value::Map(mv) if mv.values().any(|v| matches!(v, Value::Int(i) if *i <= 0))));
+    exact("{'a': 1, 'b': 2}.transformList(k, v, v).size() == 2");
+}
+
+#[test]
+fn optionals() {
+    exact("optional.of(x).hasValue() && optional.of(x).value() == x");
+    exact("!optional.none().hasValue() && optional.none().orValue(x) == x");
+    exact("optional.ofNonZeroValue(x).hasValue() == (x != 0)");
+    exact("optional.none().or(optional.of(s)).value() == s");
+    exact("optional.of(s) == optional.of(s) && optional.none() == optional.none()");
+    // value() of an empty optional is an error
+    assert!(matches!(run(Query::CanError(&c("optional.ofNonZeroValue(x).value() > 0"))).status, Status::Found(_)));
+    // optional selection and indexing
+    exact("user.?age.value() == user.age");
+    exact("user.?nick.hasValue()");
+    exact("bm.?a.hasValue() == has(bm.a)");
+    exact("bm[?'a'].orValue(0) == ('a' in bm ? bm['a'] : 0)");
+    exact("bxs[?x].hasValue() == (x >= 0 && x < size(bxs))");
+    exact("bm.?a.orValue(1) >= 1 || bm.a < 1");
+    // optional entries in literals
+    exact("size([?optional.ofNonZeroValue(x), 1]) == (x == 0 ? 1 : 2)");
+    exact("size({?'a': bm.?a, 'b': 1}) == (has(bm.a) ? 2 : 1)");
+    let w = sat("bm.?a.orValue(0) == 7");
+    assert!(matches!(&w["bm"], Value::Map(mv) if mv.values().any(|v| *v == Value::Int(7))));
+}
+
+#[test]
+fn timestamps_and_durations() {
+    exact("timestamp('2024-03-01T00:00:00Z') - timestamp('2024-02-28T00:00:00Z') == duration('48h')");
+    exact("timestamp('2024-12-31T23:59:59Z').getDayOfYear() == 365 && timestamp('2023-12-31T00:00:00Z').getDayOfYear() == 364");
+    exact("timestamp('2024-07-04T15:30:00Z').getHours('-05:00') == 10 && timestamp('2024-07-04T15:30:00Z').getDayOfWeek() == 4");
+    exact("timestamp('1969-12-31T23:59:59.5Z').getSeconds() == 59 && timestamp('1969-12-31T23:59:59.5Z').getMilliseconds() == 500");
+    exact("duration('-90m').getHours() == -1 && duration('1.5s').getMilliseconds() == 500 && duration('-1.5s').getMilliseconds() == -500");
+    proved("at + dur - dur == at || true");
+    exact("until - at == duration('0s') || until != at");
+    // ordering and arithmetic agree
+    unsat("dur > duration('0s') && dur < duration('24h') && at < timestamp('9000-01-01T00:00:00Z') && at + dur <= at");
+    let w = refuted("until < at + duration('24h')");
+    assert!(
+        matches!((&w["until"], &w["at"]), (Value::Timestamp(u), Value::Timestamp(a)) if u - a >= 86_400 * 1_000_000_000 || *a > 253_402_000_000 * 1_000_000_000)
+    );
+    // overflow past year 9999 is an error
+    assert!(matches!(run(Query::CanError(&c("at + duration('1h') > at"))).status, Status::Found(_)));
+    exact("timestamp(0) == timestamp('1970-01-01T00:00:00Z') && int(timestamp('1970-01-01T00:00:01.9Z')) == 1");
+    // a named zone isn't modeled: UNKNOWN, never a guess
+    assert!(matches!(run(Query::AlwaysTrue(&c("at.getHours('America/New_York') < 24"))).status, Status::Unknown(_)));
+    unsat("at.getFullYear() == 2025 && at.getMonth() == 1 && at.getDate() == 29 || at.getHours() == 25");
+    let w = sat("at.getFullYear() == 2024 && at.getMonth() == 1 && at.getDate() == 29 && at.getHours('+09:00') == 0");
+    assert!(matches!(w["at"], Value::Timestamp(_)));
+}
+
+#[test]
+fn doubles() {
+    // NaN breaks reflexivity and trichotomy; the witness is a real NaN
+    let w = refuted("d == d");
+    assert!(matches!(w["d"], Value::Double(v) if v.is_nan()));
+    let w = refuted("d < e || d >= e");
+    assert!(matches!((&w["d"], &w["e"]), (Value::Double(a), Value::Double(b)) if a.is_nan() || b.is_nan()));
+    // constraints exclude NaN
+    exact("price == price && price >= 0.0");
+    // -0.0 == 0.0, yet they differ under division
+    exact("-0.0 == 0.0 && 1.0 / -0.0 < 0.0 && 1.0 / 0.0 > 1.0e308");
+    // rounding is IEEE round-to-nearest-even
+    exact("0.1 + 0.2 != 0.3 && 0.5 + 0.25 == 0.75");
+    let w = refuted("d + 1.0 > d");
+    assert!(matches!(w["d"], Value::Double(v) if v.is_nan() || v.is_infinite() || v + 1.0 == v));
+    // mixed int/double comparisons convert the int (lossily, as the spec says)
+    exact("dyn(9007199254740993) == 9007199254740992.0 && !(9223372036854775807 < dyn(9223372036854775808.0))");
+    exact("x < 2 || dyn(x) >= 2.0");
+    // conversions
+    exact("int(2.9) == 2 && int(-2.9) == -2 && uint(3.5) == 3u && double(3) == 3.0");
+    assert!(matches!(run(Query::CanError(&c("int(d) > 0"))).status, Status::Found(_)));
+    exact("price < 1.0 || int(price) >= 1");
+    exact("double(x) - double(x) == 0.0");
+    let w = sat("d * 3.0 == 7.5");
+    assert!(matches!(w["d"], Value::Double(v) if v * 3.0 == 7.5));
+}
+
+/// Host functions for the tests: `risk(x)` is `2 * x` and fails on negatives.
+struct Host;
+impl celspresso_eval::Functions for Host {
+    fn call(&self, function: &str, args: &[Value]) -> Option<Result<Value, String>> {
+        match (function, args) {
+            ("risk", [Value::Int(x)]) if *x < 0 => Some(Err("negative".into())),
+            ("risk", [Value::Int(x)]) => Some(x.checked_mul(2).map(Value::Int).ok_or_else(|| "overflow".into())),
+            ("scale", [Value::Double(d)]) => Some(Ok(Value::Double(d * 2.0))),
+            ("words", [Value::String(s)]) => Some(Ok(Value::list(s.split(' ').map(Value::str).collect()))),
+            _ => None,
+        }
+    }
+}
+
+fn run_host(q: Query) -> Outcome {
+    verify(&q, &[], Options::default(), &Host)
+}
+
+#[test]
+fn host_functions_are_uninterpreted_and_refined() {
+    // the solver can't see inside risk(), so a universal claim is UNKNOWN, naming it
+    match run_host(Query::AlwaysTrue(&c("x < 0 || x > 1000 || risk(x) == 2 * x"))).status {
+        Status::Unknown(r) => assert!(r.contains("risk"), "{r}"),
+        s => panic!("{s:?}"),
+    }
+    // witnesses are refined against the real function until they replay
+    if let Status::Found(w) = run_host(Query::Satisfiable(&c("risk(x) > 10 && x < 100"))).status {
+        assert!(matches!(w["x"], Value::Int(x) if x > 5 && x < 100));
+    }
+    if let Status::Found(w) = run_host(Query::CanError(&c("risk(x) > 0"))).status {
+        assert!(matches!(w["x"], Value::Int(x) if x < 0));
+    }
+    let _ = run_host(Query::Satisfiable(&c("scale(d) == 4.0")));
+    let _ = run_host(Query::Satisfiable(&c("size(words(s)) == 2")));
+    let _ = run_host(Query::Satisfiable(&c("risk(int(n)) == 4 && risk(x) == 6")));
+}
+
+#[test]
+fn list_aggregates() {
+    exact("[1, 5, 3].sum() == 9 && [1, 5, 3].min() == 1 && [1, 5, 3].max() == 5");
+    exact("[2u, 3u].sum() == 5u && [7u].max() == 7u");
+    exact("bxs.size() == 0 || bxs.min() <= bxs.max()");
+    assert!(matches!(run(Query::CanError(&c("bxs.max() > 0"))).status, Status::Found(_)));
+    assert!(matches!(run(Query::CanError(&c("bxs.sum() > 0"))).status, Status::Found(_)));
+    // overflow
+}
+
+#[test]
+fn input_shapes_and_constraints() {
+    exact("code >= 1 && code <= 9 && level in [1, 2, 3] && n >= 0u");
+    unsat("code == 0 || code == 10 || level == 4");
+    let w = sat("zip.startsWith('9')");
+    assert!(matches!(&w["zip"], Value::String(z) if z.len() == 5 && z.starts_with('9') && z.chars().all(|c| c.is_ascii_digit())));
+    unsat("zip.contains('a')");
+    exact("size(flags) >= 1 && size(tags) >= 1");
+    let w = sat("flags[0] && tags.exists(k, tags[k])");
+    assert!(matches!(&w["flags"], Value::List(l) if !l.is_empty()));
+    let w = sat("n > 5u && uint(x) == n");
+    assert!(matches!((&w["n"], &w["x"]), (Value::Uint(a), Value::Int(b)) if *a as i64 == *b));
+    // unmodeled pieces stay sound: fresh values of every shape, UNKNOWN verdicts
+    for src in
+        ["string(d) == s", "s.lowerAscii() == s", "blob == b'abc'", "words(s).size() >= 0", "optional.ofNonZeroValue(blob).hasValue()"]
+    {
+        assert!(matches!(run(Query::AlwaysTrue(&c(src))).status, Status::Unknown(_) | Status::Found(_)), "{src}");
+    }
+}
+
+#[test]
+fn bounds_of_numeric_expressions() {
+    let b = |src: &str| bounds(&c(src), &[], Options::default(), &NoFunctions);
+    let r = b("user.tier == 'pro' ? 1000 : 10");
+    let (lo, hi) = (r.min.unwrap(), r.max.unwrap());
+    assert_eq!((lo.value.clone(), hi.value.clone()), (Value::Int(10), Value::Int(1000)));
+    assert!(lo.sound && lo.attained && hi.sound && hi.attained && r.reason.is_none());
+    assert!(matches!(&hi.witness["user"], Value::Struct(u) if u.fields["tier"] == Value::str("pro")));
+    // schema constraints bound inputs; errors (here: overflow) are excluded
+    let r = b("user.age * 2 + 1");
+    assert_eq!((r.min.unwrap().value, r.max.unwrap().value), (Value::Int(1), Value::Int(301)));
+    let r = b("x + 1");
+    assert_eq!(r.max.unwrap().value, Value::Int(i64::MAX));
+    let r = b("size(user.roles)");
+    assert_eq!((r.min.unwrap().value, r.max.unwrap().value), (Value::Int(0), Value::Int(3)));
+    // assumptions narrow the range
+    let a = c("x >= 3 && x <= 7");
+    let r = bounds(&c("x * x"), &[&a], Options::default(), &NoFunctions);
+    assert_eq!((r.min.unwrap().value, r.max.unwrap().value), (Value::Int(9), Value::Int(49)));
+    // dates and durations
+    let r = b("user.born.daysUntil(date('2024-01-01'))");
+    assert!(r.min.is_some_and(|m| m.sound));
+    // unbounded collections: the bound is not sound, and the reason says why
+    let r = b("size(xs)");
+    assert!(!r.max.unwrap().sound && r.reason.unwrap().contains("unroll"));
+    assert!(b("s").reason.unwrap().contains("integer-valued"));
+    assert!(b("1 / 0").reason.unwrap().contains("errors on every"));
 }

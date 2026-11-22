@@ -32,8 +32,12 @@ fn prec(function: &str) -> Option<(u8, &'static str)> {
 
 /// Recognize the expansion of `t.optMap(x, e)` / `t.optFlatMap(x, e)`.
 fn opt_map(e: &Expr) -> Option<(&Expr, &Comprehension)> {
-    let (ops::CONDITIONAL, [has, then, _]) = call_args(e)? else { return None };
-    let ExprKind::Call { target: Some(t), function, .. } = &has.kind else { return None };
+    let (ops::CONDITIONAL, [has, then, _]) = call_args(e)? else {
+        return None;
+    };
+    let ExprKind::Call { target: Some(t), function, .. } = &has.kind else {
+        return None;
+    };
     if function != "hasValue" {
         return None;
     }

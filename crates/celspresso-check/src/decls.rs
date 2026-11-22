@@ -68,12 +68,25 @@ pub struct FunctionDecl {
     pub overloads: Vec<Overload>,
 }
 
+/// What the verifier may assume about a host function it cannot see into.
+#[derive(Debug)]
+pub struct Contract {
+    pub params: Vec<String>,
+    /// Postcondition: a bool expression over the parameters (by name) and `result`,
+    /// assumed at every call that does not error.
+    pub ensures: Option<crate::CheckedExpr>,
+    /// The function never fails.
+    pub total: bool,
+}
+
 /// The type environment the checker resolves against.
 #[derive(Clone, Debug, Default)]
 pub struct Schema {
     pub structs: BTreeMap<String, StructDecl>,
     pub vars: BTreeMap<String, VarDecl>,
     pub functions: BTreeMap<String, FunctionDecl>,
+    /// Overload id -> contract.
+    pub contracts: BTreeMap<String, std::sync::Arc<Contract>>,
 }
 
 impl Schema {
@@ -143,13 +156,7 @@ pub fn stdlib() -> Vec<FunctionDecl> {
         func(ops::LOGICAL_OR, vec![ov("logical_or", vec![Bool, Bool], Bool)]),
         func(ops::LOGICAL_NOT, vec![ov("logical_not", vec![Bool], Bool)]),
         func(ops::NOT_STRICTLY_FALSE, vec![ov("not_strictly_false", vec![Bool], Bool)]),
-        func(
-            ops::MAP_INSERT,
-            vec![
-                ov("map_insert_entry", vec![mkv(), k(), v()], mkv()),
-                ov("map_insert_map", vec![mkv(), mkv()], mkv()),
-            ],
-        ),
+        func(ops::MAP_INSERT, vec![ov("map_insert_entry", vec![mkv(), k(), v()], mkv()), ov("map_insert_map", vec![mkv(), mkv()], mkv())]),
         func(ops::CONDITIONAL, vec![ov("conditional", vec![Bool, a(), a()], a())]),
         func(ops::NEGATE, vec![ov("negate_int64", vec![Int], Int), ov("negate_double", vec![Double], Double)]),
         func(
@@ -217,10 +224,7 @@ pub fn stdlib() -> Vec<FunctionDecl> {
         func("contains", vec![rov("contains_string", vec![String, String], Bool)]),
         func("startsWith", vec![rov("starts_with_string", vec![String, String], Bool)]),
         func("endsWith", vec![rov("ends_with_string", vec![String, String], Bool)]),
-        func(
-            "matches",
-            vec![ov("matches", vec![String, String], Bool), rov("matches_string", vec![String, String], Bool)],
-        ),
+        func("matches", vec![ov("matches", vec![String, String], Bool), rov("matches_string", vec![String, String], Bool)]),
         func("lowerAscii", vec![rov("string_lower_ascii", vec![String], String)]),
         func("upperAscii", vec![rov("string_upper_ascii", vec![String], String)]),
         func("trim", vec![rov("string_trim", vec![String], String)]),
@@ -278,10 +282,7 @@ pub fn stdlib() -> Vec<FunctionDecl> {
                 ov("timestamp_to_timestamp", vec![Timestamp], Timestamp),
             ],
         ),
-        func(
-            "duration",
-            vec![ov("string_to_duration", vec![String], Duration), ov("duration_to_duration", vec![Duration], Duration)],
-        ),
+        func("duration", vec![ov("string_to_duration", vec![String], Duration), ov("duration_to_duration", vec![Duration], Duration)]),
         // list extensions
         func(
             "sum",
@@ -350,16 +351,11 @@ pub fn stdlib() -> Vec<FunctionDecl> {
         ("duration", Duration),
     ];
     let numeric: [(&str, CelType); 3] = [("int64", Int), ("uint64", Uint), ("double", Double)];
-    for (op, name) in [
-        (ops::LESS, "less"),
-        (ops::LESS_EQUALS, "less_equals"),
-        (ops::GREATER, "greater"),
-        (ops::GREATER_EQUALS, "greater_equals"),
-    ] {
-        let mut overloads: Vec<Overload> = cmp_types
-            .iter()
-            .map(|(n, t)| ov(&format!("{name}_{n}"), vec![t.clone(), t.clone()], Bool))
-            .collect();
+    for (op, name) in
+        [(ops::LESS, "less"), (ops::LESS_EQUALS, "less_equals"), (ops::GREATER, "greater"), (ops::GREATER_EQUALS, "greater_equals")]
+    {
+        let mut overloads: Vec<Overload> =
+            cmp_types.iter().map(|(n, t)| ov(&format!("{name}_{n}"), vec![t.clone(), t.clone()], Bool)).collect();
         for (n1, t1) in &numeric {
             for (n2, t2) in &numeric {
                 if n1 != n2 {
@@ -387,8 +383,14 @@ fn extensions() -> Vec<FunctionDecl> {
         func("ip.isCanonical", vec![ov("ip_is_canonical", vec![String], Bool)]),
         func("string", vec![ov("ip_to_string", vec![ip()], String), ov("cidr_to_string", vec![cidr()], String)]),
         func("family", vec![rov("ip_family", vec![ip()], Int)]),
-        func("containsIP", vec![rov("cidr_contains_ip_ip", vec![cidr(), ip()], Bool), rov("cidr_contains_ip_string", vec![cidr(), String], Bool)]),
-        func("containsCIDR", vec![rov("cidr_contains_cidr", vec![cidr(), cidr()], Bool), rov("cidr_contains_cidr_string", vec![cidr(), String], Bool)]),
+        func(
+            "containsIP",
+            vec![rov("cidr_contains_ip_ip", vec![cidr(), ip()], Bool), rov("cidr_contains_ip_string", vec![cidr(), String], Bool)],
+        ),
+        func(
+            "containsCIDR",
+            vec![rov("cidr_contains_cidr", vec![cidr(), cidr()], Bool), rov("cidr_contains_cidr_string", vec![cidr(), String], Bool)],
+        ),
         func("masked", vec![rov("cidr_masked", vec![cidr()], cidr())]),
         func("prefixLength", vec![rov("cidr_prefix_length", vec![cidr()], Int)]),
     ];
@@ -428,7 +430,14 @@ fn core_extensions() -> Vec<FunctionDecl> {
         func("optional.none", vec![ov("optional_none", vec![], CelType::optional(CelType::p("A")))]),
         func("hasValue", vec![rov("optional_hasValue", vec![CelType::optional(CelType::p("A"))], Bool)]),
         func("value", vec![rov("optional_value", vec![CelType::optional(CelType::p("A"))], CelType::p("A"))]),
-        func("or", vec![rov("optional_or_optional", vec![CelType::optional(CelType::p("A")), CelType::optional(CelType::p("A"))], CelType::optional(CelType::p("A")))]),
+        func(
+            "or",
+            vec![rov(
+                "optional_or_optional",
+                vec![CelType::optional(CelType::p("A")), CelType::optional(CelType::p("A"))],
+                CelType::optional(CelType::p("A")),
+            )],
+        ),
         func("orValue", vec![rov("optional_orValue_value", vec![CelType::optional(CelType::p("A")), CelType::p("A")], CelType::p("A"))]),
         // math (greatest/least have no fixed signature; the checker types them)
         func("math.greatest", vec![]),
@@ -466,10 +475,7 @@ fn core_extensions() -> Vec<FunctionDecl> {
         ),
         func(
             "substring",
-            vec![
-                rov("string_substring_int", vec![String, Int], String),
-                rov("string_substring_int_int", vec![String, Int, Int], String),
-            ],
+            vec![rov("string_substring_int", vec![String, Int], String), rov("string_substring_int_int", vec![String, Int, Int], String)],
         ),
         func(
             "replace",

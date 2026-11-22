@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ._verdict import Verdict
+    from ._verdict import Bounds, Verdict
 
 __all__ = [
     "CelError",
@@ -80,7 +80,7 @@ class CelEvaluationError(CelError):
 class VerificationFailed(CelError, AssertionError):
     """Raised by `Verdict.expect()` when a property does not hold."""
 
-    def __init__(self, verdict: Verdict, message: str):
+    def __init__(self, verdict: Verdict | Bounds, message: str):
         self.verdict = verdict
         super().__init__(message)
 

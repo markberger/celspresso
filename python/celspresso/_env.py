@@ -9,7 +9,7 @@ from typing import Any, Generic, Literal, TypeVar, overload
 from . import _celspresso as _core
 from ._errors import CelError, CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
 from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, type_name
-from ._verdict import Stats, Status, Verdict, Witness, lookup
+from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness, lookup
 
 __all__ = ["Env", "Explanation", "Expr", "Predicate", "Problem", "RuleCheck", "function"]
 
@@ -48,23 +48,35 @@ def _merge_variables(positional: Mapping[str, Any] | None, keywords: dict[str, A
     return merged
 
 
-def _raise_compile(source: str, exc: Exception) -> typing.NoReturn:
-    kind, items = exc.args
+def _raise_compile(exc: Exception) -> typing.NoReturn:
+    kind, items, source = exc.args  # the source that failed (a definition or contract, maybe)
     diags = [Diagnostic(m, a, b, r) for (m, a, b, r) in items]
     cls = CelSyntaxError if kind == "syntax" else CelTypeError
     raise cls(source, diags) from None
 
 
-def function(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
+def function(
+    fn: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    ensures: str | None = None,
+    total: bool = False,
+) -> Any:
     """Mark a Python callable as a CEL function (optionally renaming it).
 
     Pass the result to `Env.extend(functions=[...])`. Parameter and return types
     come from the type hints. The verifier treats custom functions as
-    uninterpreted: it knows they are deterministic, nothing more.
+    uninterpreted: it knows they are deterministic, nothing more, unless you state a
+    postcondition. `ensures` is a CEL predicate over the parameters (by name) and
+    `result`, e.g. `@function(ensures="result >= 0 && result <= 100")`, trusted at
+    every call that does not raise. `total=True` promises the function never raises
+    (otherwise a proof must allow for it). Both are trusted, so they must really hold.
     """
 
     def wrap(f: Callable[..., Any]) -> Callable[..., Any]:
         f.__cel_name__ = name or f.__name__  # type: ignore[attr-defined]
+        f.__cel_ensures__ = ensures  # type: ignore[attr-defined]
+        f.__cel_total__ = total  # type: ignore[attr-defined]
         return f
 
     return wrap(fn) if fn is not None else wrap
@@ -76,6 +88,9 @@ class _Fn:
     impl: Callable[..., Any]
     params: tuple[TypeSpec, ...]
     result: TypeSpec
+    param_names: tuple[str, ...] = ()
+    ensures: str | None = None
+    total: bool = False
 
 
 class Env:
@@ -100,9 +115,17 @@ class Env:
         timeout: float = 5.0,
         unroll_limit: int = 5,
         schema_constraints: bool = True,
+        debug_sample_proofs: int = 0,
         **more_variables: Any,
     ) -> None:
         _check_options(timeout, unroll_limit, schema_constraints)
+        if (
+            isinstance(debug_sample_proofs, bool)
+            or not isinstance(debug_sample_proofs, int)
+            or debug_sample_proofs < 0
+        ):
+            raise _option_clash("debug_sample_proofs", debug_sample_proofs)
+        self._sample = debug_sample_proofs
         variables = _merge_variables(variables, more_variables)
         self._timeout = timeout
         self._unroll = unroll_limit
@@ -123,6 +146,7 @@ class Env:
         e._timeout = self._timeout
         e._unroll = self._unroll
         e._schema_constraints = self._schema_constraints
+        e._sample = self._sample
         e._builder = self._builder.copy()
         e._vars = dict(self._vars)
         e._fns = dict(self._fns)
@@ -134,17 +158,25 @@ class Env:
         structs = [(n, fields) for n, fields in self._builder.structs.items()]
         variables = [(n, spec, cons) for n, (spec, cons) in self._vars.items()]
         fns = [
-            (f.name, f"{f.name}_{len(f.params)}", False, list(f.params), f.result) for f in self._fns.values()
+            (
+                f.name,
+                f"{f.name}_{len(f.params)}",
+                False,
+                list(f.params),
+                f.result,
+                (list(f.param_names), f.ensures, f.total) if f.ensures or f.total else None,
+            )
+            for f in self._fns.values()
         ]
         try:
             self._core = _core.Core(structs, variables, fns, list(self._defs))
         except _core.CompileError as exc:
-            # a definition failed to compile
-            _raise_compile(self._defs[-1][1] if self._defs else "", exc)
+            # a definition (or a function's ensures contract) failed to compile
+            _raise_compile(exc)
         self._fn_impls = {f.name: f.impl for f in self._fns.values()}
         self._fingerprint = (
             tuple(sorted((n, repr(s)) for n, s in self._vars.items())),
-            tuple(sorted(self._fns)),
+            tuple(sorted((n, f.ensures or "", f.total) for n, f in self._fns.items())),
             self._defs,
         )
 
@@ -217,7 +249,7 @@ class Env:
         try:
             prog = self._core.compile(source)
         except _core.CompileError as exc:
-            _raise_compile(source, exc)
+            _raise_compile(exc)
         if prog.output_type == "bool":
             return Predicate(self, prog)
         return Expr(self, prog)
@@ -279,10 +311,7 @@ class Env:
         for x in (a, b):
             if x is not None and x._env._fingerprint != self._fingerprint:
                 raise ValueError("expressions come from different environments")
-        if isinstance(assuming, (str, Predicate)):
-            assuming = [assuming]
-        asm_src = list(self._assumptions) + [x if isinstance(x, str) else x.source for x in assuming]
-        asm = [self.predicate(s)._prog for s in asm_src]
+        asm_src, asm = self._assumption_progs(assuming)
         out = _core.verify(
             kind,
             a._prog,
@@ -293,6 +322,7 @@ class Env:
             self._schema_constraints,
             errors,
             self._fn_impls,
+            self._sample,
         )
         stats = Stats(out["elapsed_ms"], tuple(out["approximations"]))
         common = {
@@ -317,6 +347,47 @@ class Env:
         if out["status"] == "not_found":
             return Verdict(not_found, **common)  # type: ignore[arg-type]
         return Verdict(Status.UNKNOWN, reason=out["reason"], **common)  # type: ignore[arg-type]
+
+    def _assumption_progs(
+        self, assuming: Iterable[str | Predicate] | str | Predicate
+    ) -> tuple[list[str], list[Any]]:
+        if isinstance(assuming, (str, Predicate)):
+            assuming = [assuming]
+        asm_src = list(self._assumptions) + [x if isinstance(x, str) else x.source for x in assuming]
+        return asm_src, [self.predicate(s)._prog for s in asm_src]
+
+    def _bounds(
+        self, e: Expr[Any], assuming: Iterable[str | Predicate] | str | Predicate, timeout: float | None
+    ) -> Bounds:
+        if e._env._fingerprint != self._fingerprint:
+            raise ValueError("expressions come from different environments")
+        asm_src, asm = self._assumption_progs(assuming)
+        out = _core.bounds(
+            e._prog,
+            asm,
+            int((timeout if timeout is not None else self._timeout) * 1000),
+            self._unroll,
+            self._schema_constraints,
+            self._fn_impls,
+        )
+        spec = e._prog.output_type
+        paths = sorted(e.references)
+
+        def end(x: dict[str, Any] | None) -> Extreme | None:
+            if x is None:
+                return None
+            w = Witness(x["witness"], self._specs(), self._builder, paths)
+            return Extreme(from_cel(x["value"], spec, self._builder), w, x["attained"], x["sound"])
+
+        return Bounds(
+            f"bounds: {e.source}",
+            end(out["min"]),
+            end(out["max"]),
+            out["reason"],
+            out["bounded"],
+            tuple(asm_src),
+            Stats(out["elapsed_ms"], tuple(out["approximations"])),
+        )
 
     def _class_clause(self, w: Witness, exprs: Iterable[Expr[Any]]) -> str | None:
         """A clause excluding every input that sets each atomic condition of `exprs`
@@ -452,7 +523,12 @@ def _function_decl(f: Callable[..., Any], builder: SchemaBuilder) -> _Fn:
         params.append(builder.convert(hints[p.name], f"{name}({p.name})")[0])
     if "return" not in hints:
         raise TypeError(f"function '{name}' needs a return type hint")
-    return _Fn(name, f, tuple(params), builder.convert(hints["return"], f"{name} result")[0])
+    result = builder.convert(hints["return"], f"{name} result")[0]
+    names = tuple(sig.parameters)
+    ensures = getattr(f, "__cel_ensures__", None)
+    if ensures is not None and "result" in names:
+        raise TypeError(f"function '{name}': a parameter named 'result' clashes with ensures")
+    return _Fn(name, f, tuple(params), result, names, ensures, bool(getattr(f, "__cel_total__", False)))
 
 
 def _operand(env: Env, x: Any) -> str:
@@ -601,6 +677,14 @@ class Expr(Generic[T]):
     ) -> Verdict:
         """SAT if some valid input makes the expression equal `value`."""
         return self.eq(value).satisfiable(assuming=assuming, timeout=timeout)
+
+    def bounds(
+        self, *, assuming: Iterable[str | Predicate] | str | Predicate = (), timeout: float | None = None
+    ) -> Bounds:
+        """The smallest and largest values over every valid input on which the expression
+        does not error: `limit.bounds().expect() == (10, 1000)`. Integer, uint, date,
+        timestamp and duration expressions only (found with Z3 Optimize, then proved)."""
+        return self._env._bounds(self, assuming, timeout)
 
     def diff(self, other: Expr[Any], *, limit: int = 5, timeout: float | None = None) -> list[Witness]:
         """Up to `limit` distinct inputs on which the two expressions disagree."""

@@ -299,7 +299,9 @@ pub fn call(function: &str, args: &[Value]) -> ExtResult {
 
         // ------------------------------------------------------------ encoders
         ("base64.encode", [Bytes(b)]) => ok(str(base64_encode(b))),
-        ("base64.decode", [String(s)]) => Some(base64_decode(s).map(|b| Bytes(Arc::from(b))).ok_or_else(|| "illegal base64 data".to_string())),
+        ("base64.decode", [String(s)]) => {
+            Some(base64_decode(s).map(|b| Bytes(Arc::from(b))).ok_or_else(|| "illegal base64 data".to_string()))
+        }
         _ => None,
     }
 }
@@ -491,12 +493,7 @@ fn clause(verb: char, precision: Option<usize>, arg: &Value) -> Result<std::stri
                 Uint(u) => format!("{u:x}"),
                 String(s) => s.bytes().map(|b| format!("{b:02x}")).collect(),
                 Bytes(b) => b.iter().map(|b| format!("{b:02x}")).collect(),
-                _ => {
-                    return Err(format!(
-                        "only integers, byte buffers, and strings can be formatted as hex, was given {}",
-                        given()
-                    ))
-                }
+                _ => return Err(format!("only integers, byte buffers, and strings can be formatted as hex, was given {}", given())),
             };
             if verb == 'X' {
                 hex.to_uppercase()
@@ -576,9 +573,7 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn base64_encode(b: &[u8]) -> std::string::String {
     let mut out = std::string::String::with_capacity(b.len().div_ceil(3) * 4);
     for chunk in b.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);

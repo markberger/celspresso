@@ -552,9 +552,7 @@ impl<'a> Evaluator<'a> {
             ("string", [Uint(u)]) => String(Arc::from(u.to_string())),
             ("string", [Double(d)]) => String(Arc::from(d.to_string())),
             ("string", [Bool(b)]) => String(Arc::from(b.to_string())),
-            ("string", [Bytes(b)]) => {
-                String(Arc::from(std::str::from_utf8(b).map_err(|_| err(e, "invalid UTF-8 in bytes"))?))
-            }
+            ("string", [Bytes(b)]) => String(Arc::from(std::str::from_utf8(b).map_err(|_| err(e, "invalid UTF-8 in bytes"))?)),
             ("string", [Date(d)]) => String(Arc::from(date::format_date(*d))),
             ("bytes", [String(s)]) => Bytes(Arc::from(s.as_bytes())),
             ("bytes", [Bytes(b)]) => Bytes(b.clone()),

@@ -10,9 +10,8 @@ fn main() {
         "cel/expr/conformance/proto3/test_all_types.proto",
     ];
     println!("cargo:rerun-if-changed={}", root.display());
-    let fds = protox::compile(files, [&root]).unwrap_or_else(|e| {
-        panic!("compiling cel-spec protos failed ({e}); run `git submodule update --init`")
-    });
+    let fds = protox::compile(files, [&root])
+        .unwrap_or_else(|e| panic!("compiling cel-spec protos failed ({e}); run `git submodule update --init`"));
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cel_spec.bin");
     std::fs::write(out, prost::Message::encode_to_vec(&fds)).unwrap();
 }

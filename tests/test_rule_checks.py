@@ -84,11 +84,12 @@ def test_assumptions_apply_to_every_check() -> None:
 
 
 def test_unknown_is_never_accepted() -> None:
-    r = env.check_rule("m.?a.orValue(0) >= 0", ["m.?a.orValue(0) >= 0"])
+    # m has no max_length, so "every entry" can only be checked up to the unroll limit
+    r = env.check_rule("m.all(k, m[k] >= 0)", ["m.all(k, m[k] >= 0)"])
     assert r.problems
     assert set(kinds(r)) == {"unverified"}
     assert isinstance(r.problems[0], Problem)
-    assert "optional" in r.problems[0].message
+    assert "unroll limit" in r.problems[0].message
 
 
 def test_diff_returns_one_witness_per_behaviour() -> None:

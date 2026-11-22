@@ -77,10 +77,7 @@ impl Parser {
         }
     }
     fn unexpected(&self, expected: &str) -> SyntaxError {
-        SyntaxError {
-            message: format!("expected {expected}, found {}", self.peek().describe()),
-            span: self.peek_span(),
-        }
+        SyntaxError { message: format!("expected {expected}, found {}", self.peek().describe()), span: self.peek_span() }
     }
     fn id(&mut self) -> ExprId {
         let id = self.next_id;
@@ -473,9 +470,7 @@ impl Parser {
                     return Err(SyntaxError { message: "iteration variable overwrites accumulator variable".into(), span: a.span })
                 }
                 ExprKind::Ident(v) => names.push(v.clone()),
-                _ => {
-                    return Err(SyntaxError { message: format!("argument to {name}() must be a simple identifier"), span: a.span })
-                }
+                _ => return Err(SyntaxError { message: format!("argument to {name}() must be a simple identifier"), span: a.span }),
             }
         }
         if vars == 2 && names[0] == names[1] {
@@ -682,9 +677,7 @@ impl Parser {
 pub fn qualified_name(e: &Expr) -> Option<String> {
     match &e.kind {
         ExprKind::Ident(n) => Some(n.clone()),
-        ExprKind::Select { operand, field, test_only: false } => {
-            qualified_name(operand).map(|q| format!("{q}.{field}"))
-        }
+        ExprKind::Select { operand, field, test_only: false } => qualified_name(operand).map(|q| format!("{q}.{field}")),
         _ => None,
     }
 }

@@ -7,25 +7,56 @@
 
 use celspresso_check::CelType;
 use std::collections::BTreeMap;
-use z3::ast::{Bool, Int, String as ZStr};
+use z3::ast::{Bool, Float, Int, String as ZStr};
 
 #[derive(Clone, Debug)]
 pub enum Sym {
     Bool(Bool),
     Int(Int),
     Uint(Int),
+    /// IEEE-754 binary64.
+    Double(Float),
     Str(ZStr),
     /// Day number.
     Date(Int),
+    /// Nanoseconds since the Unix epoch.
+    Timestamp(Int),
+    /// Signed nanoseconds.
+    Duration(Int),
     Null,
     /// `T?`: `inner` is meaningful only when `!is_null`.
-    Nullable { is_null: Bool, inner: Box<Sym> },
+    Nullable {
+        is_null: Bool,
+        inner: Box<Sym>,
+    },
     /// Bounded list: ordered slots, an element is present iff its `live` flag holds.
-    List { slots: Vec<(Bool, Sym)>, elem: CelType, trunc: bool },
-    Struct { name: String, fields: BTreeMap<String, Sym> },
+    List {
+        slots: Vec<(Bool, Sym)>,
+        elem: CelType,
+        trunc: bool,
+    },
+    Struct {
+        name: String,
+        fields: BTreeMap<String, Sym>,
+    },
+    /// `optional_type`: `val` is meaningful only when `has`.
+    Optional {
+        has: Bool,
+        val: Box<Sym>,
+    },
+    /// Bounded map: slots of (live, key, value); the keys of live slots are distinct.
+    Map {
+        slots: Vec<(Bool, Sym, Sym)>,
+        key: CelType,
+        val: CelType,
+        trunc: bool,
+    },
     /// A value of a type the verifier does not model precisely (e.g. double,
     /// map). Opaque values are fresh and only support identity comparison.
-    Opaque { ty: CelType, id: Int },
+    Opaque {
+        ty: CelType,
+        id: Int,
+    },
 }
 
 /// A symbolic value together with "this evaluation produced an error".
@@ -63,6 +94,22 @@ impl SV {
 }
 
 impl Sym {
+    /// Every integer-sorted leaf (ints, uints, dates, timestamps, durations), for sampling.
+    pub fn int_leaves(&self, out: &mut Vec<Int>) {
+        match self {
+            Sym::Int(i) | Sym::Uint(i) | Sym::Date(i) | Sym::Timestamp(i) | Sym::Duration(i) => out.push(i.clone()),
+            Sym::Nullable { inner, .. } => inner.int_leaves(out),
+            Sym::Optional { val, .. } => val.int_leaves(out),
+            Sym::List { slots, .. } => slots.iter().for_each(|(_, s)| s.int_leaves(out)),
+            Sym::Map { slots, .. } => slots.iter().for_each(|(_, k, v)| {
+                k.int_leaves(out);
+                v.int_leaves(out)
+            }),
+            Sym::Struct { fields, .. } => fields.values().for_each(|s| s.int_leaves(out)),
+            _ => {}
+        }
+    }
+
     pub fn as_bool(&self) -> Option<&Bool> {
         match self {
             Sym::Bool(b) => Some(b),
@@ -88,6 +135,17 @@ impl Sym {
         }
     }
 
+    pub fn map_len(slots: &[(Bool, Sym, Sym)]) -> Int {
+        let one = Int::from_i64(1);
+        let zero = Int::from_i64(0);
+        let terms: Vec<Int> = slots.iter().map(|(l, _, _)| l.ite(&one, &zero)).collect();
+        if terms.is_empty() {
+            zero
+        } else {
+            Int::add(&terms)
+        }
+    }
+
     /// Strip Nullable: returns (is_null, inner).
     pub fn unwrap_nullable(&self) -> (Bool, &Sym) {
         match self {
@@ -103,8 +161,17 @@ pub fn sym_eq(a: &Sym, b: &Sym) -> Option<Bool> {
     use Sym::*;
     Some(match (a, b) {
         (Bool(x), Bool(y)) => x.eq(y),
-        (Int(x), Int(y)) | (Uint(x), Uint(y)) | (Int(x), Uint(y)) | (Uint(x), Int(y)) | (Date(x), Date(y)) => x.eq(y),
+        (Int(x), Int(y))
+        | (Uint(x), Uint(y))
+        | (Int(x), Uint(y))
+        | (Uint(x), Int(y))
+        | (Date(x), Date(y))
+        | (Timestamp(x), Timestamp(y))
+        | (Duration(x), Duration(y)) => x.eq(y),
         (Str(x), Str(y)) => x.eq(y),
+        // IEEE equality: NaN != NaN and -0.0 == 0.0; ints compare after conversion (the spec's lossy rule)
+        (Double(x), Double(y)) => x.eq_fpa(y),
+        (Double(x), Int(y) | Uint(y)) | (Int(y) | Uint(y), Double(x)) => x.eq_fpa(crate::zutil::int_to_double(y)),
         (Null, Null) => tt(),
         (Nullable { is_null, .. }, Null) | (Null, Nullable { is_null, .. }) => is_null.clone(),
         (Nullable { is_null: n1, inner: i1 }, Nullable { is_null: n2, inner: i2 }) => {
@@ -127,9 +194,55 @@ pub fn sym_eq(a: &Sym, b: &Sym) -> Option<Bool> {
             and(&parts.iter().collect::<Vec<_>>())
         }
         (List { slots: s1, .. }, List { slots: s2, .. }) => list_eq(s1, s2)?,
+        (Optional { has: h1, val: v1 }, Optional { has: h2, val: v2 }) => {
+            let inner = sym_eq(v1, v2)?;
+            or(&[&and(&[&h1.not(), &h2.not()]), &and(&[h1, h2, &inner])])
+        }
+        (Map { slots: s1, .. }, Map { slots: s2, .. }) => {
+            // same size, and every live entry of one is an entry of the other
+            let n1 = Sym::map_len(s1);
+            let n2 = Sym::map_len(s2);
+            let mut parts = vec![n1.eq(&n2)];
+            for (live, k, v) in s1 {
+                let mut hit = Vec::new();
+                for (l2, k2, v2) in s2 {
+                    hit.push(and(&[l2, &sym_eq(k, k2)?, &sym_eq(v, v2)?]));
+                }
+                parts.push(live.implies(or(&hit.iter().collect::<Vec<_>>())));
+            }
+            and(&parts.iter().collect::<Vec<_>>())
+        }
         (Opaque { ty: t1, id: x }, Opaque { ty: t2, id: y }) if t1 == t2 => x.eq(y),
         _ => return None,
     })
+}
+
+/// Look up `k` in a map: (found, value). The value is meaningful only when found.
+pub fn map_get(slots: &[(Bool, Sym, Sym)], k: &Sym) -> Option<(Bool, Option<Sym>)> {
+    let mut found = ff();
+    let mut result: Option<Sym> = None;
+    for (live, key, val) in slots {
+        let here = and(&[live, &sym_eq(key, k)?]);
+        result = Some(match result {
+            None => val.clone(),
+            Some(r) => ite_sym(&here, val, &r)?,
+        });
+        found = or(&[&found, &here]);
+    }
+    Some((found, result))
+}
+
+/// Keys of live slots are pairwise distinct.
+pub fn distinct_keys(slots: &[(Bool, Sym, Sym)]) -> Option<Bool> {
+    let mut parts = Vec::new();
+    for i in 0..slots.len() {
+        for j in i + 1..slots.len() {
+            let (li, ki, _) = &slots[i];
+            let (lj, kj, _) = &slots[j];
+            parts.push(and(&[li, lj]).implies(sym_eq(ki, kj)?.not()));
+        }
+    }
+    Some(and(&parts.iter().collect::<Vec<_>>()))
 }
 
 /// The k-th live element of a list: (exists, element).
@@ -184,7 +297,10 @@ pub fn ite_sym(c: &Bool, a: &Sym, b: &Sym) -> Option<Sym> {
         (Int(x), Int(y)) => Int(c.ite(x, y)),
         (Uint(x), Uint(y)) => Uint(c.ite(x, y)),
         (Date(x), Date(y)) => Date(c.ite(x, y)),
+        (Timestamp(x), Timestamp(y)) => Timestamp(c.ite(x, y)),
+        (Duration(x), Duration(y)) => Duration(c.ite(x, y)),
         (Str(x), Str(y)) => Str(c.ite(x, y)),
+        (Double(x), Double(y)) => Double(c.ite(x, y)),
         (Null, Null) => Null,
         (Opaque { ty, id: x }, Opaque { id: y, .. }) => Opaque { ty: ty.clone(), id: c.ite(x, y) },
         (Nullable { is_null: n1, inner: i1 }, Nullable { is_null: n2, inner: i2 }) => {
@@ -192,12 +308,8 @@ pub fn ite_sym(c: &Bool, a: &Sym, b: &Sym) -> Option<Sym> {
         }
         (Nullable { is_null, inner }, Null) => Nullable { is_null: or(&[&c.not(), is_null]), inner: inner.clone() },
         (Null, Nullable { is_null, inner }) => Nullable { is_null: or(&[c, is_null]), inner: inner.clone() },
-        (Nullable { is_null, inner }, other) => {
-            Nullable { is_null: and(&[c, is_null]), inner: Box::new(ite_sym(c, inner, other)?) }
-        }
-        (other, Nullable { is_null, inner }) => {
-            Nullable { is_null: and(&[&c.not(), is_null]), inner: Box::new(ite_sym(c, other, inner)?) }
-        }
+        (Nullable { is_null, inner }, other) => Nullable { is_null: and(&[c, is_null]), inner: Box::new(ite_sym(c, inner, other)?) },
+        (other, Nullable { is_null, inner }) => Nullable { is_null: and(&[&c.not(), is_null]), inner: Box::new(ite_sym(c, other, inner)?) },
         (Null, other) => Nullable { is_null: c.clone(), inner: Box::new(other.clone()) },
         (other, Null) => Nullable { is_null: c.not(), inner: Box::new(other.clone()) },
         (Struct { name, fields: f1 }, Struct { fields: f2, .. }) => {
@@ -206,6 +318,23 @@ pub fn ite_sym(c: &Bool, a: &Sym, b: &Sym) -> Option<Sym> {
                 fields.insert(k.clone(), ite_sym(c, v, f2.get(k)?)?);
             }
             Struct { name: name.clone(), fields }
+        }
+        (Optional { has: h1, val: v1 }, Optional { has: h2, val: v2 }) => {
+            Optional { has: c.ite(h1, h2), val: Box::new(ite_sym(c, v1, v2)?) }
+        }
+        (Map { slots: s1, key, val, trunc: t1 }, Map { slots: s2, trunc: t2, .. }) => {
+            // slot-wise merge keeps each branch's keys distinct
+            let n = s1.len().max(s2.len());
+            let mut slots = Vec::with_capacity(n);
+            for i in 0..n {
+                slots.push(match (s1.get(i), s2.get(i)) {
+                    (Some((l1, k1, v1)), Some((l2, k2, v2))) => (c.ite(l1, l2), ite_sym(c, k1, k2)?, ite_sym(c, v1, v2)?),
+                    (Some((l1, k1, v1)), None) => (and(&[c, l1]), k1.clone(), v1.clone()),
+                    (None, Some((l2, k2, v2))) => (and(&[&c.not(), l2]), k2.clone(), v2.clone()),
+                    (None, None) => unreachable!(),
+                });
+            }
+            Map { slots, key: key.clone(), val: val.clone(), trunc: *t1 || *t2 }
         }
         (List { slots: s1, elem, trunc: t1 }, List { slots: s2, trunc: t2, .. }) => {
             // pad the shorter list with dead slots, then merge slot-wise

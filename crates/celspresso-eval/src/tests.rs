@@ -96,7 +96,8 @@ fn variables_and_limits() {
     assert_eq!(r.to_string(), "285");
     let mut s = Schema::with_stdlib();
     s.vars.insert("n".into(), VarDecl { name: "n".into(), ty: CelType::Int, constraints: Default::default() });
-    let c = check(celspresso_syntax::parse("[1,2,3,4,5,6,7,8,9,10].map(x, [1,2,3,4,5,6,7,8,9,10].map(y, x * y))").unwrap(), Arc::new(s)).unwrap();
+    let c = check(celspresso_syntax::parse("[1,2,3,4,5,6,7,8,9,10].map(x, [1,2,3,4,5,6,7,8,9,10].map(y, x * y))").unwrap(), Arc::new(s))
+        .unwrap();
     let limits = Limits { max_iterations: 50, ..Limits::default() };
     let r = evaluate(&c, &HashMap::new(), &NoFunctions, limits);
     assert_eq!(r.unwrap_err().message, "comprehension iteration limit exceeded");

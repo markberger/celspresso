@@ -10,7 +10,7 @@ pub enum Tok {
     Reserved(String),
     /// A backtick-quoted field name, e.g. `` `content-type` ``.
     QuotedIdent(String),
-    Int(u64),     // magnitude; sign handled by the parser
+    Int(u64), // magnitude; sign handled by the parser
     Uint(u64),
     Double(f64),
     Str(String),
@@ -102,8 +102,23 @@ pub struct Token {
 }
 
 const RESERVED: &[&str] = &[
-    "as", "break", "const", "continue", "else", "for", "function", "if", "import", "let", "loop",
-    "package", "namespace", "return", "var", "void", "while",
+    "as",
+    "break",
+    "const",
+    "continue",
+    "else",
+    "for",
+    "function",
+    "if",
+    "import",
+    "let",
+    "loop",
+    "package",
+    "namespace",
+    "return",
+    "var",
+    "void",
+    "while",
 ];
 
 pub fn lex(src: &str) -> Result<Vec<Token>, SyntaxError> {
@@ -175,7 +190,9 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                     }
                     if self.peek() != Some(b'`') || self.pos == body {
-                        return Err(self.err(start, "invalid quoted identifier; allowed: letters, digits, '_', '.', '-', '/', ' '".to_string()));
+                        return Err(
+                            self.err(start, "invalid quoted identifier; allowed: letters, digits, '_', '.', '-', '/', ' '".to_string())
+                        );
                     }
                     let name = self.src[body..self.pos].to_string();
                     self.pos += 1;

@@ -5,7 +5,7 @@ pub mod decls;
 pub mod types;
 
 pub use checker::{check, check_unchecked, suggest, CheckError, CheckedExpr, Reference};
-pub use decls::{Constraints, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl};
+pub use decls::{Constraints, Contract, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl};
 pub use types::CelType;
 
 use celspresso_syntax::ast::{Expr, ExprKind};
@@ -48,15 +48,11 @@ fn expand(e: Expr, defs: &BTreeMap<String, Expr>, next: &mut u32, bound: &mut Ve
         },
         ExprKind::List(items) => ExprKind::List(items.into_iter().map(|a| expand(a, defs, next, bound, active)).collect()),
         ExprKind::Map(entries) => ExprKind::Map(
-            entries
-                .into_iter()
-                .map(|(k, v)| (expand(k, defs, next, bound, active), expand(v, defs, next, bound, active)))
-                .collect(),
+            entries.into_iter().map(|(k, v)| (expand(k, defs, next, bound, active), expand(v, defs, next, bound, active))).collect(),
         ),
-        ExprKind::Struct { type_name, fields } => ExprKind::Struct {
-            type_name,
-            fields: fields.into_iter().map(|(k, v)| (k, expand(v, defs, next, bound, active))).collect(),
-        },
+        ExprKind::Struct { type_name, fields } => {
+            ExprKind::Struct { type_name, fields: fields.into_iter().map(|(k, v)| (k, expand(v, defs, next, bound, active))).collect() }
+        }
         ExprKind::Comprehension(c) => {
             let mut c = *c;
             c.iter_range = expand(c.iter_range, defs, next, bound, active);

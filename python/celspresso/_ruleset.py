@@ -8,6 +8,7 @@ from ._env import Expr, Predicate
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
 
+    from ._env import RuleCheck
     from ._verdict import Verdict, Witness
 
 __all__ = ["RuleSet"]
@@ -54,6 +55,21 @@ class RuleSet:
             v = r.can_error(assuming=self.assumptions, timeout=timeout)
             if not v.unsat:
                 out[n] = v
+        return out
+
+    def verify_all(
+        self,
+        invariants: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, RuleCheck]:
+        """`Env.check_rule` on every predicate: each can fire, can't fail, and implies every
+        invariant (under the set's assumptions). `all(c.ok for c in rs.verify_all(inv).values())`
+        means the whole set is proved safe."""
+        out = {}
+        for n, r in self.rules.items():
+            if isinstance(r, Predicate):
+                out[n] = r.env.check_rule(r, invariants, assuming=self.assumptions, timeout=timeout)
         return out
 
     def check_pairwise(

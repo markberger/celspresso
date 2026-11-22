@@ -49,8 +49,7 @@ fn main() {
         .iter()
         .map(|path| {
             let text = std::fs::read_to_string(path).unwrap();
-            let file = DynamicMessage::parse_text_format(file_desc.clone(), &text)
-                .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
+            let file = DynamicMessage::parse_text_format(file_desc.clone(), &text).unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
             (path.file_stem().unwrap().to_string_lossy().to_string(), file)
         })
         .collect();
@@ -96,10 +95,7 @@ fn main() {
         total_skip += s;
     }
     let total = total_pass + total_fail + total_skip;
-    println!(
-        "| **total** | **{total_pass}** ({:.1}%) | {total_fail} | {total_skip} |",
-        100.0 * total_pass as f64 / total as f64
-    );
+    println!("| **total** | **{total_pass}** ({:.1}%) | {total_fail} | {total_skip} |", 100.0 * total_pass as f64 / total as f64);
 
     let mut ranked: Vec<_> = causes.iter().collect();
     ranked.sort_by_key(|(_, ids)| std::cmp::Reverse(ids.len()));
@@ -155,7 +151,7 @@ fn bucket(why: &str) -> String {
         match c {
             '\'' => {
                 in_quote = !in_quote;
-                out.push_str(if in_quote { "'" } else { "'" });
+                out.push('\'');
             }
             _ if in_quote => {}
             c if c.is_ascii_digit() => {}

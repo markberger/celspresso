@@ -139,13 +139,9 @@ impl Value {
                 (Some(x), Some(y)) => x.cel_eq(y),
                 _ => false,
             },
-            (Int(_) | Uint(_) | Double(_), Int(_) | Uint(_) | Double(_)) => {
-                numeric_cmp(self, other) == Some(Ordering::Equal)
-            }
+            (Int(_) | Uint(_) | Double(_), Int(_) | Uint(_) | Double(_)) => numeric_cmp(self, other) == Some(Ordering::Equal),
             (List(a), List(b)) => a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.cel_eq(y)),
-            (Map(a), Map(b)) => {
-                a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.cel_eq(w)))
-            }
+            (Map(a), Map(b)) => a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.cel_eq(w))),
             (Struct(a), Struct(b)) => {
                 a.type_name == b.type_name
                     && a.fields.len() == b.fields.len()
@@ -175,7 +171,6 @@ pub fn numeric_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     }
 }
 
-
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -187,7 +182,9 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "{}", celspresso_syntax::ast::quote_string(s)),
             Value::Bytes(b) => write!(f, "b{:?}", String::from_utf8_lossy(b)),
             Value::Date(d) => write!(f, "date(\"{}\")", crate::date::format_date(*d)),
-            Value::Timestamp(t) => write!(f, "timestamp(\"{}\")", crate::time::format_timestamp(*t)),
+            Value::Timestamp(t) => {
+                write!(f, "timestamp(\"{}\")", crate::time::format_timestamp(*t))
+            }
             Value::Duration(d) => write!(f, "duration(\"{}\")", crate::time::format_duration(*d)),
             Value::Type(t) => write!(f, "{t}"),
             Value::Net(n) => write!(f, "{}(\"{n}\")", if matches!(**n, crate::net::Net::Ip(_)) { "ip" } else { "cidr" }),

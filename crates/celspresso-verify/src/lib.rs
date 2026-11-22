@@ -15,19 +15,22 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Instant;
 use sym::*;
-use z3::ast::Bool;
-use z3::{Config, Params, SatResult, Solver};
+use z3::ast::{Bool, Int};
+use z3::{Config, Optimize, Params, SatResult, Solver};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub timeout_ms: u64,
     pub unroll_limit: usize,
     pub schema_constraints: bool,
+    /// After a proof, replay the query on this many diverse valid inputs (a soundness
+    /// self-check). Any input that replays as a counterexample is returned as one.
+    pub sample_proofs: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { timeout_ms: 5_000, unroll_limit: 5, schema_constraints: true }
+        Options { timeout_ms: 5_000, unroll_limit: 5, schema_constraints: true, sample_proofs: 0 }
     }
 }
 
@@ -152,8 +155,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
                 if let Some(w) = w.filter(|w| replay(q, assumptions, w, &rec)) {
                     break Status::Found(w);
                 }
-                let facts: Vec<Bool> =
-                    rec.calls.borrow().iter().filter_map(|(f, args, res)| enc.refine(f, args, res)).collect();
+                let facts: Vec<Bool> = rec.calls.borrow().iter().filter_map(|(f, args, res)| enc.refine(f, args, res)).collect();
                 if facts.is_empty() || refinements == MAX_REFINEMENTS {
                     break Status::Unknown(if approximations.is_empty() {
                         "internal: solver witness did not replay in the evaluator".to_string()
@@ -176,10 +178,13 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
                 break match s2.check() {
                     SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
                     _ if bounded => Status::Unknown(format!(
-                        "a list may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
+                        "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
                         opts.unroll_limit
                     )),
-                    _ => Status::NotFound,
+                    _ => match sample_proofs(&enc, q, assumptions, &user, &params, funcs, opts) {
+                        Some(w) => Status::Found(w),
+                        None => Status::NotFound,
+                    },
                 };
             }
             SatResult::Unknown => break Status::Unknown(unknown_reason(solver.get_reason_unknown())),
@@ -188,10 +193,63 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
     (status, bounded, approximations)
 }
 
+/// Proof sampling: draw diverse models of the assumptions alone (random targets for every
+/// integer leaf, as soft preferences) and replay the query on each. The encoding said no
+/// counterexample exists, so one that replays exposes a verifier bug, and is the true answer.
+fn sample_proofs(
+    enc: &Encoder,
+    q: &Query,
+    assumptions: &[&CheckedExpr],
+    user: &[Bool],
+    params: &Params,
+    funcs: &(dyn Functions + Sync),
+    opts: Options,
+) -> Option<BTreeMap<String, Value>> {
+    let mut leaves = Vec::new();
+    for s in enc.vars.values() {
+        s.int_leaves(&mut leaves);
+    }
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        seed >> 33
+    };
+    for _ in 0..opts.sample_proofs {
+        let s = Solver::new();
+        let _ = s.set_params(params);
+        for a in enc.assumptions.iter().chain(user) {
+            s.assert(a);
+        }
+        if s.check() != SatResult::Sat {
+            return None;
+        }
+        let m = s.get_model()?;
+        // half the targets near zero (boundaries), half anywhere in a wider range
+        let soft: Vec<Bool> = leaves
+            .iter()
+            .map(|x| {
+                let r = next() as i64;
+                let t = if r % 2 == 0 { r % 33 - 2 } else { r % 20_001 - 10_000 };
+                x.eq(Int::from_i64(t))
+            })
+            .collect();
+        let m = ReadablePass::new(&soft).run(&s, &m, opts.timeout_ms).unwrap_or(m);
+        if let Some(w) = complete_witness(q, assumptions, enc.witness(&m)) {
+            if replay(q, assumptions, &w, funcs) {
+                return Some(w);
+            }
+        }
+    }
+    None
+}
+
+/// One host-function call: name, arguments and outcome.
+type Call = (String, Vec<Value>, Result<Value, String>);
+
 /// Records every host-function call made while replaying a witness.
 struct Recording<'a> {
     inner: &'a dyn Functions,
-    calls: RefCell<Vec<(String, Vec<Value>, Result<Value, String>)>>,
+    calls: RefCell<Vec<Call>>,
 }
 
 impl Functions for Recording<'_> {
@@ -204,27 +262,25 @@ impl Functions for Recording<'_> {
 
 /// Prefer small, readable witness values (soft constraints) without a fresh MaxSAT search.
 ///
-/// Only preferences the solver's model *violates* are worked on (none, in the common case,
-/// which makes this free). Each is guarded by an indicator literal, created on first use
-/// so it never burdens the main search. We ask the incremental solver to satisfy the
-/// violated set, drop members of the unsat core until it succeeds, and keep the new model
-/// only if it violates fewer preferences overall. Greedy and bounded, not optimal.
+/// Runs only when the solver's model violates some preference (never, in the common case,
+/// which makes this free). Each preference is guarded by an indicator literal, created on
+/// first use so it never burdens the main search. We ask the incremental solver for all
+/// of them, drop members of the unsat core until it succeeds, and keep the new model only
+/// if it violates fewer preferences overall. Greedy and bounded, not optimal.
 struct ReadablePass<'a> {
     soft: &'a [Bool],
     indicators: RefCell<Option<Vec<Bool>>>,
 }
 
 impl<'a> ReadablePass<'a> {
-    const MAX_ROUNDS: usize = 4;
+    const MAX_ROUNDS: usize = 6;
 
     fn new(soft: &'a [Bool]) -> Self {
         ReadablePass { soft, indicators: RefCell::new(None) }
     }
 
     fn violations(&self, model: &z3::Model) -> Vec<usize> {
-        (0..self.soft.len())
-            .filter(|&i| model.eval(&self.soft[i], true).and_then(|b| b.as_bool()) != Some(true))
-            .collect()
+        (0..self.soft.len()).filter(|&i| model.eval(&self.soft[i], true).and_then(|b| b.as_bool()) != Some(true)).collect()
     }
 
     /// May leave a short timeout on the solver; the caller restores its own params.
@@ -240,7 +296,7 @@ impl<'a> ReadablePass<'a> {
                 .enumerate()
                 .map(|(i, s)| {
                     let ind = Bool::new_const(format!("!soft{i}"));
-                    solver.assert(&ind.implies(s));
+                    solver.assert(ind.implies(s));
                     ind
                 })
                 .collect()
@@ -248,7 +304,10 @@ impl<'a> ReadablePass<'a> {
         let mut p = Params::new();
         p.set_u32("timeout", timeout_ms.clamp(20, 100) as u32);
         let _ = solver.set_params(&p);
-        let mut active: Vec<Bool> = violated.iter().map(|&i| indicators[i].clone()).collect();
+        // assume every preference, not just the violated ones: satisfying those alone
+        // tends to break others. Drop unsat-core members (or, on a timeout, the
+        // lower-priority half; preferences are pushed outermost-first) and retry.
+        let mut active: Vec<Bool> = indicators.clone();
         for _ in 0..Self::MAX_ROUNDS {
             if active.is_empty() {
                 return None;
@@ -265,7 +324,7 @@ impl<'a> ReadablePass<'a> {
                     }
                     active.retain(|a| !core.contains(a));
                 }
-                SatResult::Unknown => return None,
+                SatResult::Unknown => active.truncate(active.len() / 2),
             }
         }
         None
@@ -276,12 +335,16 @@ impl<'a> ReadablePass<'a> {
 /// approximation (`optional.of(s).hasValue()`) is absent from the model. Give each such
 /// variable a concrete default so the replay below checks the witness for real; without
 /// a default the variable stays unbound, replay fails, and the verdict is UNKNOWN.
-fn complete_witness(q: &Query, assumptions: &[&CheckedExpr], mut w: BTreeMap<String, Value>) -> Option<BTreeMap<String, Value>> {
+fn complete_witness(q: &Query, assumptions: &[&CheckedExpr], w: BTreeMap<String, Value>) -> Option<BTreeMap<String, Value>> {
     let exprs: Vec<&CheckedExpr> = match q {
         Query::Satisfiable(p) | Query::AlwaysTrue(p) | Query::CanError(p) => vec![p],
         Query::Equivalent(a, b, _) | Query::Implies(a, b) => vec![a, b],
     };
-    for c in exprs.into_iter().chain(assumptions.iter().copied()) {
+    complete_vars(&exprs, assumptions, w)
+}
+
+fn complete_vars(exprs: &[&CheckedExpr], assumptions: &[&CheckedExpr], mut w: BTreeMap<String, Value>) -> Option<BTreeMap<String, Value>> {
+    for c in exprs.iter().copied().chain(assumptions.iter().copied()) {
         for r in c.refs.values() {
             if let Reference::Var(name) = r {
                 if !w.contains_key(name) {
@@ -346,6 +409,155 @@ pub fn verify(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(d
     cfg.set_model_generation(true);
     let (status, bounded, approximations) = z3::with_z3_config(&cfg, || solve(q, assumptions, opts, funcs));
     Outcome { status, bounded, elapsed_ms: start.elapsed().as_secs_f64() * 1000.0, approximations }
+}
+
+/// One end of an expression's range.
+#[derive(Clone, Debug)]
+pub struct Extreme {
+    pub value: Value,
+    /// An input where the expression evaluates to `value` (replayed when `attained`).
+    pub witness: BTreeMap<String, Value>,
+    /// The witness replays through the evaluator to exactly `value`.
+    pub attained: bool,
+    /// No input gives a value beyond this one (UNSAT check), so it is a sound bound.
+    pub sound: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BoundsOutcome {
+    pub min: Option<Extreme>,
+    pub max: Option<Extreme>,
+    /// Why a bound is missing or not exact.
+    pub reason: Option<String>,
+    pub bounded: bool,
+    pub elapsed_ms: f64,
+    pub approximations: Vec<String>,
+}
+
+/// The smallest and largest values a numeric expression takes over every valid input on
+/// which it evaluates without error. Each end is found with Z3 Optimize, then confirmed
+/// by an UNSAT check (nothing beyond it) and by replaying its witness in the evaluator.
+pub fn bounds(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> BoundsOutcome {
+    let start = Instant::now();
+    let mut cfg = Config::new();
+    cfg.set_timeout_msec(opts.timeout_ms);
+    cfg.set_model_generation(true);
+    let mut out = z3::with_z3_config(&cfg, || bounds_inner(e, assumptions, opts, funcs));
+    out.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    out
+}
+
+fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> BoundsOutcome {
+    let mut enc = Encoder::new(e.schema.clone(), opts.unroll_limit, opts.schema_constraints);
+    let sv = enc.encode(e);
+    let user: Vec<Bool> = assumptions.iter().map(|a| holds(&enc.encode(a))).collect();
+    let mut out = BoundsOutcome {
+        min: None,
+        max: None,
+        reason: None,
+        bounded: enc.bounded,
+        elapsed_ms: 0.0,
+        approximations: enc.approximations.iter().cloned().collect(),
+    };
+    let Some(x) = sv.v.as_int().cloned().or(match &sv.v {
+        Sym::Timestamp(i) | Sym::Duration(i) => Some(i.clone()),
+        _ => None,
+    }) else {
+        out.reason = Some(format!("bounds() needs an integer-valued expression, not {}", e.output_type()));
+        return out;
+    };
+    let mut params = Params::new();
+    params.set_u32("timeout", opts.timeout_ms.min(u32::MAX as u64) as u32);
+    let base: Vec<Bool> = enc.assumptions.iter().chain(&user).cloned().chain([sv.err.not()]).collect();
+    let mut reasons = Vec::new();
+    let readable = ReadablePass::new(&enc.soft);
+    for maximize in [false, true] {
+        let opt = Optimize::new();
+        opt.set_params(&params).ok();
+        for b in &base {
+            opt.assert(b);
+        }
+        if maximize {
+            opt.maximize(&x);
+        } else {
+            opt.minimize(&x);
+        }
+        match opt.check(&[]) {
+            SatResult::Sat => {}
+            SatResult::Unsat => {
+                out.reason = Some("the expression errors on every valid input (or the assumptions are unsatisfiable)".into());
+                return out;
+            }
+            SatResult::Unknown => {
+                reasons.push(unknown_reason(opt.get_reason_unknown()));
+                continue;
+            }
+        }
+        let Some(model) = opt.get_model() else { continue };
+        let Some(v) = model.eval(&x, true) else { continue };
+        // confirm: no valid input lies beyond v (Optimize alone may stop early or report infinity)
+        let s = Solver::new();
+        let _ = s.set_params(&params);
+        for b in &base {
+            s.assert(b);
+        }
+        s.push();
+        s.assert(if maximize { x.gt(&v) } else { x.lt(&v) });
+        let beyond = s.check();
+        let _ = s.pop(1);
+        let sound = match beyond {
+            SatResult::Unsat => !enc.bounded,
+            SatResult::Sat => {
+                reasons
+                    .push(format!("no {} bound: the expression is unbounded in this encoding", if maximize { "upper" } else { "lower" }));
+                false
+            }
+            SatResult::Unknown => {
+                reasons.push(unknown_reason(s.get_reason_unknown()));
+                false
+            }
+        };
+        // re-solve at exactly v so the witness can prefer small, readable values
+        s.assert(x.eq(&v));
+        let mut model = model;
+        if s.check() == SatResult::Sat {
+            if let Some(m) = s.get_model() {
+                model = readable.run(&s, &m, opts.timeout_ms).unwrap_or(m);
+            }
+        }
+        let value = enc.value(&model, &sv.v);
+        let witness = complete_vars(&[e], assumptions, enc.witness(&model));
+        let attained = witness.as_ref().is_some_and(|w| {
+            assumptions.iter().all(|a| matches!(evaluate(a, w, funcs, Limits::default()), Ok(Value::Bool(true))))
+                && evaluate(e, w, funcs, Limits::default()).is_ok_and(|r| r == value)
+        });
+        let ext = Extreme { value, witness: witness.unwrap_or_default(), attained, sound };
+        if maximize {
+            out.max = Some(ext);
+        } else {
+            out.min = Some(ext);
+        }
+    }
+    if enc.bounded {
+        reasons.push(format!(
+            "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
+            opts.unroll_limit
+        ));
+    }
+    let exact = |x: &Option<Extreme>| x.as_ref().is_some_and(|x| x.sound && x.attained);
+    if exact(&out.min) && exact(&out.max) {
+        return out;
+    }
+    if reasons.is_empty() {
+        reasons.push(if out.approximations.is_empty() {
+            "a solver witness did not replay in the evaluator".into()
+        } else {
+            format!("approximations: {}", out.approximations.join("; "))
+        });
+    }
+    reasons.dedup();
+    out.reason = Some(reasons.join("; "));
+    out
 }
 
 #[cfg(test)]

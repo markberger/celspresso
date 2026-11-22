@@ -29,12 +29,22 @@ class Core:
         self,
         structs: list[tuple[str, list[tuple[str, TypeSpec, Constraints]]]],
         vars: list[tuple[str, TypeSpec, Constraints]],
-        functions: list[tuple[str, str, bool, list[TypeSpec], TypeSpec]],
+        functions: list[
+            tuple[str, str, bool, list[TypeSpec], TypeSpec, tuple[list[str], str | None, bool] | None]
+        ],
         defs: list[tuple[str, str]],
     ) -> None: ...
     def compile(self, source: str) -> Program: ...
     def definition_names(self) -> list[str]: ...
 
+def bounds(
+    a: Program,
+    assumptions: list[Program],
+    timeout_ms: int,
+    unroll_limit: int,
+    schema_constraints: bool,
+    functions: dict[str, Any] | None = None,
+) -> dict[str, Any]: ...
 def verify(
     kind: str,
     a: Program,
@@ -45,4 +55,5 @@ def verify(
     schema_constraints: bool,
     errors: str,
     functions: dict[str, Any] | None = None,
+    sample_proofs: int = 0,
 ) -> dict[str, Any]: ...
