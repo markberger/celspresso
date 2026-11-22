@@ -30,6 +30,8 @@ pub struct Encoder {
     pub approximations: BTreeSet<String>,
     locals: Vec<(String, SV)>,
     funcs: HashMap<String, (FuncDecl, FuncDecl)>,
+    /// CEL function name -> (overload id, arity) of uninterpreted functions in use.
+    func_overloads: HashMap<String, Vec<(String, usize)>>,
     fresh: u32,
 }
 
@@ -53,6 +55,7 @@ impl Encoder {
             approximations: BTreeSet::new(),
             locals: Vec::new(),
             funcs: HashMap::new(),
+            func_overloads: HashMap::new(),
             fresh: 0,
         }
     }
@@ -108,6 +111,9 @@ impl Encoder {
             }
             CelType::String => {
                 let s = ZStr::new_const(path);
+                // an enumerated or patterned string already has a prescribed shape;
+                // "readable" preferences there are useless and slow the string solver
+                let shaped = cons.is_some_and(|c| c.one_of.is_some() || c.pattern.is_some());
                 if let Some(c) = cons {
                     let len = s.length();
                     if let Some(m) = c.min_length {
@@ -135,9 +141,11 @@ impl Encoder {
                         }
                     }
                 }
-                self.soft.push(s.length().le(Int::from_i64(8)));
-                if let Ok(re) = zutil::translate_search("^[a-z0-9]*$") {
-                    self.soft.push(s.regex_matches(&re));
+                if !shaped {
+                    self.soft.push(s.length().le(Int::from_i64(8)));
+                    if let Ok(re) = zutil::translate_search("^[a-z0-9]*$") {
+                        self.soft.push(s.regex_matches(&re));
+                    }
                 }
                 Sym::Str(s)
             }
@@ -435,6 +443,19 @@ impl Encoder {
         for a in args {
             vals.push(self.enc(c, a));
         }
+        // Equality and `in` compare nullable values as-is (null == null). Every other
+        // builtin has no overload for null, so evaluating it on a null operand is an error:
+        // unwrap to the inner value and fold `is_null` into the error flag.
+        let keeps_null = matches!(function, ops::EQUALS | ops::NOT_EQUALS | ops::IN);
+        if !keeps_null {
+            for sv in &mut vals {
+                if let Sym::Nullable { is_null, inner } = &sv.v {
+                    let (is_null, inner) = (is_null.clone(), (**inner).clone());
+                    sv.err = or(&[&sv.err, &is_null]);
+                    sv.v = inner;
+                }
+            }
+        }
         let err_in = or(&vals.iter().map(|v| &v.err).collect::<Vec<_>>());
         let syms: Vec<Sym> = vals.into_iter().map(|v| v.v).collect();
         match self.builtin(c, e, function, &syms) {
@@ -629,6 +650,30 @@ impl Encoder {
     }
 
     /// Custom (host) functions become uninterpreted functions of their arguments.
+    /// A fact learned by running a real custom function: `f(args) == result` (and no
+    /// error), or `f!err(args)` if it raised. None if the call cannot be expressed.
+    pub fn refine(&self, function: &str, args: &[Value], result: &Result<Value, String>) -> Option<Bool> {
+        let overloads = self.func_overloads.get(function)?;
+        let (overload, _) = overloads.iter().find(|(_, n)| *n == args.len())?;
+        let (f, ferr) = self.funcs.get(overload)?;
+        let lit = |v: &Value| -> Option<Dynamic> {
+            Some(match v {
+                Value::Bool(b) => Dynamic::from_ast(&Bool::from_bool(*b)),
+                Value::Int(i) | Value::Date(i) => Dynamic::from_ast(&Int::from_i64(*i)),
+                Value::Uint(u) => Dynamic::from_ast(&Int::from_u64(*u)),
+                Value::String(s) => Dynamic::from_ast(&zutil::str_lit(s)),
+                _ => return None,
+            })
+        };
+        let arg_asts = args.iter().map(lit).collect::<Option<Vec<_>>>()?;
+        let refs: Vec<&dyn Ast> = arg_asts.iter().map(|d| d as &dyn Ast).collect();
+        let err = ferr.apply(&refs).as_bool()?;
+        Some(match result {
+            Err(_) => err,
+            Ok(v) => and(&[&f.apply(&refs).eq(lit(v)?), &err.not()]),
+        })
+    }
+
     fn uninterpreted(&mut self, c: &CheckedExpr, e: &Expr, function: &str, args: &[Sym]) -> SV {
         let sort_of = |t: &CelType| -> Option<Sort> {
             match t {
@@ -656,6 +701,10 @@ impl Encoder {
             return self.approx(c, e, format!("custom function '{function}' returning {result_ty}"));
         };
         self.approximations.insert(format!("custom function '{function}' is uninterpreted"));
+        let known = self.func_overloads.entry(function.to_string()).or_default();
+        if !known.iter().any(|(o, _)| *o == overload) {
+            known.push((overload.clone(), args.len()));
+        }
         let (f, ferr) = self.funcs.entry(overload.clone()).or_insert_with(|| {
             let srefs: Vec<&Sort> = sorts.iter().collect();
             (FuncDecl::new(overload.clone(), &srefs, &rsort), FuncDecl::new(format!("{overload}!err"), &srefs, &Sort::bool()))

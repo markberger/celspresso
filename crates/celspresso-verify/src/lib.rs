@@ -11,11 +11,12 @@ mod zutil;
 use celspresso_check::CheckedExpr;
 use celspresso_eval::{evaluate, Functions, Limits, Value};
 use encode::Encoder;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Instant;
 use sym::*;
 use z3::ast::Bool;
-use z3::{Config, Optimize, Params, SatResult, Solver};
+use z3::{Config, Params, SatResult, Solver};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -68,18 +69,6 @@ pub struct Outcome {
     pub approximations: Vec<String>,
 }
 
-enum Raw {
-    Sat(BTreeMap<String, Value>),
-    Unsat,
-    Unknown(String),
-}
-
-struct RawOutcome {
-    raw: Raw,
-    bounded: bool,
-    approximations: Vec<String>,
-}
-
 fn holds(sv: &SV) -> Bool {
     match sv.v.as_bool() {
         Some(b) => and(&[b, &sv.err.not()]),
@@ -121,7 +110,10 @@ fn unknown_reason(r: Option<String>) -> String {
     }
 }
 
-fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options) -> RawOutcome {
+/// Rounds of "replay failed -> learn the custom functions' real values -> re-solve".
+const MAX_REFINEMENTS: usize = 8;
+
+fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>) {
     let schema = match q {
         Query::Satisfiable(e) | Query::AlwaysTrue(e) | Query::CanError(e) | Query::Implies(e, _) | Query::Equivalent(e, _, _) => {
             e.schema.clone()
@@ -130,9 +122,11 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options) -> RawOutcome {
     let mut enc = Encoder::new(schema, opts.unroll_limit, opts.schema_constraints);
     let g = match goal(&mut enc, q) {
         Ok(g) => g,
-        Err(why) => return RawOutcome { raw: Raw::Unknown(why), bounded: false, approximations: vec![] },
+        Err(why) => return (Status::Unknown(why), false, vec![]),
     };
     let user: Vec<Bool> = assumptions.iter().map(|a| holds(&enc.encode(a))).collect();
+    let approximations: Vec<String> = enc.approximations.iter().cloned().collect();
+    let bounded = enc.bounded;
 
     let mut params = Params::new();
     params.set_u32("timeout", opts.timeout_ms.min(u32::MAX as u64) as u32);
@@ -142,48 +136,140 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options) -> RawOutcome {
         solver.assert(a);
     }
     solver.assert(&g);
-    let approximations: Vec<String> = enc.approximations.iter().cloned().collect();
-    let raw = match solver.check() {
-        SatResult::Sat => {
-            let mut model = solver.get_model().expect("model");
-            // second pass: prefer small, readable values
-            let opt = Optimize::new();
-            let mut p2 = Params::new();
-            p2.set_u32("timeout", opts.timeout_ms.clamp(50, 500) as u32);
-            let _ = opt.set_params(&p2);
-            for a in enc.assumptions.iter().chain(&user) {
-                opt.assert(a);
-            }
-            opt.assert(&g);
-            for s in &enc.soft {
-                opt.assert_soft(s, 1, None);
-            }
-            if opt.check(&[]) == SatResult::Sat {
-                if let Some(m) = opt.get_model() {
+    let readable = ReadablePass::new(&enc.soft);
+
+    let mut refinements = 0;
+    let status = loop {
+        match solver.check() {
+            SatResult::Sat => {
+                let mut model = solver.get_model().expect("model");
+                if let Some(m) = readable.run(&solver, &model, opts.timeout_ms) {
                     model = m;
                 }
+                let _ = solver.set_params(&params); // restore the full timeout
+                let w = enc.witness(&model);
+                let rec = Recording { inner: funcs, calls: RefCell::new(Vec::new()) };
+                if replay(q, assumptions, &w, &rec) {
+                    break Status::Found(w);
+                }
+                let facts: Vec<Bool> =
+                    rec.calls.borrow().iter().filter_map(|(f, args, res)| enc.refine(f, args, res)).collect();
+                if facts.is_empty() || refinements == MAX_REFINEMENTS {
+                    break Status::Unknown(if approximations.is_empty() {
+                        "internal: solver witness did not replay in the evaluator".to_string()
+                    } else {
+                        format!("candidate witness did not replay; approximations: {}", approximations.join("; "))
+                    });
+                }
+                for f in &facts {
+                    solver.assert(f);
+                }
+                refinements += 1;
             }
-            Raw::Sat(enc.witness(&model))
+            SatResult::Unsat => {
+                // vacuity: if the assumptions alone are contradictory, the "proof" means nothing
+                let s2 = Solver::new();
+                let _ = s2.set_params(&params);
+                for a in enc.assumptions.iter().chain(&user) {
+                    s2.assert(a);
+                }
+                break match s2.check() {
+                    SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
+                    _ if bounded => Status::Unknown(format!(
+                        "a list may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
+                        opts.unroll_limit
+                    )),
+                    _ => Status::NotFound,
+                };
+            }
+            SatResult::Unknown => break Status::Unknown(unknown_reason(solver.get_reason_unknown())),
         }
-        SatResult::Unsat => {
-            // vacuity: if the assumptions alone are contradictory, the "proof" means nothing
-            let s2 = Solver::new();
-            let _ = s2.set_params(&params);
-            for a in enc.assumptions.iter().chain(&user) {
-                s2.assert(a);
-            }
-            match s2.check() {
-                SatResult::Unsat => Raw::Unknown("assumptions are unsatisfiable".into()),
-                _ if enc.bounded => Raw::Unknown(format!(
-                    "a list may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
-                    opts.unroll_limit
-                )),
-                _ => Raw::Unsat,
-            }
-        }
-        SatResult::Unknown => Raw::Unknown(unknown_reason(solver.get_reason_unknown())),
     };
-    RawOutcome { raw, bounded: enc.bounded, approximations }
+    (status, bounded, approximations)
+}
+
+/// Records every host-function call made while replaying a witness.
+struct Recording<'a> {
+    inner: &'a dyn Functions,
+    calls: RefCell<Vec<(String, Vec<Value>, Result<Value, String>)>>,
+}
+
+impl Functions for Recording<'_> {
+    fn call(&self, function: &str, args: &[Value]) -> Option<Result<Value, String>> {
+        let r = self.inner.call(function, args)?;
+        self.calls.borrow_mut().push((function.to_string(), args.to_vec(), r.clone()));
+        Some(r)
+    }
+}
+
+/// Prefer small, readable witness values (soft constraints) without a fresh MaxSAT search.
+///
+/// Only preferences the solver's model *violates* are worked on (none, in the common case,
+/// which makes this free). Each is guarded by an indicator literal, created on first use
+/// so it never burdens the main search. We ask the incremental solver to satisfy the
+/// violated set, drop members of the unsat core until it succeeds, and keep the new model
+/// only if it violates fewer preferences overall. Greedy and bounded, not optimal.
+struct ReadablePass<'a> {
+    soft: &'a [Bool],
+    indicators: RefCell<Option<Vec<Bool>>>,
+}
+
+impl<'a> ReadablePass<'a> {
+    const MAX_ROUNDS: usize = 4;
+
+    fn new(soft: &'a [Bool]) -> Self {
+        ReadablePass { soft, indicators: RefCell::new(None) }
+    }
+
+    fn violations(&self, model: &z3::Model) -> Vec<usize> {
+        (0..self.soft.len())
+            .filter(|&i| model.eval(&self.soft[i], true).and_then(|b| b.as_bool()) != Some(true))
+            .collect()
+    }
+
+    /// May leave a short timeout on the solver; the caller restores its own params.
+    fn run(&self, solver: &Solver, model: &z3::Model, timeout_ms: u64) -> Option<z3::Model> {
+        let violated = self.violations(model);
+        if violated.is_empty() {
+            return None;
+        }
+        let mut slot = self.indicators.borrow_mut();
+        let indicators = slot.get_or_insert_with(|| {
+            self.soft
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let ind = Bool::new_const(format!("!soft{i}"));
+                    solver.assert(&ind.implies(s));
+                    ind
+                })
+                .collect()
+        });
+        let mut p = Params::new();
+        p.set_u32("timeout", timeout_ms.clamp(20, 100) as u32);
+        let _ = solver.set_params(&p);
+        let mut active: Vec<Bool> = violated.iter().map(|&i| indicators[i].clone()).collect();
+        for _ in 0..Self::MAX_ROUNDS {
+            if active.is_empty() {
+                return None;
+            }
+            match solver.check_assumptions(&active) {
+                SatResult::Sat => {
+                    let m = solver.get_model()?;
+                    return (self.violations(&m).len() < violated.len()).then_some(m);
+                }
+                SatResult::Unsat => {
+                    let core = solver.get_unsat_core();
+                    if core.is_empty() {
+                        return None;
+                    }
+                    active.retain(|a| !core.contains(a));
+                }
+                SatResult::Unknown => return None,
+            }
+        }
+        None
+    }
 }
 
 fn replay(q: &Query, assumptions: &[&CheckedExpr], w: &BTreeMap<String, Value>, funcs: &dyn Functions) -> bool {
@@ -207,29 +293,13 @@ fn replay(q: &Query, assumptions: &[&CheckedExpr], w: &BTreeMap<String, Value>, 
 }
 
 /// Run a verification query. `funcs` is used to replay witnesses through the evaluator.
-pub fn verify(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &dyn Functions) -> Outcome {
+pub fn verify(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> Outcome {
     let start = Instant::now();
     let mut cfg = Config::new();
     cfg.set_timeout_msec(opts.timeout_ms);
     cfg.set_model_generation(true);
-    let r = z3::with_z3_config(&cfg, || solve(q, assumptions, opts));
-    let status = match r.raw {
-        Raw::Sat(w) => {
-            if replay(q, assumptions, &w, funcs) {
-                Status::Found(w)
-            } else {
-                let why = if r.approximations.is_empty() {
-                    "internal: solver witness did not replay in the evaluator".to_string()
-                } else {
-                    format!("candidate witness did not replay; approximations: {}", r.approximations.join("; "))
-                };
-                Status::Unknown(why)
-            }
-        }
-        Raw::Unsat => Status::NotFound,
-        Raw::Unknown(why) => Status::Unknown(why),
-    };
-    Outcome { status, bounded: r.bounded, elapsed_ms: start.elapsed().as_secs_f64() * 1000.0, approximations: r.approximations }
+    let (status, bounded, approximations) = z3::with_z3_config(&cfg, || solve(q, assumptions, opts, funcs));
+    Outcome { status, bounded, elapsed_ms: start.elapsed().as_secs_f64() * 1000.0, approximations }
 }
 
 #[cfg(test)]

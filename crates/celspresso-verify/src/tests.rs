@@ -158,6 +158,12 @@ fn nullable_and_dates() {
     let Value::Struct(u) = &w["user"] else { panic!() };
     assert_eq!(u.fields["nick"], Value::Null);
     refuted("user.nick != null");
+    // non-equality builtins see through nullable; a null operand is an evaluation error
+    let w = sat("user.nick != null && size(user.nick) > 3 && user.nick.startsWith('z')");
+    let Value::Struct(u) = &w["user"] else { panic!() };
+    assert!(matches!(&u.fields["nick"], Value::String(s) if s.starts_with('z') && s.chars().count() > 3));
+    proved("user.nick == null || size(user.nick) >= 0");
+    refuted("size(user.nick) >= 0");
     let w = sat("user.born.ageOn(today) >= 18 && user.born.ageOn(today) < 19 && user.born.year() == 2000");
     let Value::Struct(u) = &w["user"] else { panic!() };
     let Value::Date(b) = u.fields["born"] else { panic!() };

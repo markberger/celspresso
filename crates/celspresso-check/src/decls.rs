@@ -85,13 +85,28 @@ impl Schema {
         s
     }
 
-    pub fn add_function(&mut self, f: FunctionDecl) {
+    /// Register a function, or more overloads of an existing one. Fails if an overload
+    /// would be indistinguishable from one already declared (same receiver style and
+    /// parameter types), e.g. a custom `double(int)` clashing with the builtin conversion.
+    pub fn add_function(&mut self, f: FunctionDecl) -> Result<(), String> {
+        if let Some(existing) = self.functions.get(&f.name) {
+            for new in &f.overloads {
+                if let Some(old) = existing.overloads.iter().find(|o| o.receiver == new.receiver && o.params == new.params) {
+                    let params = new.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+                    return Err(format!(
+                        "function '{}({params})' clashes with existing overload '{}'; choose another name",
+                        f.name, old.id
+                    ));
+                }
+            }
+        }
         match self.functions.get_mut(&f.name) {
             Some(existing) => existing.overloads.extend(f.overloads),
             None => {
                 self.functions.insert(f.name.clone(), f);
             }
         }
+        Ok(())
     }
 }
 

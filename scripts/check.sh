@@ -12,10 +12,10 @@ RUST_LINE_FLOOR=73
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 step "ruff lint"
-uv run ruff check python tests
+uv run ruff check python tests benchmarks
 
 step "ruff format"
-uv run ruff format --check python tests
+uv run ruff format --check python tests benchmarks
 
 step "pyright"
 uv run pyright python

@@ -57,6 +57,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["B018"]
+"benchmarks/**" = ["E501", "T201"]  # report tables are printed wide
 
 [tool.ruff.format]
 docstring-code-format = true

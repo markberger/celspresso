@@ -428,7 +428,8 @@ impl Core {
         }
         for (name, id, receiver, params, result) in functions {
             let params = params.iter().map(type_from_py).collect::<PyResult<Vec<_>>>()?;
-            s.add_function(FunctionDecl { name, overloads: vec![Overload { id, receiver, params, result: type_from_py(&result)? }] });
+            s.add_function(FunctionDecl { name, overloads: vec![Overload { id, receiver, params, result: type_from_py(&result)? }] })
+                .map_err(PyValueError::new_err)?;
         }
         let schema = Arc::new(s);
         let mut defmap = BTreeMap::new();
