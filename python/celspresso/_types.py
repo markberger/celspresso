@@ -126,7 +126,7 @@ class SchemaContext:
             return tp, _constraints_of(explicit)
         cons: dict[str, Any] = {}
         spec = self._b._convert(tp, cons, where)
-        return TypeRef._unchecked(spec), _constraints_of({**cons, **explicit})
+        return TypeRef._unchecked(spec), _constraints_of(_intersect(cons, explicit))
 
 
 class _Id:
@@ -283,6 +283,7 @@ class SchemaBuilder:
         if spec[0] == "fixed":
             return
         if spec[0] == "map":
+            _check_map_value(spec[1], where)
             _check_map_value(spec[2], where)
         if spec[0] == "struct":
             if by_name and spec[1] in self.owners:
@@ -300,9 +301,7 @@ class SchemaBuilder:
         """Return (type spec, constraints) for a Python annotation."""
         cons: dict[str, Any] = {}
         spec = self._convert(tp, cons, where)
-        cons = {k: v for k, v in cons.items() if not k.startswith("_")}  # unused precision
-        if "items" in cons:
-            cons["items"] = {k: v for k, v in cons["items"].items() if not k.startswith("_")}
+        cons = _public(cons)  # drop unused precision
         return spec, (cons or None)
 
     # -- adapter support ----------------------------------------------------
@@ -470,6 +469,7 @@ class SchemaBuilder:
         if origin in (dict, Mapping):
             k = self._convert(args[0], {}, f"{where} key") if args else "dyn"
             v = self._convert(args[1], {}, f"{where} value") if args else "dyn"
+            _check_map_value(k, f"{where} key")
             _check_map_value(v, f"{where} value")
             return ("map", k, v)
         if tp in (list, tuple, set, frozenset):
@@ -480,6 +480,34 @@ class SchemaBuilder:
 
 
 _NUMERIC = {"int", "uint", "double", "fixed"}
+
+
+def _public(cons: dict[str, Any]) -> dict[str, Any]:
+    """`cons` without internal `_` keys, at every level of `items`."""
+    out = {k: v for k, v in cons.items() if not k.startswith("_")}
+    if isinstance(out.get("items"), dict):
+        out["items"] = _public(out["items"])
+    return out
+
+
+def _intersect(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """Constraints that hold when both `a` and `b` do: the tighter of each bound."""
+    out = {**a, **b}
+    for key, pick in (
+        ("ge", max),
+        ("gt", max),
+        ("min_length", max),
+        ("le", min),
+        ("lt", min),
+        ("max_length", min),
+    ):
+        if key in a and key in b:
+            out[key] = pick(a[key], b[key])
+    if "one_of" in a and "one_of" in b:
+        out["one_of"] = [v for v in a["one_of"] if v in b["one_of"]]
+    if isinstance(a.get("items"), dict) and isinstance(b.get("items"), dict):
+        out["items"] = _intersect(a["items"], b["items"])
+    return out
 
 
 def _scaled(d: decimal.Decimal, places: int) -> fractions.Fraction:
@@ -504,6 +532,12 @@ def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
         if key not in cons:
             continue
         raw = cons.pop(key)
+        if isinstance(raw, (float, decimal.Decimal)) and not math.isfinite(raw):
+            if raw > 0 if key in ("ge", "gt") else raw < 0:
+                raise ValueError(f"{where}: no value satisfies {key}={raw}")
+            continue  # an infinite bound on the open side bounds nothing
+        if abs(raw) > 10**digits:  # past the digit bound; skip building a huge Fraction
+            raw = 10**digits if raw > 0 else -(10**digits)
         units = _scaled(
             decimal.Decimal(repr(raw)) if isinstance(raw, float) else decimal.Decimal(raw), places
         )
@@ -516,7 +550,8 @@ def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
         # several bounds may land on one key; keep the strongest
         if new_key in cons:
             val = max(val, cons[new_key]) if new_key in ("ge", "gt") else min(val, cons[new_key])
-        cons[new_key] = float(val)
+        lim = 10**digits  # beyond the digit bound a bound adds nothing (and may not fit a float)
+        cons[new_key] = float(max(-lim, min(lim, val)))
     return ("fixed", digits, places)
 
 

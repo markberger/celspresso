@@ -94,7 +94,13 @@ first entry), which are exact only up to 2**53.
   `max_digits`/`decimal_places`; a third-party adapter should pass the annotation
   (`Annotated[Decimal, ...]`) to `ctx.field` instead, as the Pydantic adapter does.
 - `Annotated[T.fixed(8, 2), Field(ge=Decimal("1.00"))]` reads the Decimal bound as units.
-- Witnesses and messages print raw units (`order.total = 35538376`), not `355383.76`.
+- Witnesses and messages print raw units (`order.total = 35538376`, "must be <=
+  99999999"), not decimals.
+- `env.expr("x", T.fixed(8, 4))` on a `fixed(8, 2)` variable rescales silently (a
+  case of the scale mixing above).
+- A host function with an untyped parameter (`v: object`) receives raw units.
+- `T.fixed(5, 5)` accepts 0, which Pydantic's `max_digits=5, decimal_places=5` rejects,
+  so a witness of 0 can't go through `to_python`.
 - *Fix:* scale or reject Decimal bounds on `T.fixed`; render fixed witness values with
   their decimal form.
 - *Found:* M4 review.

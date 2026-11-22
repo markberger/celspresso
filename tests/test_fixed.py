@@ -120,9 +120,9 @@ def test_invalid_specs_are_rejected() -> None:
         T.fixed(3, 4)
     with pytest.raises(ValueError, match="digits"):
         T.fixed(True, 0)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="map values"):
+    with pytest.raises(TypeError, match="map keys and values"):
         T.map(T.string, T.fixed(3, 1))
-    with pytest.raises(TypeError, match="map values"):
+    with pytest.raises(TypeError, match="map keys and values"):
         Env(m=dict[str, Price])
     with pytest.raises(TypeError, match="fixed precision"):
         Env(x=Decimal)
@@ -245,3 +245,44 @@ def test_unused_precision_and_decimal_literals() -> None:
     assert Env(i=Annotated[int, PField(max_digits=5)]).predicate("i > 0").evaluate({"i": 3})
     with pytest.raises(TypeError, match="no CEL literal"):
         Env(x=T.fixed(8, 2)).expr("x", T.fixed(8, 2)).gt(Decimal("1.00"))
+
+
+def test_explicit_constraints_intersect_with_the_annotation() -> None:
+    class Box:
+        pass
+
+    def adapter(ann: object, cons: Constraints) -> object:
+        class A:
+            def schema_for(self, tp: object, ctx: SchemaContext) -> object:
+                return ctx.struct(tp, lambda: [ctx.field("p", ann, cons)]) if tp is Box else None
+
+            def decode(self, key: object, data: dict[str, object]) -> object:
+                return data
+
+        return A()
+
+    def described(ann: object, cons: Constraints) -> str:
+        return Env(b=Box, adapters=[adapter(ann, cons)]).describe()
+
+    assert "p: int, <= 10" in described(Annotated[int, PField(le=10)], Constraints(le=50))
+    price = Annotated[Decimal, PField(max_digits=8, decimal_places=2, le=Decimal("10.00"))]
+    assert "p: fixed(8, 2), <= 1000" in described(price, Constraints(le=5000))
+    items = Annotated[list[Annotated[int, PField(ge=0)]], PField(max_length=3)]
+    assert "each item: >= 0, <= 9" in described(items, Constraints(items=Constraints(le=9)))
+
+
+def test_fixed_map_keys_are_rejected() -> None:
+    with pytest.raises(TypeError, match="map keys"):
+        T.map(T.fixed(3, 1), T.int)
+    with pytest.raises(TypeError, match="map keys"):
+        Env(m=dict[Price, int])
+
+
+def test_deeply_nested_unused_precision_and_extreme_bounds() -> None:
+    ann = Annotated[int, PField(max_digits=5)]
+    assert Env(x=list[list[ann]]).predicate("size(x) == 1").evaluate({"x": [[1]]})
+    for b in (1e308, Decimal("1e999999"), Decimal("Infinity")):
+        env = Env(x=Annotated[Decimal, PField(max_digits=4, decimal_places=2, le=b)])
+        assert env.predicate("x <= 9999").always_true().proved
+    with pytest.raises(ValueError, match="no value satisfies"):
+        Env(x=Annotated[Decimal, PField(max_digits=4, decimal_places=2, ge=Decimal("Infinity"))])

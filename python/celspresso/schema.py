@@ -111,6 +111,7 @@ def _check_spec(spec: Any) -> None:
             for a in args:
                 _check_spec(a)
             if kind == "map":
+                _check_map_value(args[0], "T.map key")
                 _check_map_value(args[1], "T.map value")
             return
     raise TypeError(f"not a CEL type: {spec!r}; build types with celspresso.schema.T")
@@ -136,9 +137,9 @@ def _contains_fixed(spec: Any) -> bool:
 
 
 def _check_map_value(spec: Any, where: str) -> None:
-    # a map's values carry no constraints, so a fixed-point scale has nowhere to go
+    # a map's keys and values carry no constraints, so a fixed-point scale has nowhere to go
     if _contains_fixed(spec):
-        raise TypeError(f"{where}: fixed-point map values are not supported; use a list of structs")
+        raise TypeError(f"{where}: fixed-point map keys and values are not supported; use a list of structs")
 
 
 def _check_struct_name(name: Any) -> None:
@@ -170,6 +171,7 @@ class T:
 
     @staticmethod
     def map(key: TypeRef, value: TypeRef) -> TypeRef:
+        _check_map_value(_ref(key, "T.map key")._spec, "T.map key")
         _check_map_value(_ref(value, "T.map value")._spec, "T.map value")
         return TypeRef._unchecked(("map", _ref(key, "T.map key")._spec, _ref(value, "T.map value")._spec))
 
