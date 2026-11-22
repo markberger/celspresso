@@ -230,12 +230,12 @@ def test_declared_structs_and_classes_share_one_namespace() -> None:
     assert env.variables["cls"] != "Item"
     assert env.predicate("declared.sku == cls.name").satisfiable().sat
     # ...and a declared struct can't take a name a class holds
-    with pytest.raises(ValueError, match="already used by class"):
+    with pytest.raises(ValueError, match="already used by"):
         Env(x=Item).extend(structs=[Struct("Item", [Field("name", T.string)])])
     # nor refer to a class's struct by name: that name depends on registration order
-    with pytest.raises(TypeError, match="use the class itself"):
+    with pytest.raises(TypeError, match="use that type itself"):
         Env(x=Item).extend(structs=[Struct("Box", [Field("i", T.struct("Item"))])])
-    with pytest.raises(TypeError, match="use the class itself"):
+    with pytest.raises(TypeError, match="use that type itself"):
         Env(x=Item).extend(y=T.struct("Item"))
 
 

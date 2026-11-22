@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
-import dataclasses
 import datetime as _dt
 import decimal
 import enum
+import functools
 import math
 import sys
 import types
 import typing
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any, Union, get_args, get_origin
 
 from ._celspresso import pattern_error
-from .schema import Constraints, Struct, TypeRef
+from .schema import Constraints, Field, Struct, TypeRef, _check_struct_name
 
 TypeSpec = Any  # "int" | ("list", TypeSpec) | ("nullable", TypeSpec) | ("struct", name) | ...
 
@@ -52,8 +52,64 @@ def is_model(tp: Any) -> bool:
     return isinstance(tp, type) and hasattr(tp, "model_fields") and hasattr(tp, "model_validate")
 
 
-def is_struct_class(tp: Any) -> bool:
-    return is_model(tp) or (isinstance(tp, type) and dataclasses.is_dataclass(tp))
+@functools.cache
+def _default_adapters() -> tuple[Any, ...]:
+    from .adapters import DataclassAdapter, PydanticAdapter
+
+    return (PydanticAdapter(), DataclassAdapter())
+
+
+class SchemaContext:
+    """What a `TypeAdapter` gets while mapping a type: converting the types its fields
+    are annotated with, and registering structs (with naming and recursion handled)."""
+
+    __slots__ = ("_adapter", "_b")
+
+    def __init__(self, builder: SchemaBuilder, adapter: Any) -> None:
+        self._b = builder
+        self._adapter = adapter
+
+    def struct(self, key: Any, build: Callable[[], Iterable[Field]], *, name: str | None = None) -> TypeRef:
+        """The struct for `key` (usually a class), calling `build()` for its fields the
+        first time. `build` may convert types that refer back to `key`: recursion works.
+
+        The struct is named `name` if given and free, else after the class
+        (`Name`, then `module.Qualname`), with `#2`, `#3`, ... appended if taken."""
+        if name is not None:
+            _check_struct_name(name)
+        return TypeRef._unchecked(("struct", self._b._register(key, self._adapter, build, name)))
+
+    def convert(self, tp: Any, constraints: Constraints | None = None) -> tuple[TypeRef, Constraints]:
+        """The CEL type for a Python annotation (through every adapter), and the
+        constraints it carries, merged over `constraints`."""
+        where = self._b._building[-1] if self._b._building else repr(tp)
+        return self._convert(tp, constraints, where)
+
+    def field(self, name: str, tp: Any, constraints: Constraints | None = None) -> Field:
+        """A struct field of Python type `tp`; for use inside `struct(..., build)`."""
+        where = f"{self._b._building[-1]}.{name}" if self._b._building else name
+        ref, cons = self._convert(tp, constraints, where)
+        return Field(name, ref, cons)
+
+    def type_hints(self, cls: type) -> dict[str, Any]:
+        """`typing.get_type_hints(cls, include_extras=True)`, also resolving string
+        annotations that name classes already registered (e.g. local classes)."""
+        return self._b.type_hints(cls)
+
+    def _convert(self, tp: Any, constraints: Constraints | None, where: str) -> tuple[TypeRef, Constraints]:
+        cons: dict[str, Any] = dict(constraints._spec() or {}) if constraints is not None else {}
+        spec = self._b._convert(tp, cons, where)
+        return TypeRef._unchecked(spec), _constraints_of(cons)
+
+
+def _constraints_of(d: dict[str, Any] | None) -> Constraints:
+    if not d:
+        return Constraints()
+    return Constraints(
+        **{k: v for k, v in d.items() if k not in ("one_of", "items")},
+        one_of=tuple(d["one_of"]) if "one_of" in d else None,
+        items=_constraints_of(d["items"]) if "items" in d else None,
+    )
 
 
 def type_name(spec: TypeSpec) -> str:
@@ -72,15 +128,37 @@ def type_name(spec: TypeSpec) -> str:
 class SchemaBuilder:
     """Collects struct declarations while converting Python annotations."""
 
-    def __init__(self) -> None:
+    def __init__(self, adapters: Iterable[Any] = ()) -> None:
         self.structs: dict[str, list[tuple[str, TypeSpec, dict[str, Any] | None]]] = {}
-        self.classes: dict[str, type] = {}
+        # struct name -> (the key an adapter registered it under, that adapter)
+        self.owners: dict[str, tuple[Any, Any]] = {}
+        self._by_key: dict[int, str] = {}  # id(key) -> name; owners keeps the keys alive
+        self.adapters: tuple[Any, ...] = _default_adapters()
+        self._building: list[str] = []
+        self.add_adapters(adapters)
 
     def copy(self) -> SchemaBuilder:
-        b = SchemaBuilder()
+        b = SchemaBuilder.__new__(SchemaBuilder)
         b.structs = dict(self.structs)
-        b.classes = dict(self.classes)
+        b.owners = dict(self.owners)
+        b._by_key = dict(self._by_key)
+        b.adapters = self.adapters
+        b._building = []
         return b
+
+    def add_adapters(self, adapters: Iterable[Any]) -> None:
+        """Put adapters ahead of the ones already here (they only affect types not yet seen)."""
+        new = list(adapters)
+        for a in new:
+            if not (callable(getattr(a, "schema_for", None)) and callable(getattr(a, "decode", None))):
+                raise TypeError(
+                    f"adapters=[...] expects TypeAdapter objects (schema_for and decode), got {a!r}"
+                )
+        self.adapters = (*new, *self.adapters)
+
+    @property
+    def classes(self) -> dict[str, Any]:
+        return {name: key for name, (key, _) in self.owners.items()}
 
     # -- public -----------------------------------------------------------
 
@@ -93,9 +171,9 @@ class SchemaBuilder:
                 raise TypeError(f"structs=[...] expects celspresso.schema.Struct values, got {st!r}")
             spec = st._spec()
             if st.name in self.structs:
-                if st.name in self.classes:
+                if st.name in self.owners:
                     raise ValueError(
-                        f"struct name '{st.name}' is already used by class {self.classes[st.name]!r}"
+                        f"struct name '{st.name}' is already used by {self.owners[st.name][0]!r}"
                     )
                 if self.structs[st.name] != spec:
                     raise ValueError(f"struct '{st.name}' is already declared with different fields")
@@ -103,24 +181,25 @@ class SchemaBuilder:
         for st in new:
             for f in st.fields:
                 where = f"{st.name}.{f.name}"
-                self._check_refs(f.type._spec, where)
+                self._check_refs(f.type._spec, where, by_name=True)
                 _check_constraints(f.type._spec, f.constraints, where)
 
-    def _check_refs(self, spec: TypeSpec, where: str) -> None:
+    def _check_refs(self, spec: TypeSpec, where: str, *, by_name: bool) -> None:
+        """Every struct `spec` mentions must exist. `by_name` refs (a user's T.struct) may
+        not name an adapter's struct: those names depend on registration order."""
         if isinstance(spec, str):
             return
         if spec[0] == "struct":
-            if spec[1] in self.classes:
-                # a class's CEL name depends on registration order; never refer to it by name
+            if by_name and spec[1] in self.owners:
                 raise TypeError(
-                    f"{where}: '{spec[1]}' is the struct for class {self.classes[spec[1]]!r}; "
-                    "use the class itself instead of T.struct"
+                    f"{where}: '{spec[1]}' is the struct for {self.owners[spec[1]][0]!r}; "
+                    "use that type itself instead of T.struct"
                 )
             if spec[1] not in self.structs:
                 raise TypeError(f"{where}: unknown struct '{spec[1]}'; declare it with structs=[Struct(...)]")
             return
         for inner in spec[1:]:
-            self._check_refs(inner, where)
+            self._check_refs(inner, where, by_name=by_name)
 
     def convert(self, tp: Any, where: str) -> tuple[TypeSpec, dict[str, Any] | None]:
         """Return (type spec, constraints) for a Python annotation."""
@@ -128,55 +207,69 @@ class SchemaBuilder:
         spec = self._convert(tp, cons, where)
         return spec, (cons or None)
 
-    # -- internals --------------------------------------------------------
+    # -- adapter support ----------------------------------------------------
 
-    def _struct_name(self, cls: type) -> str:
-        """The class's struct name: its own if registered already, else the first free one
-        of `Name`, `module.Qualname`, `module.Qualname#2`, ... Distinct classes never share
-        a name (Django migration models, for one, all live in the same fake module)."""
-        for name, known in self.classes.items():
-            if known is cls:
-                return name
-        qualified = f"{cls.__module__}.{cls.__qualname__}"
-        candidates = [cls.__name__, qualified]
+    def _struct_name(self, key: Any, preferred: str | None) -> str:
+        """The first free one of `preferred` (else `Name`, `module.Qualname`), then
+        `...#2`, `...#3`: distinct keys never share a name (Django migration models, for
+        one, are distinct classes that all live in the same fake module)."""
+        if preferred is not None:
+            qualified, candidates = preferred, [preferred]
+        else:
+            qualname = getattr(key, "__qualname__", None)
+            if not isinstance(qualname, str):
+                raise TypeError(f"cannot name a struct for {key!r}; pass name= to ctx.struct")
+            qualified = f"{key.__module__}.{qualname}"
+            candidates = [key.__name__, qualified]
         n = 2
         while True:
             for name in candidates:
-                if name not in self.structs:  # taken by a class or a declared Struct
+                if name not in self.structs:  # taken by an adapter or a declared Struct
                     return name
             candidates = [f"{qualified}#{n}"]
             n += 1
 
-    def _register(self, cls: type) -> str:
-        name = self._struct_name(cls)
-        if name in self.structs:
-            return name
-        self.classes[name] = cls
-        self.structs[name] = []  # placeholder for recursion
-        fields: list[tuple[str, TypeSpec, dict[str, Any] | None]] = []
-        if is_model(cls):
-            for fname, info in cls.model_fields.items():  # type: ignore[attr-defined]
-                cons: dict[str, Any] = {}
-                _metadata_constraints(info.metadata, cons)
-                spec = self._convert(info.annotation, cons, f"{name}.{fname}")
-                fields.append((fname, spec, cons or None))
-        else:
-            hints = self._hints(cls, name)
-            for f in dataclasses.fields(cls):
-                cons = {}
-                spec = self._convert(hints.get(f.name, Any), cons, f"{name}.{f.name}")
-                fields.append((f.name, spec, cons or None))
-        self.structs[name] = fields
+    def _register(
+        self, key: Any, adapter: Any, build: Callable[[], Iterable[Field]], preferred: str | None
+    ) -> str:
+        known = self._by_key.get(id(key))
+        if known is not None:
+            return known
+        name = self._struct_name(key, preferred)
+        self.owners[name] = (key, adapter)
+        self._by_key[id(key)] = name
+        self.structs[name] = []  # placeholder: fields may refer back to this struct
+        self._building.append(name)
+        try:
+            fields = list(build())
+        finally:
+            self._building.pop()
+        seen: set[str] = set()
+        out: list[tuple[str, TypeSpec, dict[str, Any] | None]] = []
+        for f in fields:
+            if not isinstance(f, Field):
+                raise TypeError(f"{name}: an adapter's struct fields must be schema.Field values, got {f!r}")
+            if f.name in seen:
+                raise ValueError(f"{name}: field '{f.name}' is declared twice")
+            seen.add(f.name)
+            where = f"{name}.{f.name}"
+            self._check_refs(f.type._spec, where, by_name=False)
+            _check_constraints(f.type._spec, f.constraints, where)
+            out.append((f.name, f.type._spec, f.constraints._spec()))
+        self.structs[name] = out
         return name
 
-    def _hints(self, cls: type, where: str) -> dict[str, Any]:
+    def type_hints(self, cls: type) -> dict[str, Any]:
+        where = self._by_key.get(id(cls), cls.__name__)
         # String annotations (``from __future__ import annotations``) on classes defined
         # inside a function cannot see that function's locals; give them the classes we know.
         # Names the class's own module defines win: `localns` outranks module globals
         # in get_type_hints, so a same-named class from elsewhere would hide them.
         module = sys.modules.get(cls.__module__)
         own = vars(module) if module is not None else {}
-        known = {c.__name__: c for c in self.classes.values() if c.__name__ not in own}
+        known = {
+            k.__name__: k for k, _ in self.owners.values() if isinstance(k, type) and k.__name__ not in own
+        }
         try:
             return typing.get_type_hints(cls, localns=known, include_extras=True)
         except NameError as exc:
@@ -187,8 +280,22 @@ class SchemaBuilder:
 
     def _convert(self, tp: Any, cons: dict[str, Any], where: str) -> TypeSpec:
         if isinstance(tp, TypeRef):
-            self._check_refs(tp._spec, where)
+            self._check_refs(tp._spec, where, by_name=True)
             return tp._spec
+        for adapter in self.adapters:
+            result = adapter.schema_for(tp, SchemaContext(self, adapter))
+            if result is None:
+                continue
+            ref, extra = result if isinstance(result, tuple) else (result, None)
+            if not isinstance(ref, TypeRef) or not (extra is None or isinstance(extra, Constraints)):
+                raise TypeError(
+                    f"{where}: {type(adapter).__name__}.schema_for must return a TypeRef, "
+                    f"(TypeRef, Constraints) or None, got {result!r}"
+                )
+            self._check_refs(ref._spec, where, by_name=False)
+            for k, v in (extra._spec() or {} if extra is not None else {}).items():
+                cons.setdefault(k, v)  # the annotation's own constraints win
+            return ref._spec
         if isinstance(tp, str) and tp in _CEL_NAMES:
             return tp
         if tp in _SCALARS:
@@ -208,8 +315,6 @@ class SchemaBuilder:
                 cons["one_of"] = values
                 return "int"
             raise TypeError(f"{where}: enum {tp.__name__} must have all-str or all-int values")
-        if is_struct_class(tp):
-            return ("struct", self._register(typing.cast("type", tp)))
         origin = get_origin(tp)
         args = get_args(tp)
         if origin is typing.Annotated:
@@ -312,7 +417,11 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None
         for key in ("ge", "gt", "le", "lt", "min_length", "max_length", "pattern"):
             val = getattr(m, key, None)
             if val is not None and not callable(val):
-                cons[key] = float(val) if key in ("ge", "gt", "le", "lt") else val
+                if key in ("ge", "gt", "le", "lt"):
+                    val = float(val)
+                elif key == "pattern" and not isinstance(val, str):
+                    val = getattr(val, "pattern", val)  # a compiled re.Pattern
+                cons[key] = val
         # pydantic FieldInfo nested in Annotated[..., Field(...)]
         inner = getattr(m, "metadata", None)
         if isinstance(inner, list) and inner is not metadata:
@@ -331,13 +440,13 @@ def from_cel(value: Any, spec: TypeSpec, schema: SchemaBuilder) -> Any:
     if kind == "map":
         return {k: from_cel(v, spec[2], schema) for k, v in value.items()}
     if kind == "struct":
-        cls = schema.classes.get(spec[1])
-        if cls is None:
-            return value
-        if is_model(cls):
-            return cls.model_validate(dict(value))  # type: ignore[attr-defined]
         fields = {f: s for f, s, _ in schema.structs.get(spec[1], [])}
-        return cls(**{k: from_cel(v, fields.get(k, "dyn"), schema) for k, v in value.items() if k in fields})
+        data = {k: from_cel(v, fields.get(k, "dyn"), schema) for k, v in value.items()}
+        owner = schema.owners.get(spec[1])
+        if owner is None:  # a declared Struct: stays a dict
+            return data
+        key, adapter = owner
+        return adapter.decode(key, data)
     return value
 
 

@@ -86,7 +86,14 @@ class TypeRef:
         return f"TypeRef({self})"
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (TypeRef, (self._spec,))
+        return (TypeRef._unchecked, (self._spec,))
+
+    @classmethod
+    def _unchecked(cls, spec: TypeSpec) -> TypeRef:
+        # for specs celspresso built itself (adapter struct names may be any string)
+        ref = cls.__new__(cls)
+        object.__setattr__(ref, "_spec", spec)
+        return ref
 
 
 def _check_spec(spec: Any) -> None:

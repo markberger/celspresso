@@ -14,6 +14,9 @@ from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, type_name
 from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness, lookup
 from .schema import Struct, TypeRef
 
+if typing.TYPE_CHECKING:
+    from .adapters import TypeAdapter
+
 __all__ = ["Env", "Explanation", "Expr", "Predicate", "Problem", "RuleCheck", "function"]
 
 T = TypeVar("T")
@@ -39,11 +42,12 @@ def _check_options(timeout: Any, unroll_limit: Any, schema_constraints: Any) -> 
         raise _option_clash("schema_constraints", schema_constraints)
 
 
-def _structs(structs: Any) -> list[Struct]:
-    """The `structs=` option, which a variable named 'structs' would collide with."""
-    if isinstance(structs, (str, type, Struct, TypeRef)) or not isinstance(structs, Iterable):
-        raise _option_clash("structs", structs)
-    return list(structs)
+def _option_list(name: str, value: Any) -> list[Any]:
+    """A list-valued option (`structs=`, `adapters=`), which a variable of that name
+    would collide with."""
+    if isinstance(value, (str, type, Struct, TypeRef)) or not isinstance(value, Iterable):
+        raise _option_clash(name, value)
+    return list(value)
 
 
 def _merge_variables(positional: Mapping[str, Any] | None, keywords: dict[str, Any]) -> dict[str, Any]:
@@ -173,6 +177,7 @@ class Env:
         debug_sample_proofs: int = 0,
         limits: Limits | None = None,
         structs: Iterable[Struct] = (),
+        adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> None:
         _check_options(timeout, unroll_limit, schema_constraints)
@@ -190,12 +195,12 @@ class Env:
         self._timeout = timeout
         self._unroll = unroll_limit
         self._schema_constraints = schema_constraints
-        self._builder = SchemaBuilder()
+        self._builder = SchemaBuilder(_option_list("adapters", adapters))
         self._vars: dict[str, tuple[TypeSpec, dict[str, Any] | None]] = {}
         self._fns: dict[str, _Fn] = {}
         self._defs: tuple[_Def, ...] = ()
         self._assumptions: tuple[str, ...] = ()
-        self._builder.declare(_structs(structs))
+        self._builder.declare(_option_list("structs", structs))
         for n, tp in variables.items():
             self._vars[n] = self._builder.convert(tp, n)
         self._build()
@@ -244,7 +249,12 @@ class Env:
             # struct names alone don't identify a schema: same-named structs may differ
             tuple(sorted((n, repr(fields)) for n, fields in self._builder.structs.items())),
             # ...nor do equal fields: a struct backed by a class decodes witnesses into it
-            tuple(sorted((n, c.__module__, c.__qualname__, id(c)) for n, c in self._builder.classes.items())),
+            tuple(
+                sorted(
+                    (n, repr(k), id(k), type(a).__module__, type(a).__qualname__)
+                    for n, (k, a) in self._builder.owners.items()
+                )
+            ),
             tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
             tuple((n, src, repr(ps)) for n, src, ps in self._defs),
         )
@@ -259,6 +269,7 @@ class Env:
         timeout: float | None = None,
         unroll_limit: int | None = None,
         structs: Iterable[Struct] = (),
+        adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> Env:
         """Return a new Env with more variables, functions, or standing assumptions.
@@ -278,7 +289,8 @@ class Env:
                 raise TypeError(f"functions=[...] expects plain callables, got {f!r}")
         variables = _merge_variables(variables, more_variables)
         e = self._clone()
-        e._builder.declare(_structs(structs))
+        e._builder.add_adapters(_option_list("adapters", adapters))
+        e._builder.declare(_option_list("structs", structs))
         for n, tp in variables.items():
             if n in e._vars:
                 raise ValueError(f"variable '{n}' is already declared")
