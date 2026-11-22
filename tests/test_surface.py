@@ -293,7 +293,8 @@ def test_diff_with_no_differences_and_flat_vars() -> None:
     env = Env(x=int)
     assert env.predicate("x > 1").diff(env.predicate("1 < x")) == []
     ws = env.predicate("x > 1").diff(env.predicate("x > 3"), limit=5)
-    assert sorted(w["x"] for w in ws) == [2, 3]
+    # x=2 and x=3 differ for the same reason (x > 1 holds, x > 3 doesn't): one class
+    assert [w["x"] in (2, 3) for w in ws] == [True]
 
 
 def test_explain_error_and_nesting() -> None:

@@ -1,10 +1,8 @@
-# celspresso
+# celspresso ☕
 
-**Typed [CEL](https://cel.dev) expressions for Python, with a built-in prover.**
+**Find the input that breaks your business rules, before your customers do.**
 
-Business rules live in config, change weekly, and are tested on a handful of examples. celspresso checks them against *every possible input*, and when a rule is wrong, it hands you the input that breaks it.
-
-Say support auto-approves refunds with this rule, and finance has one requirement: **never auto-refund more than $500.**
+celspresso type-checks, evaluates, and *proves things about* [CEL](https://cel.dev) rules from Python. CEL is the expression language behind Kubernetes, Google Cloud IAM and Envoy. Rules are usually tested on a handful of examples; celspresso checks them against every possible input and hands you the one that breaks them.
 
 ```python
 from typing import Annotated, Literal
@@ -13,144 +11,132 @@ from celspresso import Env
 
 class Order(BaseModel):
     total_cents: Annotated[int, Field(ge=0)]
-    items: Annotated[int, Field(ge=0, le=100)]
     days_since_delivery: Annotated[int, Field(ge=0, le=365)]
     status: Literal["delivered", "lost", "damaged"]
     tier: Literal["standard", "gold"]
 
 env = Env(order=Order)
-
 auto_refund = env.predicate("""
     order.status == 'lost'
     || (order.status == 'damaged' && order.days_since_delivery <= 30)
     || (order.tier == 'gold' && order.total_cents < 5000)
 """)
 
-auto_refund.implies("order.total_cents <= 50000")
-# Verdict(REFUTED, counterexample={'order': {'status': 'damaged', 'total_cents': 50001,
-#                                            'days_since_delivery': 0, 'tier': 'standard', 'items': 0}})
+# Finance's one requirement: never auto-refund more than $500.
+print(auto_refund.implies("order.total_cents <= 50000").counterexample)
+# order.days_since_delivery = 0, order.status = 'damaged', order.tier = 'standard', order.total_cents = 50001
 ```
 
-Every test you wrote probably passed. The prover found the gap in milliseconds: a damaged $500.01 order is refunded with no cap.
+Every test passed. The prover found the gap in milliseconds: a damaged $500.01 order is refunded with no cap.
 
-Under the hood, a Rust core parses and type-checks CEL, evaluates it in microseconds, and encodes its exact semantics into [Z3](https://github.com/Z3Prover/z3). Your Pydantic constraints (`ge`, `le`, `Literal`, ...) become facts the prover can rely on.
-
-> **Status: pre-alpha.** Not on PyPI yet, and the API may still change.
+It works just as well on rules you didn't write, [from customers, an admin UI, or an LLM](#accepting-rules-you-didnt-write).
 
 ## Install
 
-From source. You need Rust (stable) and [uv](https://docs.astral.sh/uv/). Z3 is downloaded and linked statically, so you don't need a system install.
+> **Pre-alpha.** Not on PyPI yet, and the API may still change.
+
+You need Rust (stable) and [uv](https://docs.astral.sh/uv/). Z3 is downloaded and linked statically.
 
 ```sh
 git clone https://github.com/markberger/celspresso && cd celspresso
-uv sync --group dev
-uv run maturin develop --release
+uv sync --group dev && uv run maturin develop --release
 ```
 
-## A tour
+## What you can ask
 
-Continuing with the refund rule above.
+| | Question | Answer |
+|---|---|---|
+| `p.satisfiable()` | Can this ever be true? | `SAT` + example / `UNSAT` |
+| `p.always_true()` | Is it true for every valid input? | `PROVED` / `REFUTED` + counterexample |
+| `a.implies(b)` | Whenever `a` holds, does `b`? | `PROVED` / `REFUTED` + counterexample |
+| `a.equivalent(b)` | Do they agree on every input, errors included? | `PROVED` / `REFUTED` + counterexample |
+| `a.diff(b)` | Where do they disagree, and why? | one input per distinct reason |
+| `e.can_error()` | Can evaluation fail (÷0, overflow, missing key)? | `SAT` + example / `UNSAT` |
+| `env.check_rule(src, invariants)` | Is this rule safe to accept? | report |
 
-**Evaluate it**, in microseconds:
+**Catch a refactor that changes behavior.** Someone tidies `<= 30` into `< 30`:
 
 ```python
-auto_refund.evaluate({"order": order})   # True
+auto_refund.equivalent(tidied).counterexample
+# order.days_since_delivery = 30, order.status = 'damaged', ...
 ```
 
-**Catch a refactor that changes behavior.** Someone "tidies up" the rule, and `<= 30` quietly becomes `< 30`:
+**Review behavior, not code.** A proposed "simplification", explained as the cases that change:
 
 ```python
-tidied = env.predicate("""
-    order.status == 'lost'
-    || (order.status == 'damaged' && order.days_since_delivery < 30)
-    || (order.tier == 'gold' && order.total_cents < 5000)
-""")
-auto_refund.equivalent(tidied)
-# Verdict(REFUTED, counterexample={'order': {'status': 'damaged', 'days_since_delivery': 30, ...}})
-```
-
-The counterexample is exactly the boundary case: a customer whose damaged order arrived 30 days ago.
-
-**Find inputs that crash an expression** before production does:
-
-```python
-env.expr("order.total_cents / order.items", int).can_error()
-# Verdict(SAT, witness={'order': {'items': 0, ...}})
-```
-
-**Find dead rules** that can never fire, given your schema:
-
-```python
-from celspresso import RuleSet
-
-RuleSet({
-    "lost":        env.predicate("order.status == 'lost'"),
-    "late_damage": env.predicate("order.status == 'damaged' && order.days_since_delivery > 400"),
-}).unreachable()
-# {'late_damage': Verdict(UNSAT)}   # the schema caps days_since_delivery at 365
+looser = env.predicate("order.status != 'delivered' || (order.tier == 'gold' && order.total_cents < 10000)")
+for case in auto_refund.diff(looser):
+    print(case)
+# order.days_since_delivery = 31, order.status = 'damaged', order.tier = 'standard', ...
+# order.days_since_delivery = 31, order.status = 'damaged', order.tier = 'gold', order.total_cents = 5000
+# order.days_since_delivery = 0, order.status = 'delivered', order.tier = 'gold', order.total_cents = 5000
 ```
 
 **Typos fail at compile time**, not in production:
 
-```python
-env.compile("order.totl_cents > 0")
-# CelTypeError: 1:1: undefined field 'totl_cents' on Order (did you mean 'total_cents'?)
-#   | order.totl_cents > 0
-#   | ^^^^^^^^^^^^^^^^
+```
+>>> env.compile("order.totl_cents > 0")
+CelTypeError: 1:1: undefined field 'totl_cents' on Order (did you mean 'total_cents'?)
+  | order.totl_cents > 0
+  | ^^^^^^^^^^^^^^^^
 ```
 
-**Counterexamples are real objects.** `verdict.counterexample.to_python()` returns `{'order': Order(...)}`, ready to paste into a regression test.
+And `auto_refund.evaluate({"order": order})` runs the rule in about 10 µs.
 
-### What you can ask
+## Accepting rules you didn't write
 
-| Method | Question | Answers |
-|---|---|---|
-| `p.satisfiable()` | Can this ever be true? | `SAT` + witness / `UNSAT` |
-| `p.always_true()` | Is this true for every valid input? | `PROVED` / `REFUTED` + counterexample |
-| `a.implies(b)` | Whenever `a` holds, does `b`? | `PROVED` / `REFUTED` |
-| `a.equivalent(b)` | Do these agree on every input, errors included? | `PROVED` / `REFUTED` |
-| `e.can_error()` | Can evaluation fail (÷0, overflow, missing key)? | `SAT` + witness / `UNSAT` |
-| `a.diff(b, limit=5)` | Show me inputs where these disagree | list of witnesses |
+When rules come from customers, operations teams or an LLM, `check_rule` decides whether to accept them. It checks that a rule compiles, can fire, can't fail at runtime, and never breaks the invariants *you* own:
 
-Every method takes `assuming=` for extra preconditions and `timeout=` in seconds. `RuleSet` runs checks across a whole collection of rules: unreachable rules, overlapping rules, and old-vs-new diffs.
+```python
+POLICY = {
+    "refunds over $500 need a human": "order.total_cents <= 50000",
+    "nothing is refunded after 90 days": "order.days_since_delivery <= 90",
+}
+
+print(env.check_rule("order.status == 'lost' || (order.tier == 'gold' && order.days_since_delivery <= 120)", POLICY))
+# rejected:
+# - violates 'refunds over $500 need a human' when order.status = 'lost', order.total_cents = 50001, ...
+# - violates 'nothing is refunded after 90 days' when order.days_since_delivery = 91, order.status = 'lost', ...
+```
+
+The report is plain text that a person or an LLM can act on, so it can drive a repair loop:
+
+```python
+feedback = ""
+for _ in range(5):
+    src = llm.draft_rule(policy_doc, feedback)   # your LLM call
+    report = env.check_rule(src, POLICY)
+    if report.ok:
+        break
+    feedback = str(report)
+```
+
+`report.ok` means *proved*: a check that comes back `UNKNOWN` is a problem, never a pass. For a fuller example, see [`examples/credentialing.py`](examples/credentialing.py), where an agent drafts provider-scheduling rules for a healthcare back office against compliance invariants.
 
 ## Verdicts are never guesses
 
-- **`bool(verdict)` raises.** A query can come back `UNKNOWN` because of a timeout or a construct that isn't modeled yet. That should never be silently read as yes or no. Use `.proved`, `.refuted`, `.sat`, `.unsat`, `.unknown`, or `.expect()`, which raises with a readable report.
-- **Every witness is real.** Before you see a witness, it is replayed through the evaluator and validated by your Pydantic model. If either check fails, the result is downgraded to `UNKNOWN`, and `verdict.reason` explains why.
-- **The semantics are CEL's, not Python's.** Integers are 64-bit with overflow errors. Division truncates toward zero. `&&` and `||` absorb errors in both directions.
-- **Your schema is part of the question.** `ge`, `le`, `max_length`, `pattern`, `Literal` and `Enum` become assumptions. Turn this off with `Env(..., schema_constraints=False)`.
+- **Every counterexample is real.** It is replayed through the evaluator and validated by your Pydantic model before you see it.
+- **`UNKNOWN` can't be mistaken for an answer.** `bool(verdict)` raises, and `verdict.reason` names the timeout or the construct that isn't modeled yet.
+- **The semantics are CEL's.** Integers are 64-bit with overflow errors, division truncates toward zero, and `&&` and `||` absorb errors. Your schema's `ge`, `le`, `max_length`, `Literal` and `Enum` become facts the prover relies on.
 
-## Beyond the basics
+## How it compares
 
-- `env.define("recent", "order.days_since_delivery <= 30")` adds a named, reusable sub-expression.
-- `env.table("covered", {"99213", "99214"})` adds a constant lookup table.
-- `@function` and `env.extend(functions=[...])` call your own Python functions from CEL.
-- `expr.explain(data)` shows the value of every sub-expression, for debugging and audit logs.
-- `celspresso.testing` provides `assert_equivalent`, `assert_implies`, `assert_never` and more for your test suite.
-- Pydantic models, dataclasses, `Optional`, lists, maps `datetime.date`, `datetime.datetime` (timezone-aware) and `timedelta` are all supported. `Decimal` is rejected: store money as integer cents.
-- The standard CEL extensions are built in: strings, math, lists, sets, base64, optionals (`m.?key.orValue(0)`), `cel.bind`, `cel.block`, and the Kubernetes network library (`ip()`, `cidr()`).
+| | evaluate | type-check | prove & find counterexamples |
+|---|:-:|:-:|:-:|
+| [`common-expression-language`](https://pypi.org/project/common-expression-language/) | ✓ | | |
+| [`cel-python`](https://github.com/cloud-custodian/cel-python) | ✓ | | |
+| **celspresso** | ✓ | ✓ | ✓ |
 
-## Performance
+A Rust core parses, checks and evaluates CEL, and encodes its exact semantics into [Z3](https://github.com/Z3Prover/z3). A typical proof takes 2–20 ms, and the GIL is released while solving.
 
-Measured on an Apple M3:
+## More
 
-- Evaluating takes about 10 µs.
-- A typical proof or counterexample takes 2–20 ms.
-- Large lists (`max_length` ≥ 16) take 100–200 ms.
-- The GIL is released while solving, so verification scales across threads.
-
-Reproduce these numbers with `uv run python benchmarks/bench_verify.py`.
-
-## Not yet supported
-
-Protobuf messages and JSON values. The verifier doesn't yet model doubles, maps, bytes, optionals, timestamps or function contracts. Constructs the verifier doesn't model yet return `UNKNOWN`, with the reason named in `verdict.reason`.
-
-## Contributing
-
-```sh
-scripts/check.sh   # ruff, pyright, pytest and Rust tests, with coverage gates
-```
+- **Types:** Pydantic models, dataclasses, `Optional`, lists, maps, `date`, timezone-aware `datetime` and `timedelta`. Store money as integer cents; `Decimal` is rejected.
+- **Extensions:** strings, math, lists, sets, base64, optionals, `cel.bind`, `cel.block` and the Kubernetes network library.
+- **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions.
+- **Debugging and tests:** `expr.explain(data)` shows the value of every sub-expression; `celspresso.testing` has `assert_equivalent`, `assert_implies`, `assert_never` and more.
+- **Not yet supported:** protobuf messages and JSON values. The verifier doesn't yet model doubles, maps, bytes, optionals or timestamps; those return `UNKNOWN` with the reason.
+- **Contributing:** `scripts/check.sh` runs every lint, type-check and test gate.
 
 ## License
 

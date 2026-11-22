@@ -33,6 +33,16 @@ pub struct Encoder {
     /// CEL function name -> (overload id, arity) of uninterpreted functions in use.
     func_overloads: HashMap<String, Vec<(String, usize)>>,
     fresh: u32,
+    /// The first date input, which later dates prefer to stay near (readable witnesses).
+    first_date: Option<Int>,
+}
+
+/// Days since 1970-01-01 today (UTC). Only steers *preferences*, never verdicts.
+fn today_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
 }
 
 fn int_range(x: &Int, lo: i64, hi: i64) -> Bool {
@@ -57,6 +67,7 @@ impl Encoder {
             funcs: HashMap::new(),
             func_overloads: HashMap::new(),
             fresh: 0,
+            first_date: None,
         }
     }
 
@@ -107,6 +118,16 @@ impl Encoder {
                 let hi = date::days_from_civil(9999, 12, 31);
                 self.assumptions.push(int_range(&x, lo, hi));
                 self.soft.push(int_range(&x, date::days_from_civil(1950, 1, 1), date::days_from_civil(2030, 12, 31)));
+                // dates near today, and near each other, read like real records (not 1970-01-01)
+                let today = today_days();
+                self.soft.push(int_range(&x, today - 365, today + 365));
+                match &self.first_date {
+                    Some(d) => {
+                        let gap = &x - d;
+                        self.soft.push(int_range(&gap, -365, 365));
+                    }
+                    None => self.first_date = Some(x.clone()),
+                }
                 Sym::Date(x)
             }
             CelType::String => {

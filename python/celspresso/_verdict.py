@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import datetime as _dt
 import enum
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
@@ -28,10 +29,17 @@ class Witness(Mapping[str, Any]):
     Values are raw CEL data (structs as dicts); `to_python()` rebuilds your models.
     """
 
-    def __init__(self, raw: Mapping[str, Any], specs: Mapping[str, TypeSpec], schema: SchemaBuilder):
+    def __init__(
+        self,
+        raw: Mapping[str, Any],
+        specs: Mapping[str, TypeSpec],
+        schema: SchemaBuilder,
+        paths: Sequence[str] = (),
+    ):
         self._raw = dict(raw)
         self._specs = specs
         self._schema = schema
+        self._paths = tuple(paths)
 
     def __getitem__(self, key: str) -> Any:
         return self._raw[key]
@@ -46,8 +54,47 @@ class Witness(Mapping[str, Any]):
         """Convert to Python objects; Pydantic models go through `model_validate`."""
         return {k: from_cel(v, self._specs.get(k, "dyn"), self._schema) for k, v in self._raw.items()}
 
+    @property
+    def relevant(self) -> dict[str, Any]:
+        """Only the values the question's expressions read, by path:
+        `{'p.status': 'provisional', 'today': date(2026, 11, 21)}`. Everything else in the
+        witness is arbitrary filler the solver had to pick."""
+        leaves = [p for p in self._paths if not any(q.startswith(p + ".") for q in self._paths)]
+        out: dict[str, Any] = {}
+        for path in leaves:
+            ok, value = lookup(self._raw, path)
+            if ok:
+                out[path] = value
+        return out or dict(self._raw)
+
+    def __str__(self) -> str:
+        """The relevant values as CEL-style assignments, for people and LLMs."""
+        return ", ".join(f"{k} = {_show(v)}" for k, v in self.relevant.items())
+
     def __repr__(self) -> str:
         return f"Witness({self._raw!r})"
+
+
+def lookup(w: Mapping[str, Any], path: str) -> tuple[bool, Any]:
+    head, *rest = path.split(".")
+    if head not in w:
+        return False, None
+    cur = w[head]
+    for part in rest:
+        if not isinstance(cur, Mapping) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
+
+
+def _show(v: Any) -> str:
+    if isinstance(v, (_dt.date, _dt.datetime)):
+        return v.isoformat()
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    return repr(v)
 
 
 @dataclass(frozen=True)
@@ -116,8 +163,8 @@ class Verdict:
         if self.witness is not None:
             label = "counterexample" if self.status is Status.REFUTED else "witness"
             lines.append(f"  {label}:")
-            for k, v in self.witness.items():
-                lines.append(f"    {k} = {v!r}")
+            for k, v in self.witness.relevant.items():
+                lines.append(f"    {k} = {_show(v)}")
         if self.reason:
             lines.append(f"  reason: {self.reason}")
         if self.bounded:

@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar, overload
 
 from . import _celspresso as _core
-from ._errors import CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
+from ._errors import CelError, CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
 from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, type_name
-from ._verdict import Stats, Status, Verdict, Witness
+from ._verdict import Stats, Status, Verdict, Witness, lookup
 
-__all__ = ["Env", "Explanation", "Expr", "Predicate", "function"]
+__all__ = ["Env", "Explanation", "Expr", "Predicate", "Problem", "RuleCheck", "function"]
 
 T = TypeVar("T")
 ErrorMode = Literal["strict", "as_false"]
@@ -302,7 +302,8 @@ class Env:
             "stats": stats,
         }
         if out["status"] == "found":
-            w = Witness(out["witness"], self._specs(), self._builder)
+            paths = sorted({p for x in (a, b) if x is not None for p in x.references})
+            w = Witness(out["witness"], self._specs(), self._builder, paths)
             try:
                 w.to_python()
             except Exception as exc:  # noqa: BLE001 - any validator failure means the witness is not real
@@ -316,6 +317,123 @@ class Env:
         if out["status"] == "not_found":
             return Verdict(not_found, **common)  # type: ignore[arg-type]
         return Verdict(Status.UNKNOWN, reason=out["reason"], **common)  # type: ignore[arg-type]
+
+    def _class_clause(self, w: Witness, exprs: Iterable[Expr[Any]]) -> str | None:
+        """A clause excluding every input that sets each atomic condition of `exprs`
+        (a boolean sub-expression with no boolean sub-expression inside) the way `w`
+        does. Conditions over macro loop variables are skipped; the clause must
+        exclude `w` itself, or None is returned."""
+        data = dict(w)
+        values: dict[str, bool | None] = {}
+        for e in exprs:
+            ex = e.explain(data)
+            spans = [(a, b, v) for (a, b, ok, v) in ex.nodes if ok and isinstance(v, bool)]
+            usable = [(a, b, v) for (a, b, v) in spans if self._standalone(ex.source[a:b])]
+            for a, b, v in usable:
+                if any((c, d) != (a, b) and a <= c and d <= b for (c, d, _) in usable):
+                    continue  # not atomic
+                text = ex.source[a:b].strip()
+                values[text] = v if values.get(text, v) == v else None  # conflicting: drop
+        atoms = [f"({t}) == {'true' if v else 'false'}" for t, v in sorted(values.items()) if v is not None]
+        if not atoms:
+            return None
+        clause = "!(" + " && ".join(atoms) + ")"
+        try:
+            excluded = self.predicate(clause).evaluate(data) is False
+        except Exception:  # noqa: BLE001 - any failure: use value blocking instead
+            return None
+        return clause if excluded else None
+
+    def _standalone(self, src: str) -> bool:
+        try:
+            self.predicate(src)
+        except CelError:
+            return False
+        return True
+
+    def check_rule(
+        self,
+        rule: str | Predicate,
+        invariants: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
+        *,
+        assuming: Iterable[str | Predicate] | str | Predicate = (),
+        timeout: float | None = None,
+    ) -> RuleCheck:
+        """Vet a rule you didn't write (from a customer, an admin UI or an LLM) before accepting it.
+
+        Checks, in order: it compiles to a predicate; it can fire at all; it can't fail
+        at runtime; and it implies every invariant (named, or keyed by their source).
+        A check that comes back UNKNOWN is a problem too, so `.ok` means *proved* safe.
+        """
+        src = rule if isinstance(rule, str) else rule.source
+        try:
+            pred = self.predicate(rule) if isinstance(rule, str) else rule
+        except CelError as e:
+            return RuleCheck(src, None, (Problem("invalid", str(e)),))
+        named: dict[str, str | Predicate] = {}
+        if isinstance(invariants, Mapping):
+            named.update(typing.cast("Mapping[str, str | Predicate]", invariants))
+        else:
+            for i in invariants:
+                named[i if isinstance(i, str) else i.source] = i
+        problems: list[Problem] = []
+
+        def undecided(what: str, v: Verdict, invariant: str | None = None) -> None:
+            problems.append(Problem("unverified", f"could not verify {what}: {v.reason}", invariant, v))
+
+        v = pred.satisfiable(assuming=assuming, timeout=timeout)
+        if v.unsat:
+            problems.append(Problem("never_fires", "the rule can never be true for any valid input", None, v))
+            return RuleCheck(src, pred, tuple(problems))
+        if v.unknown:
+            undecided("that the rule can fire", v)
+        v = pred.can_error(assuming=assuming, timeout=timeout)
+        if v.sat:
+            problems.append(Problem("can_error", f"evaluation fails when {v.witness}", None, v))
+        elif v.unknown:
+            undecided("that the rule never errors", v)
+        for name, inv in named.items():
+            v = pred.implies(inv, assuming=assuming, timeout=timeout)
+            if v.refuted:
+                problems.append(Problem("violates", f"violates '{name}' when {v.counterexample}", name, v))
+            elif v.unknown:
+                undecided(f"'{name}'", v, name)
+        return RuleCheck(src, pred, tuple(problems))
+
+
+ProblemKind = Literal["invalid", "never_fires", "can_error", "violates", "unverified"]
+
+
+@dataclass(frozen=True)
+class Problem:
+    """One reason a rule was not accepted. `verdict` holds the evidence, when there is one."""
+
+    kind: ProblemKind
+    message: str
+    invariant: str | None = None
+    verdict: Verdict | None = None
+
+
+@dataclass(frozen=True)
+class RuleCheck:
+    """The result of `Env.check_rule`. `str()` is a report fit for a person or an LLM."""
+
+    source: str
+    rule: Predicate | None
+    problems: tuple[Problem, ...]
+
+    @property
+    def ok(self) -> bool:
+        """True only if every check was *proved*: an UNKNOWN counts as a problem."""
+        return not self.problems
+
+    def __bool__(self) -> typing.NoReturn:
+        raise TypeError("use RuleCheck.ok (a RuleCheck has no truth value, like a Verdict)")
+
+    def __str__(self) -> str:
+        if self.ok:
+            return "accepted: every check passed"
+        return "rejected:\n" + "\n".join("- " + p.message.replace("\n", "\n  ") for p in self.problems)
 
 
 def _type_mismatch(source: str, e: Expr[Any], want: str) -> typing.NoReturn:
@@ -494,7 +612,9 @@ class Expr(Generic[T]):
             if not v.refuted or v.witness is None:
                 break
             found.append(v.witness)
-            clause = _blocking_clause(v.witness, paths)
+            # block the witness's whole behaviour class (same truth value for every
+            # condition), so each result shows a different reason; fall back to its values
+            clause = self._env._class_clause(v.witness, (self, other)) or _blocking_clause(v.witness, paths)
             if clause is None:
                 break
             blockers.append(clause)
@@ -568,16 +688,7 @@ def _pred_operand(env: Env, other: Predicate | str) -> str:
     return _operand(env, other)
 
 
-def _lookup(w: Mapping[str, Any], path: str) -> tuple[bool, Any]:
-    head, *rest = path.split(".")
-    if head not in w:
-        return False, None
-    cur = w[head]
-    for part in rest:
-        if not isinstance(cur, Mapping) or part not in cur:
-            return False, None
-        cur = cur[part]
-    return True, cur
+_lookup = lookup
 
 
 def _blocking_clause(w: Witness, paths: list[str]) -> str | None:

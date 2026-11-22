@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._env import Env, Explanation, Expr, Predicate, function
+from ._env import Env, Explanation, Expr, Predicate, Problem, RuleCheck, function
 from ._errors import (
     CelError,
     CelEvaluationError,
@@ -32,6 +32,8 @@ __all__ = [
     "Explanation",
     "Expr",
     "Predicate",
+    "Problem",
+    "RuleCheck",
     "RuleSet",
     "Stats",
     "Status",
