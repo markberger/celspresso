@@ -145,7 +145,7 @@ class Env:
             raise ValueError(f"invalid definition name {name!r}")
         self.compile(source)  # type-check against the current env first
         e = self._clone()
-        e._defs = self._defs + ((name, source),)
+        e._defs = (*self._defs, (name, source))
         e._build()
         return e
 
@@ -247,7 +247,7 @@ class Env:
             "stats": stats,
         }
         if out["status"] == "found":
-            w = Witness(out["witness"], self._specs(), self._builder.classes)
+            w = Witness(out["witness"], self._specs(), self._builder)
             try:
                 w.to_python()
             except Exception as exc:  # noqa: BLE001 - any validator failure means the witness is not real
@@ -348,7 +348,7 @@ class Expr(Generic[T]):
         except _core.EvalError as exc:
             msg, eid, a, b, rendered = exc.args
             raise CelEvaluationError(msg, eid, (a, b), rendered) from None
-        return from_cel(raw, self._prog.output_type, self._env._builder.classes)
+        return from_cel(raw, self._prog.output_type, self._env._builder)
 
     def explain(self, data: Mapping[str, Any] | None = None) -> Explanation:
         """Evaluate and record the value of every sub-expression."""

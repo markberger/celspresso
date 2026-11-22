@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
 from itertools import combinations
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._env import Expr, Predicate
-from ._verdict import Verdict
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Mapping
+
+    from ._verdict import Verdict
 
 __all__ = ["RuleSet"]
 

@@ -94,13 +94,25 @@ class SchemaBuilder:
                 spec = self._convert(info.annotation, cons, f"{name}.{fname}")
                 fields.append((fname, spec, cons or None))
         else:
-            hints = typing.get_type_hints(cls, include_extras=True)
+            hints = self._hints(cls, name)
             for f in dataclasses.fields(cls):
                 cons = {}
                 spec = self._convert(hints.get(f.name, Any), cons, f"{name}.{f.name}")
                 fields.append((f.name, spec, cons or None))
         self.structs[name] = fields
         return name
+
+    def _hints(self, cls: type, where: str) -> dict[str, Any]:
+        # String annotations (``from __future__ import annotations``) on classes defined
+        # inside a function cannot see that function's locals; give them the classes we know.
+        known = {c.__name__: c for c in self.classes.values()}
+        try:
+            return typing.get_type_hints(cls, localns=known, include_extras=True)
+        except NameError as exc:
+            raise TypeError(
+                f"{where}: cannot resolve annotation {exc.name!r}; define the class at module "
+                f"level, or declare {exc.name} in the Env before {cls.__name__}"
+            ) from None
 
     def _convert(self, tp: Any, cons: dict[str, Any], where: str) -> TypeSpec:
         if isinstance(tp, str) and tp in _CEL_NAMES:
@@ -123,7 +135,7 @@ class SchemaBuilder:
                 return "int"
             raise TypeError(f"{where}: enum {tp.__name__} must have all-str or all-int values")
         if is_struct_class(tp):
-            return ("struct", self._register(typing.cast(type, tp)))
+            return ("struct", self._register(typing.cast("type", tp)))
         origin = get_origin(tp)
         args = get_args(tp)
         if origin is typing.Annotated:
@@ -178,41 +190,26 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None
             _metadata_constraints(inner, cons)
 
 
-def from_cel(value: Any, spec: TypeSpec, classes: Mapping[str, type]) -> Any:
+def from_cel(value: Any, spec: TypeSpec, schema: SchemaBuilder) -> Any:
     """Convert a raw CEL value (structs as dicts) back into Python classes."""
     if value is None or isinstance(spec, str):
         return value
     kind = spec[0]
     if kind == "nullable":
-        return from_cel(value, spec[1], classes)
+        return from_cel(value, spec[1], schema)
     if kind == "list":
-        return [from_cel(v, spec[1], classes) for v in value]
+        return [from_cel(v, spec[1], schema) for v in value]
     if kind == "map":
-        return {k: from_cel(v, spec[2], classes) for k, v in value.items()}
+        return {k: from_cel(v, spec[2], schema) for k, v in value.items()}
     if kind == "struct":
-        cls = classes.get(spec[1])
+        cls = schema.classes.get(spec[1])
         if cls is None:
             return value
-        return struct_from_dict(cls, value, classes)
+        if is_model(cls):
+            return cls.model_validate(dict(value))  # type: ignore[attr-defined]
+        fields = {f: s for f, s, _ in schema.structs.get(spec[1], [])}
+        return cls(**{k: from_cel(v, fields.get(k, "dyn"), schema) for k, v in value.items() if k in fields})
     return value
-
-
-def struct_from_dict(cls: type, data: Mapping[str, Any], classes: Mapping[str, type]) -> Any:
-    if is_model(cls):
-        return cls.model_validate(dict(data))  # type: ignore[attr-defined]
-    # dataclass: convert nested structs by annotation
-    b = SchemaBuilder()
-    b.classes = dict(classes)
-    hints = typing.get_type_hints(cls)
-    kwargs = {}
-    for f in dataclasses.fields(cls):
-        if f.name in data:
-            try:
-                spec, _ = b.convert(hints[f.name], f.name)
-            except TypeError:
-                spec = "dyn"
-            kwargs[f.name] = from_cel(data[f.name], spec, classes)
-    return cls(**kwargs)
 
 
 def cel_literal(value: Any) -> str:

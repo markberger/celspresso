@@ -5,6 +5,8 @@ import datetime as dt
 from typing import Annotated, Literal
 
 import pytest
+from pydantic import BaseModel, Field, field_validator
+
 from celspresso import (
     CelEvaluationError,
     CelSyntaxError,
@@ -18,7 +20,6 @@ from celspresso import (
     function,
 )
 from celspresso import testing as ct
-from pydantic import BaseModel, Field, field_validator
 
 
 class User(BaseModel):
@@ -44,7 +45,8 @@ def U(**kw):
 def test_compile_returns_typed_exprs(env: Env) -> None:
     assert isinstance(env.compile("user.age > 3"), Predicate)
     e = env.compile("user.age + 1")
-    assert isinstance(e, Expr) and not isinstance(e, Predicate)
+    assert isinstance(e, Expr)
+    assert not isinstance(e, Predicate)
     assert e.output_type == "int"
     assert env.expr("user.age * 2", int).output_type == "int"
 
@@ -95,12 +97,14 @@ def test_evaluation_error_has_no_values() -> None:
 
 def test_struct_result_roundtrip(env: Env) -> None:
     out = env.expr("user", User).evaluate({"user": U(age=40)})
-    assert isinstance(out, User) and out.age == 40
+    assert isinstance(out, User)
+    assert out.age == 40
 
 
 def test_explain(env: Env) -> None:
     ex = env.predicate("user.age >= 18 && user.tier == 'pro'").explain({"user": U(age=20)})
-    assert ex.ok and ex.value is False
+    assert ex.ok
+    assert ex.value is False
     texts = dict(ex)
     assert texts["user.age >= 18"] is True
     assert texts["user.tier == 'pro'"] is False
@@ -113,7 +117,8 @@ def test_explain(env: Env) -> None:
 
 def test_schema_constraints_make_unsat(env: Env) -> None:
     v = env.compile("user.age > 200").satisfiable()
-    assert v.status is Status.UNSAT and v.unsat
+    assert v.status is Status.UNSAT
+    assert v.unsat
     with pytest.raises(TypeError):
         bool(v)
 
@@ -122,7 +127,8 @@ def test_schema_constraints_can_be_disabled() -> None:
     env = Env(user=User, schema_constraints=False)
     v = env.predicate("user.age > 200").satisfiable()
     # the solver finds age=201, which Pydantic then rejects: never claim SAT on an invalid model
-    assert v.unknown and "validation" in (v.reason or "")
+    assert v.unknown
+    assert "validation" in (v.reason or "")
 
     @dataclasses.dataclass
     class Plain:
@@ -139,7 +145,8 @@ def test_literal_membership(env: Env) -> None:
 def test_witness_is_real_and_validates(env: Env) -> None:
     p = env.predicate("user.age >= 18 && 'admin' in user.roles")
     v = p.satisfiable()
-    assert v.sat and v.witness is not None
+    assert v.sat
+    assert v.witness is not None
     py = v.witness.to_python()
     assert isinstance(py["user"], User)
     assert p.evaluate(py) is True
@@ -149,7 +156,8 @@ def test_always_true_and_counterexample(env: Env) -> None:
     assert env.predicate("user.age >= 0").always_true().proved
     v = env.predicate("user.age >= 18").always_true()
     assert v.refuted
-    assert v.counterexample is not None and v.counterexample["user"]["age"] < 18
+    assert v.counterexample is not None
+    assert v.counterexample["user"]["age"] < 18
     with pytest.raises(VerificationFailed, match="counterexample"):
         v.expect()
 
@@ -188,7 +196,9 @@ def test_can_error_and_assumptions() -> None:
 
 def test_vacuous_assumptions_unknown(env: Env) -> None:
     v = env.predicate("user.age > 3").always_true(assuming=["user.age < 0"])
-    assert v.unknown and v.reason and "assumption" in v.reason
+    assert v.unknown
+    assert v.reason
+    assert "assumption" in v.reason
 
 
 def test_env_level_assumptions(env: Env) -> None:
@@ -216,7 +226,7 @@ def test_combinators(env: Env) -> None:
 
 def test_mixed_env_rejected(env: Env) -> None:
     other = Env(x=int)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="different environments"):
         env.predicate("user.age > 1") & other.predicate("x > 1")
 
 
@@ -233,7 +243,8 @@ def test_model_validation_downgrades_to_unknown() -> None:
 
     env = Env(o=Odd)
     v = env.predicate("o.n == 4").satisfiable()
-    assert v.unknown and "validation" in (v.reason or "")
+    assert v.unknown
+    assert "validation" in (v.reason or "")
 
 
 # -- strings, lists, nullable, dates, dataclasses --------------------------
@@ -248,10 +259,13 @@ def test_strings_and_regex() -> None:
 
 def test_lists_bounded_by_max_length(env: Env) -> None:
     v = env.predicate("user.roles.all(r, r == 'a') && size(user.roles) > 10").satisfiable()
-    assert v.unsat and not v.bounded
+    assert v.unsat
+    assert not v.bounded
     unbounded = Env(xs=list[int])
     w = unbounded.predicate("xs.all(x, x > 0)").implies("xs.exists(x, x > 0) || size(xs) == 0")
-    assert w.unknown and w.bounded and "max_length" in (w.reason or "")
+    assert w.unknown
+    assert w.bounded
+    assert "max_length" in (w.reason or "")
     # SAT witnesses are always real, even for unbounded lists
     assert unbounded.predicate("xs.exists(x, x > 5)").satisfiable().sat
     bounded = Env(xs=Annotated[list[int], Field(max_length=4)])
@@ -276,7 +290,8 @@ def test_dates() -> None:
     v = (p & env.predicate("today == date('2026-01-01')")).satisfiable()
     assert v.sat
     w = v.witness.to_python()
-    assert isinstance(w["dob"], dt.date) and w["dob"] <= dt.date(2008, 1, 1)
+    assert isinstance(w["dob"], dt.date)
+    assert w["dob"] <= dt.date(2008, 1, 1)
 
 
 def test_dataclass_schema() -> None:
@@ -315,7 +330,8 @@ def test_custom_function_uninterpreted() -> None:
     assert p.equivalent("risk(n) > 10 && risk(n) > 10").proved
     # but nothing more is known, and the verdict says why
     v = env.predicate("risk(n) > n").always_true()
-    assert v.unknown and "risk" in (v.reason or "")
+    assert v.unknown
+    assert "risk" in (v.reason or "")
     assert any("risk" in a for a in v.stats.approximations) or "risk" in (v.reason or "")
 
 

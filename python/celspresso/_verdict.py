@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
 from ._errors import VerificationFailed, VerificationTimeout
-from ._types import TypeSpec, from_cel
+from ._types import SchemaBuilder, TypeSpec, from_cel
 
 __all__ = ["Stats", "Status", "Verdict", "Witness"]
 
@@ -28,10 +28,10 @@ class Witness(Mapping[str, Any]):
     Values are raw CEL data (structs as dicts); `to_python()` rebuilds your models.
     """
 
-    def __init__(self, raw: Mapping[str, Any], specs: Mapping[str, TypeSpec], classes: Mapping[str, type]):
+    def __init__(self, raw: Mapping[str, Any], specs: Mapping[str, TypeSpec], schema: SchemaBuilder):
         self._raw = dict(raw)
         self._specs = specs
-        self._classes = classes
+        self._schema = schema
 
     def __getitem__(self, key: str) -> Any:
         return self._raw[key]
@@ -44,7 +44,7 @@ class Witness(Mapping[str, Any]):
 
     def to_python(self) -> dict[str, Any]:
         """Convert to Python objects; Pydantic models go through `model_validate`."""
-        return {k: from_cel(v, self._specs.get(k, "dyn"), self._classes) for k, v in self._raw.items()}
+        return {k: from_cel(v, self._specs.get(k, "dyn"), self._schema) for k, v in self._raw.items()}
 
     def __repr__(self) -> str:
         return f"Witness({self._raw!r})"

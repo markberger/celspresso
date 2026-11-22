@@ -5,11 +5,13 @@ Each raises `VerificationFailed` (an AssertionError) with a readable counterexam
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ._env import Expr, Predicate
 from ._errors import VerificationFailed
-from ._verdict import Verdict
+
+if TYPE_CHECKING:
+    from ._env import Expr, Predicate
+    from ._verdict import Verdict
 
 __all__ = [
     "assert_always",
