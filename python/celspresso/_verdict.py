@@ -27,6 +27,8 @@ class Witness(Mapping[str, Any]):
     """Concrete input found by the solver (already replayed through the evaluator).
 
     Values are raw CEL data (structs as dicts); `to_python()` rebuilds your models.
+    To replay it, pass the Witness itself to `evaluate`/`explain`: that skips field
+    readers, which expect your host objects, not this data.
     """
 
     def __init__(

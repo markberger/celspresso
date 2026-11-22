@@ -211,6 +211,16 @@ fn date_from_py(obj: &Bound<'_, PyAny>) -> PyResult<i64> {
     Ok(date::days_from_civil(y, m, d))
 }
 
+/// PEP 678 note on an exception; on Python 3.10 (no `add_note`) set `__notes__` directly.
+fn add_note(e: &PyErr, py: Python<'_>, note: &str) {
+    let v = e.value(py);
+    if v.call_method1("add_note", (note,)).is_err() {
+        let notes = v.getattr("__notes__").ok().and_then(|n| n.cast_into::<PyList>().ok()).unwrap_or_else(|| PyList::empty(py));
+        let _ = notes.append(note);
+        let _ = v.setattr("__notes__", notes);
+    }
+}
+
 /// Custom field readers, passed per call from Python (never stored here, so the GC
 /// sees them): {struct name: {field name: callable(containing object) -> value}}.
 type Readers<'a, 'py> = Option<&'a Bound<'py, PyDict>>;
@@ -226,7 +236,7 @@ fn get_field<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     if let Some(f) = reader {
         return f.call1((obj,)).map(Some).map_err(|e| {
-            let _ = e.value(obj.py()).call_method1("add_note", (format!("while reading field '{path}'"),));
+            add_note(&e, obj.py(), &format!("while reading field '{path}'"));
             e
         });
     }

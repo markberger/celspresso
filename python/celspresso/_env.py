@@ -257,7 +257,11 @@ class Env:
                 )
             ),
             # ...nor does the schema alone: readers change what evaluate sees
-            tuple(sorted((n, f, id(r)) for n, fs in self._builder.readers.items() for f, r in fs.items())),
+            tuple(
+                sorted(
+                    (n, f, _reader_key(r)) for n, fs in self._builder.readers.items() for f, r in fs.items()
+                )
+            ),
             tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
             tuple((n, src, repr(ps)) for n, src, ps in self._defs),
         )
@@ -652,6 +656,16 @@ ProblemKind = Literal[
 ]
 
 
+def _reader_key(reader: Callable[[Any], Any]) -> tuple[int, ...]:
+    """Identity of what a reader does: a function's code and captured values, so an
+    adapter that makes a fresh lambda per build still gives identical Envs."""
+    code = getattr(reader, "__code__", None)
+    if code is None:
+        return (id(reader),)
+    cells = getattr(reader, "__closure__", None) or ()
+    return (id(code), *(id(c.cell_contents) for c in cells))
+
+
 def _failure(pred: Predicate, v: Verdict) -> str:
     """'fails (division by zero) when x = 0': the witness, and the error it really raises."""
     cause = ""
@@ -890,7 +904,9 @@ class Expr(Generic[T]):
         """Evaluate against a mapping of variable values (models, dicts, scalars).
 
         A `Witness` from a verdict can be passed as is: its values are the solver's raw
-        data, so fields are read by name, not by their custom readers."""
+        data, so fields are read by name, not by their custom readers (`schema.Field`).
+        Pass the Witness itself: `dict(w)` or `w.to_python()` is treated as host data,
+        and readers run on it."""
         try:
             raw = self._prog.evaluate(
                 dict(data or {}), self._env._fn_impls, self._env._limits, self._readers(data)

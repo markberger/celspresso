@@ -12,6 +12,8 @@ pieces (`PydanticAdapter`, `DataclassAdapter`). An adapter answers two questions
   dict (already decoded). Return the dict itself if there is nothing better to build.
   Raise `ValueError` if the data can't be a real `tp` (a validator rejects it): the
   verdict becomes UNKNOWN. Any other exception is treated as a bug and propagates.
+  The dict is keyed by field name, even for a field with a `reader` that reads some
+  other attribute.
 
 A `SchemaContext` is only valid during the `schema_for` call it was passed to.
 

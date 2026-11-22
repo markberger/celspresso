@@ -257,3 +257,23 @@ def test_reader_cycles_are_collected() -> None:
     ref = make()
     gc.collect()
     assert ref() is None
+
+
+def test_identically_built_envs_with_adapter_readers_combine() -> None:
+    adapter = OrderAdapter()
+    a = Env(order=Order, adapters=[adapter]).predicate("order.note == null")
+    b = Env(order=Order, adapters=[adapter]).predicate("order.note == null")
+    assert a == b
+    assert (a & b).evaluate({"order": Order([])})
+
+
+def test_cli_diff_replays_witnesses_without_readers() -> None:
+    from celspresso._cli import RuleFile, run_diff
+
+    env = _qty_env()
+    old = RuleFile("old.toml", "", env, {"r": "item.qty > 3"})
+    new = RuleFile("new.toml", "", env, {"r": "item.qty > 5"})
+    (change,) = run_diff(old, new)
+    assert change.status == "changed"
+    assert change.examples
+    assert all((e.old, e.new) == ("true", "false") for e in change.examples)
