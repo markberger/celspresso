@@ -196,3 +196,18 @@ def test_parameterized_definition_errors() -> None:
         env.define("h", "1", params={"not valid": int})
     with pytest.raises(ValueError, match="shadows a variable"):
         env.define("n", "x", params={"x": int})
+
+
+def test_user_overload_on_a_builtin_name_gets_host_function_advice():
+    @function(name="contains")
+    def contains_n(s: str, n: int) -> bool:
+        return True  # the solver can't know that, and its counterexample won't replay
+
+    env = Env(s=str, n=int).extend(functions=[contains_n])
+    reason = env.predicate("contains(s, n)").always_true().reason
+    assert reason is not None
+    assert "ensures=" in reason
+    assert "doesn't model" not in reason
+    builtin = Env(a=int, b=float).predicate("math.greatest(1.5, b) > 2.0 || a > 0").always_true(timeout=1.0)
+    assert builtin.reason is not None
+    assert "ensures=" not in builtin.reason

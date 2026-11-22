@@ -1157,6 +1157,26 @@ impl Encoder {
                 let s = if *elem == CelType::Int { Int(acc) } else { Uint(acc) };
                 Some(Ok((s, or(&over.iter().collect::<Vec<_>>()))))
             }
+            ("math.abs", [Int(x)]) => {
+                let zero = ZInt::from_i64(0);
+                Some(Ok((Int(x.lt(&zero).ite(&-x, x)), x.eq(ZInt::from_i64(I64_MIN)))))
+            }
+            ("math.abs", [Uint(x)]) => ok(Uint(x.clone())),
+            ("math.greatest" | "math.least", [List { .. }]) => {
+                let as_list = if function == "math.greatest" { "max" } else { "min" };
+                self.builtin(c, e, as_list, v)
+            }
+            ("math.greatest" | "math.least", [first, rest @ ..])
+                if v.iter().all(|x| matches!(x, Int(_))) || v.iter().all(|x| matches!(x, Uint(_))) =>
+            {
+                let mut best = first.as_int()?.clone();
+                for x in rest {
+                    let xi = x.as_int()?;
+                    let better = if function == "math.greatest" { xi.gt(&best) } else { xi.lt(&best) };
+                    best = better.ite(xi, &best);
+                }
+                ok(if matches!(first, Int(_)) { Int(best) } else { Uint(best) })
+            }
             ("min" | "max", [List { slots, elem, .. }]) if matches!(elem, CelType::Int | CelType::Uint) => {
                 let mut best: Option<z3::ast::Int> = None;
                 let mut any = ff();
@@ -1291,7 +1311,7 @@ impl Encoder {
 
     /// Note that `function` (overload `overload`) is opaque here; returns how to describe it.
     fn note_opaque(&mut self, function: &str, overload: &str, args: &[Sym]) -> String {
-        if celspresso_check::is_builtin_overload(overload) {
+        if celspresso_check::is_builtin(function, overload) {
             if let Some(why) = self.unmodeled(function, args) {
                 return why;
             }

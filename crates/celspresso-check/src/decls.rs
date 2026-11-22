@@ -146,11 +146,16 @@ fn func(name: &str, overloads: Vec<Overload>) -> FunctionDecl {
 }
 
 /// Standard library declarations (cel-go overload ids).
-/// Whether `id` names an overload of the standard library or a bundled extension
-/// (as opposed to a host function the user declared).
-pub fn is_builtin_overload(id: &str) -> bool {
+/// Whether a call to `function` resolved to `overload` is the standard library or a
+/// bundled extension (as opposed to a host function the user declared). Both are
+/// checked: some builtins (`math.greatest`) are typed by the checker without overloads.
+pub fn is_builtin(function: &str, overload: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
     static IDS: OnceLock<HashSet<String>> = OnceLock::new();
-    IDS.get_or_init(|| stdlib().into_iter().flat_map(|f| f.overloads.into_iter().map(|o| o.id)).collect()).contains(id)
+    // by name only for builtins with no overloads, so a user overload on a stdlib name
+    // (`contains(string, int)`) is still a host function
+    NAMES.get_or_init(|| stdlib().into_iter().filter(|f| f.overloads.is_empty()).map(|f| f.name).collect()).contains(function)
+        || IDS.get_or_init(|| stdlib().into_iter().flat_map(|f| f.overloads.into_iter().map(|o| o.id)).collect()).contains(overload)
 }
 
 pub fn stdlib() -> Vec<FunctionDecl> {

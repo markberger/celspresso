@@ -629,3 +629,24 @@ fn operator_names_in_reasons_are_as_written() {
         st => panic!("{st:?}"),
     }
 }
+
+#[test]
+fn math_greatest_and_least() {
+    proved("math.greatest(x, y) >= x && math.greatest(x, y) >= y");
+    proved("math.least(x, y, 3) <= 3");
+    proved("math.greatest(x, y) == (x > y ? x : y)");
+    proved("math.greatest(5) == 5");
+    proved("x == -9223372036854775807 - 1 || math.abs(x) >= 0");
+    let w = refuted("math.abs(x) >= 0"); // abs(i64 min) overflows
+    assert_eq!(w["x"], Value::Int(i64::MIN));
+    let w = refuted("math.least(x, y) == x");
+    assert!(matches!((&w["x"], &w["y"]), (Value::Int(a), Value::Int(b)) if b < a));
+    // over a list: errors when empty, like the evaluator
+    proved("math.greatest([x, y]) == math.greatest(x, y)");
+    assert!(matches!(run(Query::CanError(&c("math.greatest(xs)"))).status, Status::Found(_)));
+    // still unmodeled: reported as a builtin, never with advice meant for host functions
+    match run(Query::Satisfiable(&c("math.greatest(1.5, double(x)) > 2.0"))).status {
+        Status::Unknown(r) => assert!(r.contains("'math.greatest'") && !r.contains("ensures") && r.contains("doesn't model"), "{r}"),
+        st => panic!("{st:?}"),
+    }
+}
