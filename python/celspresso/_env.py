@@ -243,6 +243,8 @@ class Env:
             tuple(sorted((n, repr(s)) for n, s in self._vars.items())),
             # struct names alone don't identify a schema: same-named structs may differ
             tuple(sorted((n, repr(fields)) for n, fields in self._builder.structs.items())),
+            # ...nor do equal fields: a struct backed by a class decodes witnesses into it
+            tuple(sorted((n, c.__module__, c.__qualname__, id(c)) for n, c in self._builder.classes.items())),
             tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
             tuple((n, src, repr(ps)) for n, src, ps in self._defs),
         )

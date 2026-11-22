@@ -24,6 +24,8 @@ the verifier as plain dicts.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -34,20 +36,80 @@ if TYPE_CHECKING:
 
 __all__ = ["Constraints", "Field", "Struct", "T", "TypeRef"]
 
+_SCALARS = (
+    "bool",
+    "int",
+    "uint",
+    "double",
+    "string",
+    "bytes",
+    "date",
+    "timestamp",
+    "duration",
+    "null",
+    "dyn",
+)
+# names CEL's checker or our type display already use
+_RESERVED = {*_SCALARS, "list", "map", "type", "null_type", "optional_type", "any"}
+# dotted identifiers, optionally versioned: `shop.Order`, `Patient@2`
+_STRUCT_NAME = re.compile(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*([@#][A-Za-z0-9_.]+)?")
 
-@dataclass(frozen=True)
+
 class TypeRef:
-    """A CEL type. Build them with `T`: `T.int`, `T.list(T.string)`, `T.struct("Order")`."""
+    """A CEL type. Build them with `T`: `T.int`, `T.list(T.string)`, `T.struct("Order")`.
 
-    spec: TypeSpec
+    TypeRefs are immutable and hashable, and compare equal when they denote the same
+    type. Their representation is private."""
+
+    __slots__ = ("_spec",)
+    _spec: TypeSpec
+
+    def __init__(self, spec: TypeSpec) -> None:
+        _check_spec(spec)
+        object.__setattr__(self, "_spec", spec)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("TypeRef is immutable")
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TypeRef) and self._spec == other._spec
+
+    def __hash__(self) -> int:
+        return hash(self._spec)
 
     def __str__(self) -> str:
-        from ._types import type_name
+        from ._types import type_name  # _types imports this module
 
-        return type_name(self.spec)
+        return type_name(self._spec)
 
     def __repr__(self) -> str:
         return f"TypeRef({self})"
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (TypeRef, (self._spec,))
+
+
+def _check_spec(spec: Any) -> None:
+    if isinstance(spec, str) and spec in _SCALARS:
+        return
+    if isinstance(spec, tuple) and spec:
+        kind, args = spec[0], spec[1:]
+        if kind == "struct" and len(args) == 1:
+            _check_struct_name(args[0])
+            return
+        if (kind, len(args)) in {("list", 1), ("nullable", 1), ("map", 2)}:
+            for a in args:
+                _check_spec(a)
+            return
+    raise TypeError(f"not a CEL type: {spec!r}; build types with celspresso.schema.T")
+
+
+def _check_struct_name(name: Any) -> None:
+    if not isinstance(name, str) or not _STRUCT_NAME.fullmatch(name) or name in _RESERVED:
+        raise ValueError(
+            f"invalid struct name {name!r}: use a dotted identifier such as 'shop.Order' "
+            "(optionally versioned, 'Patient@2') that is not a CEL type name"
+        )
 
 
 class T:
@@ -67,23 +129,22 @@ class T:
 
     @staticmethod
     def list(elem: TypeRef) -> TypeRef:
-        return TypeRef(("list", _ref(elem, "T.list").spec))
+        return TypeRef(("list", _ref(elem, "T.list")._spec))
 
     @staticmethod
     def map(key: TypeRef, value: TypeRef) -> TypeRef:
-        return TypeRef(("map", _ref(key, "T.map key").spec, _ref(value, "T.map value").spec))
+        return TypeRef(("map", _ref(key, "T.map key")._spec, _ref(value, "T.map value")._spec))
 
     @staticmethod
     def nullable(inner: TypeRef) -> TypeRef:
         """A value that may be null (Python's `Optional[...]`)."""
-        spec = _ref(inner, "T.nullable").spec
+        spec = _ref(inner, "T.nullable")._spec
         return TypeRef(spec if isinstance(spec, tuple) and spec[0] == "nullable" else ("nullable", spec))
 
     @staticmethod
     def struct(name: str) -> TypeRef:
-        """A struct declared with `Struct(name, ...)`, or registered from a class."""
-        if not isinstance(name, str) or not name:
-            raise TypeError(f"T.struct expects a struct name, got {name!r}")
+        """A struct declared with `Struct(name, ...)` in the same Env. (Refer to a Python
+        class with the class itself, not by name: its CEL name is assigned for it.)"""
         return TypeRef(("struct", name))
 
 
@@ -99,7 +160,8 @@ class Constraints:
 
     Bounds apply to numbers, lengths to strings (in characters), bytes, lists and maps,
     `pattern` (an unanchored regex) to strings, `one_of` to strings and ints, and
-    `items` to each element of a list.
+    `items` to each element of a list. Declaring a struct checks each constraint
+    against its field's type.
     """
 
     ge: float | None = None
@@ -115,8 +177,15 @@ class Constraints:
     def __post_init__(self) -> None:
         for key in ("ge", "gt", "le", "lt"):
             v = getattr(self, key)
-            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            if v is None:
+                continue
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise TypeError(f"Constraints({key}=...) must be a number, got {v!r}")
+            if not math.isfinite(v):
+                raise ValueError(f"Constraints({key}=...) must be finite, got {v!r}")
+            if isinstance(v, int) and float(v) != v:
+                # bounds are solved and checked as doubles; never round one silently
+                raise ValueError(f"Constraints({key}={v}) is not exactly representable as a double")
         for key in ("min_length", "max_length"):
             v = getattr(self, key)
             if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
@@ -124,12 +193,16 @@ class Constraints:
         if self.pattern is not None and not isinstance(self.pattern, str):
             raise TypeError(f"Constraints(pattern=...) must be a str, got {self.pattern!r}")
         if self.one_of is not None:
+            if not isinstance(self.one_of, (list, tuple)):
+                raise TypeError(f"Constraints(one_of=...) must be a list or tuple, got {self.one_of!r}")
             values = tuple(self.one_of)
             kinds = {type(v) for v in values}
             if not values or not (kinds == {str} or kinds == {int}):
                 raise TypeError(
-                    "Constraints(one_of=...) must be a non-empty collection of all-str or all-int values"
+                    "Constraints(one_of=...) must be a non-empty list of all-str or all-int values"
                 )
+            if kinds == {int} and not all(-(2**63) <= v < 2**64 for v in values):
+                raise ValueError("Constraints(one_of=...) ints must fit in int64 or uint64")
             object.__setattr__(self, "one_of", values)
         if self.items is not None and not isinstance(self.items, Constraints):
             raise TypeError(f"Constraints(items=...) must be Constraints, got {self.items!r}")
@@ -176,8 +249,7 @@ class Struct:
     fields: tuple[Field, ...]
 
     def __init__(self, name: str, fields: Iterable[Field]) -> None:
-        if not isinstance(name, str) or not name:
-            raise ValueError(f"invalid struct name {name!r}")
+        _check_struct_name(name)
         fs = tuple(fields)
         for f in fs:
             if not isinstance(f, Field):
@@ -191,4 +263,4 @@ class Struct:
         object.__setattr__(self, "fields", fs)
 
     def _spec(self) -> list[tuple[str, TypeSpec, dict[str, Any] | None]]:
-        return [(f.name, f.type.spec, f.constraints._spec()) for f in self.fields]
+        return [(f.name, f.type._spec, f.constraints._spec()) for f in self.fields]

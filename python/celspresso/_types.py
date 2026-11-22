@@ -6,6 +6,7 @@ import dataclasses
 import datetime as _dt
 import decimal
 import enum
+import math
 import sys
 import types
 import typing
@@ -13,7 +14,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any, Union, get_args, get_origin
 
-from .schema import Struct, TypeRef
+from ._celspresso import pattern_error
+from .schema import Constraints, Struct, TypeRef
 
 TypeSpec = Any  # "int" | ("list", TypeSpec) | ("nullable", TypeSpec) | ("struct", name) | ...
 
@@ -100,12 +102,20 @@ class SchemaBuilder:
             self.structs[st.name] = spec
         for st in new:
             for f in st.fields:
-                self._check_refs(f.type.spec, f"{st.name}.{f.name}")
+                where = f"{st.name}.{f.name}"
+                self._check_refs(f.type._spec, where)
+                _check_constraints(f.type._spec, f.constraints, where)
 
     def _check_refs(self, spec: TypeSpec, where: str) -> None:
         if isinstance(spec, str):
             return
         if spec[0] == "struct":
+            if spec[1] in self.classes:
+                # a class's CEL name depends on registration order; never refer to it by name
+                raise TypeError(
+                    f"{where}: '{spec[1]}' is the struct for class {self.classes[spec[1]]!r}; "
+                    "use the class itself instead of T.struct"
+                )
             if spec[1] not in self.structs:
                 raise TypeError(f"{where}: unknown struct '{spec[1]}'; declare it with structs=[Struct(...)]")
             return
@@ -177,8 +187,8 @@ class SchemaBuilder:
 
     def _convert(self, tp: Any, cons: dict[str, Any], where: str) -> TypeSpec:
         if isinstance(tp, TypeRef):
-            self._check_refs(tp.spec, where)
-            return tp.spec
+            self._check_refs(tp._spec, where)
+            return tp._spec
         if isinstance(tp, str) and tp in _CEL_NAMES:
             return tp
         if tp in _SCALARS:
@@ -240,6 +250,61 @@ class SchemaBuilder:
         if tp is dict:
             return ("map", "dyn", "dyn")
         raise TypeError(f"{where}: cannot map {tp!r} to a CEL type")
+
+
+_NUMERIC = {"int", "uint", "double"}
+_SIZED = {"string", "bytes", "list", "map"}
+
+
+def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
+    """Reject constraints that don't apply to the field's type, so the verifier (which
+    would ignore them) and `evaluate` (which might reject every value) can't disagree."""
+    if isinstance(spec, tuple) and spec[0] == "nullable":
+        spec = spec[1]
+    kind = spec if isinstance(spec, str) else spec[0]
+
+    def bad(what: str, applies_to: str) -> TypeError:
+        return TypeError(f"{where}: {what} applies to {applies_to}, not {type_name(spec)}")
+
+    bounds = {k: v for k in ("ge", "gt", "le", "lt") if (v := getattr(c, k)) is not None}
+    if bounds and kind not in _NUMERIC:
+        raise bad("a numeric bound", "int, uint or double")
+    if kind == "uint" and (bounds.get("le", 0) < 0 or bounds.get("lt", 1) <= 0):
+        raise ValueError(f"{where}: no uint satisfies {bounds}")
+    # (bound, strict): on a tie between ge and gt, the strict one is the binding bound
+    lo = max((bounds.get("ge", -math.inf), False), (bounds.get("gt", -math.inf), True))
+    hi = min(
+        (bounds.get("le", math.inf), False),
+        (bounds.get("lt", math.inf), True),
+        key=lambda b: (b[0], not b[1]),
+    )
+    if lo[0] > hi[0] or (lo[0] == hi[0] and (lo[1] or hi[1])):
+        raise ValueError(f"{where}: no value satisfies {bounds}")
+    if (c.min_length is not None or c.max_length is not None) and kind not in _SIZED:
+        raise bad("a length", "string, bytes, list or map")
+    if c.min_length is not None and c.max_length is not None and c.min_length > c.max_length:
+        raise ValueError(f"{where}: min_length {c.min_length} exceeds max_length {c.max_length}")
+    if c.pattern is not None:
+        if kind != "string":
+            raise bad("a pattern", "string")
+        if (err := pattern_error(c.pattern)) is not None:
+            raise ValueError(f"{where}: {err}")
+    if c.one_of is not None:
+        if isinstance(c.one_of[0], str):
+            if kind != "string":
+                raise bad("one_of with strings", "string")
+        elif kind == "int":
+            if not all(-(2**63) <= v < 2**63 for v in c.one_of):
+                raise ValueError(f"{where}: one_of values must fit in int64")
+        elif kind == "uint":
+            if not all(v >= 0 for v in c.one_of):
+                raise ValueError(f"{where}: one_of values must be non-negative for uint")
+        else:
+            raise bad("one_of with ints", "int or uint")
+    if c.items is not None:
+        if kind != "list":
+            raise bad("items", "list")
+        _check_constraints(spec[1], c.items, f"{where}[]")
 
 
 def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None:

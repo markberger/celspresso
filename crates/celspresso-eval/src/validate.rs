@@ -162,6 +162,11 @@ thread_local! {
     static PATTERNS: RefCell<HashMap<String, regex::Regex>> = RefCell::new(HashMap::new());
 }
 
+/// Why `pattern` can't be used as a schema pattern, if it can't.
+pub fn pattern_error(pattern: &str) -> Option<String> {
+    regex::Regex::new(pattern).err().map(|e| format!("invalid pattern {pattern:?}: {e}"))
+}
+
 /// Pydantic-style `pattern`: an unanchored search, compiled once per thread.
 fn pattern_matches(pattern: &str, s: &str) -> Result<bool, String> {
     PATTERNS.with(|cache| {

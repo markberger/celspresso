@@ -864,12 +864,19 @@ fn bounds<'py>(
     Ok(d)
 }
 
+/// Why `pattern` is not a usable schema pattern (`None` if it is).
+#[pyfunction]
+fn pattern_error(pattern: &str) -> Option<String> {
+    celspresso_eval::validate::pattern_error(pattern)
+}
+
 #[pymodule]
 fn _celspresso(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bounds, m)?)?;
     m.add_class::<Core>()?;
     m.add_class::<Program>()?;
     m.add_function(wrap_pyfunction!(verify, m)?)?;
+    m.add_function(wrap_pyfunction!(pattern_error, m)?)?;
     m.add("CompileError", m.py().get_type::<CompileError>())?;
     m.add("EvalError", m.py().get_type::<EvalError>())?;
     Ok(())
