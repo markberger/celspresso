@@ -231,6 +231,8 @@ class Env:
         self._fn_impls = {f.name: f.impl for f in self._fns.values()}
         self._fingerprint = (
             tuple(sorted((n, repr(s)) for n, s in self._vars.items())),
+            # struct names alone don't identify a schema: same-named structs may differ
+            tuple(sorted((n, repr(fields)) for n, fields in self._builder.structs.items())),
             tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
             tuple((n, src, repr(ps)) for n, src, ps in self._defs),
         )

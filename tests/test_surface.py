@@ -135,6 +135,36 @@ def test_classes_sharing_module_and_qualname_stay_distinct() -> None:
     assert z.c > 5
 
 
+def test_string_annotations_resolve_in_their_own_module(tmp_path, monkeypatch) -> None:
+    (tmp_path / "shop_a.py").write_text(
+        "from dataclasses import dataclass\n@dataclass\nclass Order:\n    a: int\n"
+    )
+    (tmp_path / "shop_b.py").write_text(
+        "from __future__ import annotations\nfrom dataclasses import dataclass\n"
+        "@dataclass\nclass Order:\n    b: int\n@dataclass\nclass Holder:\n    o: Order\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import shop_a  # type: ignore[import-not-found]
+    import shop_b  # type: ignore[import-not-found]
+
+    env = Env(x=shop_a.Order, h=shop_b.Holder)  # shop_a.Order must not hide shop_b's
+    assert env.predicate("h.o.b > 0 && x.a > 0").satisfiable().sat
+
+
+def test_envs_over_different_same_named_structs_are_different() -> None:
+    def model(field: str) -> type:
+        cls = dataclasses.make_dataclass("Order", [(field, int)])
+        cls.__module__ = "__fake__"
+        return cls
+
+    e1, e2 = Env(x=model("a")), Env(x=model("b"))
+    p1, p2 = e1.predicate("x.a > 0"), e2.predicate("x.b > 0")
+    with pytest.raises(ValueError, match="different environments"):
+        p1 & p2
+    with pytest.raises(ValueError, match="different environments"):
+        p1.implies(p2)
+
+
 def test_type_name_helper() -> None:
     assert type_name(("map", "string", ("list", "int"))) == "map(string, list(int))"
     assert type_name(("nullable", ("struct", "User"))) == "User?"

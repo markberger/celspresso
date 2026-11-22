@@ -6,6 +6,7 @@ import dataclasses
 import datetime as _dt
 import decimal
 import enum
+import sys
 import types
 import typing
 from collections.abc import Mapping, Sequence
@@ -129,7 +130,11 @@ class SchemaBuilder:
     def _hints(self, cls: type, where: str) -> dict[str, Any]:
         # String annotations (``from __future__ import annotations``) on classes defined
         # inside a function cannot see that function's locals; give them the classes we know.
-        known = {c.__name__: c for c in self.classes.values()}
+        # Names the class's own module defines win: `localns` outranks module globals
+        # in get_type_hints, so a same-named class from elsewhere would hide them.
+        module = sys.modules.get(cls.__module__)
+        own = vars(module) if module is not None else {}
+        known = {c.__name__: c for c in self.classes.values() if c.__name__ not in own}
         try:
             return typing.get_type_hints(cls, localns=known, include_extras=True)
         except NameError as exc:
