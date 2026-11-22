@@ -195,7 +195,7 @@ A Rust core parses, checks and evaluates CEL, and encodes its exact semantics in
 - **Rule sets:** `RuleSet({...}).verify_all(invariants)` vets every rule at once; `unreachable()`, `can_error()` and `check_pairwise(...)` find dead, crashing and overlapping rules.
 - **Debugging and tests:** `expr.explain(data)` shows the value of every sub-expression; `celspresso.testing` has `assert_equivalent`, `assert_implies`, `assert_never` and more.
 - **Not yet supported:** protobuf messages and JSON values. Fields typed `Any` or `dict[str, Any]` can be evaluated, but the verifier can't see into them: checks that depend on them return `UNKNOWN`, and the reason suggests a concrete type. The verifier models ints, doubles (IEEE, NaN included), strings, lists, maps, optionals, dates, timestamps and durations; bytes and named time zones return `UNKNOWN` with the reason. Proofs over a list or map need a `max_length` (or a larger `unroll_limit`), so the prover can cover every length.
-- **Contributing:** `scripts/check.sh` runs every lint, type-check and test gate.
+- **Contributing:** `scripts/check.sh` runs every lint, type-check and test gate. Run `uv run prek install` once: commits then get file hygiene, ruff and rustfmt fixes on the staged files, and pushes run `scripts/check.sh --fast`.
 
 ## License
 

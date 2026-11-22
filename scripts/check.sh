@@ -11,14 +11,10 @@ RUST_LINE_FLOOR=85
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
-step "ruff lint"
-uv run ruff check python tests benchmarks
+step "file hygiene, ruff, rustfmt (the pre-commit hooks in prek.toml; fixes are reported as failures)"
+uv run prek run --all-files --stage pre-commit --show-diff-on-failure
 
-step "ruff format"
-uv run ruff format --check python tests benchmarks
-
-step "rustfmt + clippy"
-cargo fmt --all --check
+step "clippy"
 cargo clippy -q --workspace --exclude celspresso-py --all-targets -- -D warnings
 
 step "pyright"

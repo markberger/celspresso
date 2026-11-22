@@ -64,6 +64,27 @@ with "comprehension over this range is not yet modeled". The same comprehension 
 non-nullable list works.
 - *Fix:* in the encoder, unwrap a nullable range under the guard that it isn't null.
 
+### Common string functions are not modeled, so form-filling proofs come back UNKNOWN
+In the claim-form walkthrough, `upperAscii`, `string(int)` and `split` all made proofs
+come back UNKNOWN ("depends on 'upperAscii', which the verifier doesn't model yet").
+This includes `can_error()` over the whole fill spec. These functions are everywhere in
+form filling (names in caps, money formatting).
+- *Fix:* add encodings. `size(upperAscii(s)) == size(s)`, together with per-character
+  mapping axioms, covers lengths. `string(int)` can be encoded with Z3's `int.to.str`,
+  plus a sign case. `split` is harder: a bounded unrolling, or an uninterpreted function
+  with length axioms.
+- *Found:* claim-form walkthrough, while writing a usage example.
+
+## Language
+
+### `date` has no month or day accessors
+`date` supports only `year()`, `ageOn()` and `daysUntil()`. So a date of birth can't be
+formatted into the `MM DD YY` boxes that forms use. The timestamp accessors
+(`getMonth`, `getDayOfMonth`) aren't declared for `date`.
+- *Fix:* declare `getMonth`/`getDayOfMonth`/`getDayOfWeek` (and maybe `format`) for
+  `date`, with day-number encodings in the verifier.
+- *Found:* claim-form walkthrough.
+
 ## API surface
 
 ### `Env` and `Expr` aren't picklable
