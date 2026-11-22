@@ -44,7 +44,16 @@ pub struct Encoder {
     first_date: Option<Int>,
     /// (haystack, needle, result, is_last) of every indexOf(s, t) / lastIndexOf(s, t), to relate them.
     index_terms: Vec<(ZStr, ZStr, ZInt, bool)>,
+    /// lowerAscii and upperAscii as uninterpreted String -> String functions (plus axioms).
+    case_funcs: Option<(FuncDecl, FuncDecl)>,
+    /// Conditions under which some value was cut off at the unroll bound (a split with
+    /// more pieces than slots). A proof holds only if the assumptions rule them all out.
+    pub overflow: Vec<Bool>,
 }
+
+/// Characters of a lowerAscii/upperAscii result that are pinned exactly, per call (each
+/// one costs solver time: 8 is about 5x slower than 4 on simple refutations).
+const CASE_CHARS: i64 = 4;
 
 /// Days since 1970-01-01 today (UTC). Only steers *preferences*, never verdicts.
 fn today_days() -> i64 {
@@ -87,6 +96,8 @@ impl Encoder {
             fresh: 0,
             first_date: None,
             index_terms: Vec::new(),
+            case_funcs: None,
+            overflow: Vec::new(),
         }
     }
 
@@ -1210,6 +1221,37 @@ impl Encoder {
                 ok(Int(&oy - &by - before.ite(&ZInt::from_i64(1), &ZInt::from_i64(0))))
             }
             ("daysUntil", [Date(a), Date(b)]) => ok(Int(b - a)),
+            ("lowerAscii" | "upperAscii", [Str(s)]) => ok(Str(self.ascii_case(function == "upperAscii", s))),
+            ("string", [Str(s)]) => ok(Str(s.clone())),
+            ("string", [Bool(b)]) => ok(Str(b.ite(&zutil::str_lit("true"), &zutil::str_lit("false")))),
+            ("string", [Uint(x)]) => ok(Str(zutil::int_to_str(x))),
+            ("string", [Int(x)]) => {
+                // str.from_int is "" below zero
+                let neg = ZStr::concat(&[zutil::str_lit("-"), zutil::int_to_str(&-x)]);
+                ok(Str(x.lt(ZInt::from_i64(0)).ite(&neg, &zutil::int_to_str(x))))
+            }
+            // Rust's integer parsing: an optional sign ('+' always; '-' for int), then ASCII digits
+            ("int", [Str(s)]) => {
+                let (neg, n) = Self::parse_digits(s, true);
+                let x = neg.ite(&-&n, &n);
+                Some(Ok((Int(x.clone()), or(&[&n.lt(ZInt::from_i64(0)), &int_range(&x, I64_MIN, I64_MAX).not()]))))
+            }
+            ("uint", [Str(s)]) => {
+                let (_, n) = Self::parse_digits(s, false);
+                Some(Ok((Uint(n.clone()), or(&[&n.lt(ZInt::from_i64(0)), &uint_range(&n).not()]))))
+            }
+            ("join", [List { slots, elem: CelType::String, .. }, sep @ ..]) if sep.len() <= 1 => {
+                let sep = match sep {
+                    [Str(t)] => t.clone(),
+                    [] => zutil::str_lit(""),
+                    _ => return Some(Err("join() with this separator is not modeled".into())),
+                };
+                ok(Str(Self::join(slots, &sep)))
+            }
+            ("split", [Str(s), Str(sep)]) => match zutil::str_value(sep) {
+                Some(t) if !t.is_empty() => ok(self.split(s, sep)),
+                _ => Some(Err("split() with an empty or non-constant separator is not modeled".into())),
+            },
             ("year", [Date(d)]) => ok(Int(civil_from_days(d).0)),
             (
                 "lowerAscii"
@@ -1449,6 +1491,82 @@ impl Encoder {
             self.relate_indexes(a, b, &r, false);
         }
         r
+    }
+
+    /// `s.lowerAscii()` / `s.upperAscii()`: exact on literals; otherwise an uninterpreted
+    /// function with true facts about it (length, each of the first CASE_CHARS characters,
+    /// idempotence, and that the other case of the result is the other case of `s`).
+    fn ascii_case(&mut self, upper: bool, s: &ZStr) -> ZStr {
+        if let Some(v) = zutil::str_value(s) {
+            return zutil::str_lit(&if upper { v.to_ascii_uppercase() } else { v.to_ascii_lowercase() });
+        }
+        let (lower_f, upper_f) = &*self.case_funcs.get_or_insert_with(|| {
+            let s = Sort::string();
+            (FuncDecl::new("lowerAscii", &[&s], &s), FuncDecl::new("upperAscii", &[&s], &s))
+        });
+        let app = |f: &FuncDecl, x: &ZStr| f.apply(&[x as &dyn Ast]).as_string().expect("string result");
+        let (f, other) = if upper { (upper_f, lower_f) } else { (lower_f, upper_f) };
+        let r = app(f, s);
+        let (lo, hi, shift) = if upper { (97, 122, -32) } else { (65, 90, 32) };
+        let mut facts = vec![r.length().eq(s.length()), app(f, &r).eq(&r), app(other, &r).eq(app(other, s))];
+        for i in 0..CASE_CHARS {
+            let c = s.at(ZInt::from_i64(i));
+            let code = zutil::str_to_code(&c);
+            let in_range = and(&[&code.ge(ZInt::from_i64(lo)), &code.le(ZInt::from_i64(hi))]);
+            let mapped = in_range.ite(&zutil::str_from_code(&(&code + ZInt::from_i64(shift))), &c);
+            facts.push(r.at(ZInt::from_i64(i)).eq(&mapped));
+        }
+        self.assumptions.push(and(&facts.iter().collect::<Vec<_>>()));
+        self.approximations.insert(format!("lowerAscii/upperAscii are exact only on their first {CASE_CHARS} characters and on literals"));
+        r
+    }
+
+    /// (negative, magnitude) of an optionally signed run of ASCII digits; the magnitude is
+    /// -1 when `s` isn't one ('-' only when `signed`).
+    fn parse_digits(s: &ZStr, signed: bool) -> (Bool, ZInt) {
+        let neg = if signed { zutil::str_lit("-").prefix(s) } else { ff() };
+        let sign = or(&[&neg, &zutil::str_lit("+").prefix(s)]);
+        let body = sign.ite(&s.substr(ZInt::from_i64(1), s.length() - ZInt::from_i64(1)), s);
+        (neg, zutil::str_to_int(&body))
+    }
+
+    /// Live elements of `slots` joined by `sep` (liveness need not be a prefix: `filter`).
+    fn join(slots: &[(Bool, Sym)], sep: &ZStr) -> ZStr {
+        let mut acc = zutil::str_lit("");
+        let mut seen = ff();
+        for (live, x) in slots {
+            let Sym::Str(x) = x else { continue };
+            let next = seen.ite(&ZStr::concat(&[acc.clone(), sep.clone(), x.clone()]), x);
+            acc = live.ite(&next, &acc);
+            seen = or(&[&seen, live]);
+        }
+        acc
+    }
+
+    /// `s.split(sep)` for a non-empty `sep`: the pieces, in `unroll` slots, are the unique
+    /// list whose join is `s` where each separator is the leftmost match after the previous
+    /// one. More pieces than slots is recorded in `overflow`.
+    fn split(&mut self, s: &ZStr, sep: &ZStr) -> Sym {
+        let k = self.unroll.max(1);
+        let n = ZInt::fresh_const("split#len");
+        let mut facts = vec![int_range(&n, 1, k as i64)];
+        let mut slots = Vec::with_capacity(k);
+        for i in 0..k {
+            let live = n.gt(ZInt::from_i64(i as i64));
+            let p = ZStr::fresh_const("split#piece");
+            let is_last = n.eq(ZInt::from_i64(i as i64 + 1));
+            // a piece that is followed by a separator ends where the first match starts
+            let first = zutil::str_index_of(&ZStr::concat(&[p.clone(), sep.clone()]), sep, &ZInt::from_i64(0)).eq(p.length());
+            if i + 1 < k {
+                facts.push(live.implies(is_last.ite(&p.contains(sep).not(), &first)));
+            } else {
+                self.overflow.push(and(&[&live, &p.contains(sep)]));
+            }
+            slots.push((live, Sym::Str(p)));
+        }
+        facts.push(Self::join(&slots, sep).eq(s));
+        self.assumptions.push(and(&facts.iter().collect::<Vec<_>>()));
+        Sym::List { slots, elem: CelType::String, trunc: false }
     }
 
     /// For each haystack/needle pair: found iff `contains`, and the first match is at or

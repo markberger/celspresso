@@ -181,3 +181,34 @@ pub fn str_last_index_of(s: &ZStr, t: &ZStr) -> z3::ast::Int {
         z3::ast::Int::wrap(&ctx, raw)
     }
 }
+
+macro_rules! unary {
+    ($(#[$doc:meta])* $name:ident, $z3:ident, $from:ty => $to:ty) => {
+        $(#[$doc])*
+        pub fn $name(x: &$from) -> $to {
+            let ctx = z3::Context::thread_local();
+            // SAFETY: handles from the thread-local context; the result is wrapped immediately.
+            unsafe {
+                let raw = z3_sys::$z3(ctx.get_z3_context(), x.get_z3_ast()).expect(stringify!($z3));
+                <$to>::wrap(&ctx, raw)
+            }
+        }
+    };
+}
+
+unary!(
+    /// Z3 `str.from_int`: the decimal digits of `x` for `x >= 0`, "" for negative `x`.
+    int_to_str, Z3_mk_int_to_str, z3::ast::Int => ZStr
+);
+unary!(
+    /// Z3 `str.to_int`: the value of an all-ASCII-digit, non-empty string, else -1.
+    str_to_int, Z3_mk_str_to_int, ZStr => z3::ast::Int
+);
+unary!(
+    /// Z3 `str.to_code`: the code point of a one-character string, else -1.
+    str_to_code, Z3_mk_string_to_code, ZStr => z3::ast::Int
+);
+unary!(
+    /// Z3 `str.from_code`: the one-character string for a code point, else "".
+    str_from_code, Z3_mk_string_from_code, z3::ast::Int => ZStr
+);

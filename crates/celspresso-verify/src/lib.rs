@@ -105,6 +105,20 @@ fn goal(enc: &mut Encoder, q: &Query) -> Result<Bool, String> {
     })
 }
 
+/// Whether the assumptions allow a value the encoding cut off at the unroll bound.
+fn overflows(enc: &Encoder, user: &[Bool], params: &Params) -> bool {
+    if enc.overflow.is_empty() {
+        return false;
+    }
+    let s = Solver::new();
+    let _ = s.set_params(params);
+    for a in enc.assumptions.iter().chain(user) {
+        s.assert(a);
+    }
+    s.assert(or(&enc.overflow.iter().collect::<Vec<_>>()));
+    s.check() != SatResult::Unsat
+}
+
 fn unknown_reason(r: Option<String>) -> String {
     match r.as_deref() {
         Some("timeout") | Some("canceled") => "solver timeout".into(),
@@ -163,7 +177,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
             }
             match s2.check() {
                 SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
-                _ if truncated => {
+                _ if truncated || overflows(&enc, &user, &params) => {
                     bounded = true;
                     Status::Unknown(format!(
                         "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",

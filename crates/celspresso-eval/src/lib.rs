@@ -534,7 +534,7 @@ impl<'a> Evaluator<'a> {
                 }
                 Int(d.trunc() as i64)
             }
-            ("int", [String(s)]) => Int(s.parse().map_err(|_| err(e, format!("cannot convert {} to int", Value::String(s.clone()))))?),
+            ("int", [String(s)]) => Int(s.parse().map_err(|_| err(e, "cannot convert string to int"))?),
             ("uint", [Uint(u)]) => Uint(*u),
             ("uint", [Int(i)]) => Uint(u64::try_from(*i).map_err(|_| err(e, "uint range error"))?),
             ("uint", [Double(d)]) => {

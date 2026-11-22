@@ -113,16 +113,21 @@ with "comprehension over this range is not yet modeled". The same comprehension 
 non-nullable list works.
 - *Fix:* in the encoder, unwrap a nullable range under the guard that it isn't null.
 
-### Common string functions are not modeled, so form-filling proofs come back UNKNOWN
-In the claim-form walkthrough, `upperAscii`, `string(int)` and `split` all made proofs
-come back UNKNOWN ("depends on 'upperAscii', which the verifier doesn't model yet").
-This includes `can_error()` over the whole fill spec. These functions are everywhere in
-form filling (names in caps, money formatting).
-- *Fix:* add encodings. `size(upperAscii(s)) == size(s)`, together with per-character
-  mapping axioms, covers lengths. `string(int)` can be encoded with Z3's `int.to.str`,
-  plus a sign case. `split` is harder: a bounded unrolling, or an uninterpreted function
-  with length axioms.
-- *Found:* claim-form walkthrough, while writing a usage example.
+### Some string functions are still not modeled
+`trim`, `replace`, `format`, `substring`-free `charAt` loops, `split` with a limit or an
+empty or non-constant separator, `reverse` and `quote` return UNKNOWN ("depends on
+'trim', which the verifier doesn't model yet"). `lowerAscii`/`upperAscii`, `string()` of
+ints, uints and bools, `int()`/`uint()` of strings, `join` and `split(sep)` are modeled.
+Remaining limits of those:
+- `lowerAscii`/`upperAscii` pin only the first 4 characters of a non-literal string
+  (each extra character costs solver time). Facts about longer strings that depend on
+  later characters may be UNKNOWN; counterexamples are always replayed, so never wrong.
+- `split` uses `unroll_limit` slots. If the assumptions allow more pieces (an unbounded
+  string, or `max_length` above the limit), a proof is UNKNOWN even when it holds for
+  any number of pieces (`size(t.split(',')) >= 1`).
+- *Fix:* `trim` via a regex over the whitespace class; `format` for constant format
+  strings; lazy refinement of case-mapping axioms when a witness doesn't replay.
+- *Found:* claim-form walkthrough; partly fixed in the string-functions milestone.
 
 ## Language
 
