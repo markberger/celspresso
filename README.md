@@ -42,7 +42,7 @@ Under the hood, a Rust core parses and type-checks CEL, evaluates it in microsec
 From source. You need Rust (stable) and [uv](https://docs.astral.sh/uv/). Z3 is downloaded and linked statically, so you don't need a system install.
 
 ```sh
-git clone git@github.com:markberger/celspresso-.git celspresso && cd celspresso
+git clone https://github.com/markberger/celspresso && cd celspresso
 uv sync --group dev
 uv run maturin develop --release
 ```
@@ -153,4 +153,4 @@ scripts/check.sh   # ruff, pyright, pytest and Rust tests, with coverage gates
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE)
