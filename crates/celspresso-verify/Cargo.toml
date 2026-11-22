@@ -9,3 +9,5 @@ celspresso-syntax.workspace = true
 celspresso-check.workspace = true
 celspresso-eval.workspace = true
 z3.workspace = true
+z3-sys = "0.14.2"
+regex-syntax = "0.8"

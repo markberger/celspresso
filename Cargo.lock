@@ -133,7 +133,9 @@ dependencies = [
  "celspresso-check",
  "celspresso-eval",
  "celspresso-syntax",
+ "regex-syntax",
  "z3",
+ "z3-sys",
 ]
 
 [[package]]
