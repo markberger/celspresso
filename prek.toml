@@ -1,19 +1,19 @@
-# Git hooks, run by prek (https://prek.j178.dev). Set up once with: uv run prek install
-#
-# pre-commit: file hygiene, and fix-then-check formatting/lint on the staged files.
-# pre-push:   the fast quality gate (scripts/check.sh --fast), so nothing reaches
-#             origin without passing it. The full gate (with Rust coverage) stays manual.
-default_install_hook_types = ["pre-commit", "pre-push"]
+# Pre-commit hooks, run by prek (https://prek.j178.dev): file hygiene, and fix-then-check
+# formatting/lint on the staged files. Set up once with: uv run prek install
+# The pre-push gate is a plain hook, scripts/pre-push (see that file for why).
+default_install_hook_types = ["pre-commit"]
+default_stages = ["pre-commit"]
 
 [[repos]]
 repo = "builtin"
 hooks = [
-  { id = "trailing-whitespace" },
-  { id = "end-of-file-fixer" },
+  # these three declare more stages in their manifests; keep them to commits
+  { id = "trailing-whitespace", stages = ["pre-commit"] },
+  { id = "end-of-file-fixer", stages = ["pre-commit"] },
   { id = "mixed-line-ending" },
   { id = "check-merge-conflict" },
   { id = "check-toml" },
-  { id = "check-added-large-files" },
+  { id = "check-added-large-files", stages = ["pre-commit"] },
   { id = "detect-private-key" },
 ]
 
@@ -24,14 +24,14 @@ repo = "local"
 id = "ruff-check"
 name = "ruff check --fix"
 language = "system"
-entry = "uv run ruff check --fix --exit-non-zero-on-fix"
+entry = "uv run --no-sync ruff check --fix --exit-non-zero-on-fix"
 types = ["python"]
 
 [[repos.hooks]]
 id = "ruff-format"
 name = "ruff format"
 language = "system"
-entry = "uv run ruff format"
+entry = "uv run --no-sync ruff format"
 types = ["python"]
 
 [[repos.hooks]]
@@ -41,12 +41,3 @@ language = "system"
 entry = "cargo fmt --all"
 types = ["rust"]
 pass_filenames = false
-
-[[repos.hooks]]
-id = "gate"
-name = "quality gate (scripts/check.sh --fast)"
-language = "system"
-entry = "scripts/check.sh --fast"
-pass_filenames = false
-always_run = true
-stages = ["pre-push"]

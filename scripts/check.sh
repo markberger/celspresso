@@ -12,7 +12,8 @@ RUST_LINE_FLOOR=85
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 step "file hygiene, ruff, rustfmt (the pre-commit hooks in prek.toml; fixes are reported as failures)"
-uv run prek run --all-files --stage pre-commit --show-diff-on-failure
+# tracked and untracked-but-not-ignored files, so new work is linted before it's added
+git ls-files -z -co --exclude-standard | xargs -0 uv run prek run --stage pre-commit --show-diff-on-failure --files
 
 step "clippy"
 cargo clippy -q --workspace --exclude celspresso-py --all-targets -- -D warnings
