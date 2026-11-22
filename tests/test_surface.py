@@ -215,6 +215,52 @@ def test_expr_type_assertions() -> None:
 # -- expressions ------------------------------------------------------------
 
 
+def test_expr_equality_is_syntactic_and_hashable() -> None:
+    env = Env(x=int)
+    a, b = env.predicate("x > 1"), env.predicate("x>1")
+    c = env.predicate("1 < x")
+    assert a == b
+    assert a != c  # same meaning, different text: use .equivalent()
+    assert a.equivalent(c).proved
+    assert a != "x > 1"
+    assert {a, b, c} == {a, c}
+    assert {a: "rule"}[b] == "rule"
+    assert env.compile("x") != Env(x=int, y=int).compile("x")  # different envs
+
+
+def test_option_names_as_variables() -> None:
+    env = Env({"timeout": int, "unroll_limit": str}, timeout=2.0, flag=bool)
+    assert env.variables == {"timeout": "int", "unroll_limit": "string", "flag": "bool"}
+    assert env.predicate("timeout > 3 && flag").evaluate({"timeout": 5, "unroll_limit": "", "flag": True})
+    env2 = Env(x=int).extend({"functions": list[int], "assumptions": str}, unroll_limit=3)
+    assert env2.variables["functions"] == "list(int)"
+    assert env2.predicate("size(functions) > 0").satisfiable().sat
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"timeout": int}, {"timeout": True}, {"unroll_limit": 2.5}, {"schema_constraints": str}],
+)
+def test_option_clash_gives_clear_error(kwargs: dict[str, object]) -> None:
+    with pytest.raises(TypeError, match="is an Env option"):
+        Env(**kwargs)  # type: ignore[arg-type]
+
+
+def test_extend_option_clashes() -> None:
+    env = Env(x=int)
+    with pytest.raises(TypeError, match="is an Env option"):
+        env.extend(functions=int)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="is an Env option"):
+        env.extend(assumptions=str)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="plain callables"):
+        env.extend(functions=[int])
+    with pytest.raises(ValueError, match="both in the mapping"):
+        Env({"x": int}, x=str)
+    with pytest.raises(ValueError, match="invalid variable name"):
+        Env({"not valid": int})
+    assert env.extend(assumptions="x > 0").assumptions == ("x > 0",)
+
+
 def test_expr_identity_and_repr() -> None:
     env = Env(x=int)
     a, b = env.compile("x + 1"), env.compile("x+1")

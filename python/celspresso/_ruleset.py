@@ -8,7 +8,7 @@ from ._env import Expr, Predicate
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
 
-    from ._verdict import Verdict
+    from ._verdict import Verdict, Witness
 
 __all__ = ["RuleSet"]
 
@@ -70,7 +70,9 @@ class RuleSet:
         )
         return {(a[0], b[0]): check(a[1], b[1]) for a, b in pairs}
 
-    def diff(self, other: RuleSet, *, limit: int = 5, timeout: float | None = None) -> dict[str, list[Any]]:
+    def diff(
+        self, other: RuleSet, *, limit: int = 5, timeout: float | None = None
+    ) -> dict[str, list[Witness]]:
         """For each rule name in both sets, inputs on which old and new disagree."""
         out = {}
         for n, old in self.rules.items():

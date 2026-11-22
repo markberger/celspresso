@@ -17,7 +17,35 @@ T = TypeVar("T")
 ErrorMode = Literal["strict", "as_false"]
 Assumption = "str | Predicate"
 
-_RESERVED = {"timeout", "unroll_limit", "schema_constraints"}
+_OPTION_NAMES = ("timeout", "unroll_limit", "schema_constraints", "functions", "assumptions")
+
+
+def _option_clash(name: str, value: Any) -> TypeError:
+    return TypeError(
+        f"{name}={value!r}: '{name}' is an Env option, not a variable. To declare a variable "
+        f"named '{name}', pass variables as a mapping: Env({{'{name}': ...}})"
+    )
+
+
+def _check_options(timeout: Any, unroll_limit: Any, schema_constraints: Any) -> None:
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))):
+        raise _option_clash("timeout", timeout)
+    if unroll_limit is not None and (isinstance(unroll_limit, bool) or not isinstance(unroll_limit, int)):
+        raise _option_clash("unroll_limit", unroll_limit)
+    if schema_constraints is not None and not isinstance(schema_constraints, bool):
+        raise _option_clash("schema_constraints", schema_constraints)
+
+
+def _merge_variables(positional: Mapping[str, Any] | None, keywords: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(positional or {})
+    for n, tp in keywords.items():
+        if n in merged:
+            raise ValueError(f"variable '{n}' is given both in the mapping and as a keyword")
+        merged[n] = tp
+    for n in merged:
+        if not isinstance(n, str) or not n.isidentifier():
+            raise ValueError(f"invalid variable name {n!r}")
+    return merged
 
 
 def _raise_compile(source: str, exc: Exception) -> typing.NoReturn:
@@ -56,16 +84,26 @@ class Env:
     >>> env = Env(x=int, name=str)
     >>> env.predicate("x > 3 && name.startsWith('a')").evaluate({"x": 5, "name": "ab"})
     True
+
+    Variables are keyword arguments, or a mapping when a name collides with an option
+    (`timeout`, `unroll_limit`, `schema_constraints`) or is not a Python keyword-safe name:
+
+    >>> Env({"timeout": int}, timeout=2.0).variables
+    {'timeout': 'int'}
     """
 
     def __init__(
         self,
+        variables: Mapping[str, Any] | None = None,
+        /,
         *,
         timeout: float = 5.0,
         unroll_limit: int = 5,
         schema_constraints: bool = True,
-        **variables: Any,
+        **more_variables: Any,
     ) -> None:
+        _check_options(timeout, unroll_limit, schema_constraints)
+        variables = _merge_variables(variables, more_variables)
         self._timeout = timeout
         self._unroll = unroll_limit
         self._schema_constraints = schema_constraints
@@ -112,14 +150,31 @@ class Env:
 
     def extend(
         self,
+        variables: Mapping[str, Any] | None = None,
+        /,
         *,
         functions: Iterable[Callable[..., Any]] = (),
         assumptions: Iterable[str | Predicate] = (),
         timeout: float | None = None,
         unroll_limit: int | None = None,
-        **variables: Any,
+        **more_variables: Any,
     ) -> Env:
-        """Return a new Env with more variables, functions, or standing assumptions."""
+        """Return a new Env with more variables, functions, or standing assumptions.
+
+        As with `Env(...)`, pass a mapping for variables whose names clash with options.
+        """
+        _check_options(timeout, unroll_limit, None)
+        if isinstance(functions, (str, type)) or not isinstance(functions, Iterable):
+            raise _option_clash("functions", functions)
+        if isinstance(assumptions, (str, Predicate)):
+            assumptions = [assumptions]
+        elif not isinstance(assumptions, Iterable) or isinstance(assumptions, type):
+            raise _option_clash("assumptions", assumptions)
+        functions = list(functions)
+        for f in functions:
+            if not callable(f) or isinstance(f, type):
+                raise TypeError(f"functions=[...] expects plain callables, got {f!r}")
+        variables = _merge_variables(variables, more_variables)
         e = self._clone()
         for n, tp in variables.items():
             if n in e._vars:
@@ -330,13 +385,18 @@ class Expr(Generic[T]):
         return hash((self._env._fingerprint, self.canonical))
 
     def __eq__(self, other: object) -> bool:
-        raise TypeError(
-            "use .equivalent() to compare meaning, .eq() to build a CEL comparison, "
-            "or .same_as() for syntactic identity"
-        )
+        """Syntactic identity: same environment and same canonical text.
+
+        This is *not* semantic equality (`x > 1` and `1 < x` are different
+        objects that mean the same thing); use `.equivalent()` for that, and
+        `.eq()` to build the CEL comparison `a == b`.
+        """
+        if not isinstance(other, Expr):
+            return NotImplemented
+        return self.same_as(other)
 
     def same_as(self, other: Expr[Any]) -> bool:
-        """Syntactic identity (same env, same canonical text)."""
+        """Syntactic identity (same env, same canonical text); the same as `==`."""
         return self._env._fingerprint == other._env._fingerprint and self.canonical == other.canonical
 
     # -- evaluation -------------------------------------------------------

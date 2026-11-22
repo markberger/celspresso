@@ -218,8 +218,7 @@ def test_combinators(env: Env) -> None:
     assert limit.gt(500).equivalent(b).proved
     assert limit.can_equal(10).sat
     assert limit.can_equal(11).unsat
-    with pytest.raises(TypeError):
-        _ = a == b
+    assert a != b  # == is syntactic identity, never a CEL comparison
     with pytest.raises(TypeError):
         bool(a)
 
