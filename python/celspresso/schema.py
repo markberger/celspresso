@@ -104,11 +104,41 @@ def _check_spec(spec: Any) -> None:
         if kind == "struct" and len(args) == 1:
             _check_struct_name(args[0])
             return
+        if kind == "fixed" and len(args) == 2:
+            _check_fixed(*args)
+            return
         if (kind, len(args)) in {("list", 1), ("nullable", 1), ("map", 2)}:
             for a in args:
                 _check_spec(a)
+            if kind == "map":
+                _check_map_value(args[1], "T.map value")
             return
     raise TypeError(f"not a CEL type: {spec!r}; build types with celspresso.schema.T")
+
+
+# 10**15 - 1 is the largest bound of this form that is exact as a double (see TECH_DEBT)
+_MAX_FIXED_DIGITS = 15
+
+
+def _check_fixed(digits: Any, places: Any) -> None:
+    ok = all(isinstance(x, int) and not isinstance(x, bool) for x in (digits, places))
+    if not ok or not 1 <= digits <= _MAX_FIXED_DIGITS or not 0 <= places <= digits:
+        raise ValueError(
+            f"T.fixed(digits, places) needs 1 <= digits <= {_MAX_FIXED_DIGITS} and "
+            f"0 <= places <= digits, got ({digits!r}, {places!r})"
+        )
+
+
+def _contains_fixed(spec: Any) -> bool:
+    if isinstance(spec, tuple):
+        return spec[0] == "fixed" or (spec[0] != "struct" and any(_contains_fixed(a) for a in spec[1:]))
+    return False
+
+
+def _check_map_value(spec: Any, where: str) -> None:
+    # a map's values carry no constraints, so a fixed-point scale has nowhere to go
+    if _contains_fixed(spec):
+        raise TypeError(f"{where}: fixed-point map values are not supported; use a list of structs")
 
 
 def _check_struct_name(name: Any) -> None:
@@ -140,7 +170,21 @@ class T:
 
     @staticmethod
     def map(key: TypeRef, value: TypeRef) -> TypeRef:
+        _check_map_value(_ref(value, "T.map value")._spec, "T.map value")
         return TypeRef._unchecked(("map", _ref(key, "T.map key")._spec, _ref(value, "T.map value")._spec))
+
+    @staticmethod
+    def fixed(digits: int, places: int) -> TypeRef:
+        """An exact decimal with `digits` significant digits, `places` of them after the
+        point (SQL `NUMERIC(digits, places)`, Django `DecimalField`): money.
+
+        Python values are `decimal.Decimal`s; a value with more places is rejected,
+        never rounded. In CEL, and in this type's `Constraints`, the value is an int
+        counting units of 10**-places (cents for `T.fixed(10, 2)`), so `price <= 5000`
+        means at most 50.00. The verifier reasons about it exactly. Results and
+        witnesses come back as `Decimal`. Mixing scales in one expression is up to you."""
+        _check_fixed(digits, places)
+        return TypeRef._unchecked(("fixed", digits, places))
 
     @staticmethod
     def nullable(inner: TypeRef) -> TypeRef:

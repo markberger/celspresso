@@ -21,6 +21,9 @@ pub struct Constraints {
     pub pattern: Option<String>,
     /// Constraints that apply to each element of a list field.
     pub items: Option<Box<Constraints>>,
+    /// Fixed-point scale of an int: the value counts units of 10^-scale, and host
+    /// `Decimal`s convert to it exactly. Conversion only; the verifier ignores it.
+    pub scale: Option<u32>,
 }
 
 impl Constraints {

@@ -51,8 +51,8 @@ registered in the Env. The error says what to do.
 
 ### Adapters can decode structs only
 `TypeAdapter.decode` is called only for structs. A type-level mapping such as
-`Cents → T.int` can't turn witness values back into its own type. M4 (`T.fixed` with a
-`Decimal` codec) needs this.
+`Cents → T.int` can't turn witness values back into its own type. (`T.fixed` doesn't need
+this: the builder itself decodes it.)
 - *Fix:* record which adapter owns each converted position, and call a `decode_value`
   hook there.
 
@@ -73,6 +73,14 @@ fails with "returned an unsupported value".
 - *Fix:* convert results with `value_from_py` against the declared result type and the
   readers, or reject struct result types.
 - *Found:* M3 review (predates M3).
+
+### Fixed-point results without an expected type come back in units
+`env.compile("order.total").evaluate(...)` returns `1234`, not `Decimal("12.34")`: CEL's
+type for a fixed-point field is `int`, and only `env.expr(src, T.fixed(...))` says
+otherwise. CEL also lets a rule add a `fixed(8, 2)` to a `fixed(8, 3)` or to a count.
+- *Fix:* track the scale through the checker (a `fixed` type that unifies only with
+  itself and int literals), so results and mistakes are found without a hint.
+- *Found:* M4.
 
 ## Verifier
 

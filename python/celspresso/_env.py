@@ -10,9 +10,9 @@ from typing import Any, Generic, Literal, TypeVar, overload
 
 from . import _celspresso as _core
 from ._errors import CelError, CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
-from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, type_name
+from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, lower, type_name
 from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness, lookup
-from .schema import Struct, TypeRef
+from .schema import Struct, TypeRef, _contains_fixed
 
 if typing.TYPE_CHECKING:
     from .adapters import TypeAdapter
@@ -222,8 +222,10 @@ class Env:
         return e
 
     def _build(self) -> None:
-        structs = [(n, fields) for n, fields in self._builder.structs.items()]
-        variables = [(n, spec, cons) for n, (spec, cons) in self._vars.items()]
+        structs = [
+            (n, [(f, *lower(s, c)) for f, s, c in fields]) for n, fields in self._builder.structs.items()
+        ]
+        variables = [(n, *lower(spec, cons)) for n, (spec, cons) in self._vars.items()]
         fns = [
             (
                 f.name,
@@ -338,6 +340,8 @@ class Env:
                 if not p.isidentifier():
                     raise ValueError(f"invalid parameter name {p!r}")
             specs = tuple((p, e._builder.convert(tp, f"{name}({p})")[0]) for p, tp in params.items())
+            for p, sp in specs:
+                _no_fixed(sp, f"define '{name}' parameter '{p}'")
         e._defs = (*self._defs, (name, source, specs))
         e._build()
         return e
@@ -377,10 +381,12 @@ class Env:
         if type is not None:
             want, _ = self._builder.copy().convert(type, "expected type")
             got = e._prog.output_type
-            if got != "dyn" and got != want:
+            if got != "dyn" and got != lower(want, None)[0]:
                 _type_mismatch(source, e, type_name(want))
             if want == "bool" and not isinstance(e, Predicate):
                 e = Predicate(self, e._prog)
+            elif _contains_fixed(want):
+                e = Expr(self, e._prog, want)
         return e
 
     # -- introspection ----------------------------------------------------
@@ -427,6 +433,12 @@ class Env:
             out += ["", "Always true (you may rely on these):"]
             out += [f"  {a}" for a in self._assumptions]
         out += ["", _CEL_REFERENCE]
+        specs = [s for s, _ in self._vars.values()] + [s for fs in structs.values() for _, s, _ in fs]
+        if any(_contains_fixed(s) for s in specs):
+            out.append(
+                "  fixed(d, p) is an exact decimal written as an int count of 10^-p units, as are\n"
+                "  its bounds above: with fixed(8, 2), 12.34 is 1234 (write price <= 5000, not 50.0)"
+            )
         return "\n".join(out)
 
     def __repr__(self) -> str:
@@ -512,7 +524,7 @@ class Env:
             self._schema_constraints,
             self._fn_impls,
         )
-        spec = e._prog.output_type
+        spec = e._result_spec
         paths = sorted(e.references)
 
         def end(x: dict[str, Any] | None) -> Extreme | None:
@@ -801,6 +813,13 @@ def _tabulate(name: str, f: Callable[..., Any], domains: list[list[Any] | None])
     return tuple(_call_row(name, f, args) for args in itertools.product(*finite))
 
 
+def _no_fixed(spec: TypeSpec, where: str) -> None:
+    if _contains_fixed(spec):
+        raise TypeError(
+            f"{where}: fixed-point (Decimal) values can't cross a function boundary yet; pass cents as int"
+        )
+
+
 def _function_decl(f: Callable[..., Any], builder: SchemaBuilder) -> _Fn:
     name = getattr(f, "__cel_name__", None) or f.__name__
     hints = typing.get_type_hints(f, include_extras=True)
@@ -811,11 +830,13 @@ def _function_decl(f: Callable[..., Any], builder: SchemaBuilder) -> _Fn:
         if p.name not in hints:
             raise TypeError(f"function '{name}': parameter '{p.name}' needs a type hint")
         spec, cons = builder.convert(hints[p.name], f"{name}({p.name})")
+        _no_fixed(spec, f"function '{name}' parameter '{p.name}'")
         params.append(spec)
         domains.append(_domain(spec, cons))
     if "return" not in hints:
         raise TypeError(f"function '{name}' needs a return type hint")
     result = builder.convert(hints["return"], f"{name} result")[0]
+    _no_fixed(result, f"function '{name}' result")
     names = tuple(sig.parameters)
     ensures = getattr(f, "__cel_ensures__", None)
     if ensures is not None and "result" in names:
@@ -836,11 +857,18 @@ def _operand(env: Env, x: Any) -> str:
 class Expr(Generic[T]):
     """A compiled, type-checked CEL expression producing a `T`."""
 
-    __slots__ = ("_env", "_prog")
+    __slots__ = ("_env", "_prog", "_spec")
 
-    def __init__(self, env: Env, prog: Any) -> None:
+    def __init__(self, env: Env, prog: Any, spec: TypeSpec | None = None) -> None:
         self._env = env
         self._prog = prog
+        # the result type asked for in env.expr, when it says more than the core's
+        # (a fixed-point Decimal is an int in CEL)
+        self._spec = spec
+
+    @property
+    def _result_spec(self) -> TypeSpec:
+        return self._spec if self._spec is not None else self._prog.output_type
 
     # -- metadata ---------------------------------------------------------
 
@@ -857,7 +885,7 @@ class Expr(Generic[T]):
 
     @property
     def output_type(self) -> str:
-        return self._prog.output_type_name
+        return type_name(self._spec) if self._spec is not None else self._prog.output_type_name
 
     @property
     def references(self) -> list[str]:
@@ -914,7 +942,7 @@ class Expr(Generic[T]):
         except _core.EvalError as exc:
             msg, eid, a, b, rendered = exc.args
             raise CelEvaluationError(msg, eid, (a, b), rendered) from None
-        return from_cel(raw, self._prog.output_type, self._env._builder)
+        return from_cel(raw, self._result_spec, self._env._builder)
 
     def explain(self, data: Mapping[str, Any] | None = None) -> Explanation:
         """Evaluate and record the value of every sub-expression."""

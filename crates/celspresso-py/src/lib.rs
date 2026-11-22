@@ -111,6 +111,7 @@ fn constraints_from_py(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Constraints> 
                 c.one_of = Some(out);
             }
             "items" => c.items = Some(Box::new(constraints_from_py(Some(&v))?)),
+            "scale" => c.scale = Some(v.extract()?),
             other => return Err(PyValueError::new_err(format!("unknown constraint '{other}'"))),
         }
     }
@@ -249,13 +250,39 @@ fn get_field<'py>(
     }
 }
 
-fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers: Readers, path: &str) -> PyResult<Value> {
+/// A fixed-point `Decimal` as its count of 10^-scale units; exact or an error.
+fn fixed_from_py(obj: &Bound<'_, PyAny>, scale: u32, path: &str) -> PyResult<Value> {
+    let decimal = obj.py().import("decimal")?.getattr("Decimal")?;
+    if !obj.is_instance(&decimal)? {
+        return Err(conv_err(path, &format!("Decimal (fixed point, {scale} places)"), obj));
+    }
+    if !obj.call_method0("is_finite")?.extract::<bool>()? {
+        return Err(PyValueError::new_err(format!("Decimal at '{path}' is not finite")));
+    }
+    let units = obj.call_method1("scaleb", (scale,))?;
+    if !units.eq(units.call_method0("to_integral_value")?)? {
+        return Err(PyValueError::new_err(format!("Decimal at '{path}' has more than {scale} decimal places")));
+    }
+    let n = units.call_method0("__int__")?;
+    n.extract::<i64>().map(Value::Int).map_err(|_| PyValueError::new_err(format!("Decimal at '{path}' is out of range")))
+}
+
+/// `cons` are the constraints at this position (a field's, a variable's, or a list's
+/// `items`); only `scale` matters for conversion.
+fn value_from_py(
+    obj: &Bound<'_, PyAny>,
+    ty: &CelType,
+    cons: Option<&Constraints>,
+    schema: &Schema,
+    readers: Readers,
+    path: &str,
+) -> PyResult<Value> {
     match ty {
         CelType::Nullable(inner) => {
             if obj.is_none() {
                 Ok(Value::Null)
             } else {
-                value_from_py(obj, inner, schema, readers, path)
+                value_from_py(obj, inner, cons, schema, readers, path)
             }
         }
         CelType::Bool => {
@@ -265,6 +292,7 @@ fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers:
                 Err(conv_err(path, "bool", obj))
             }
         }
+        CelType::Int if cons.and_then(|c| c.scale).is_some() => fixed_from_py(obj, cons.and_then(|c| c.scale).unwrap_or(0), path),
         CelType::Int => {
             if obj.is_instance_of::<PyBool>() || !obj.is_instance_of::<PyInt>() {
                 return Err(conv_err(path, "int", obj));
@@ -343,7 +371,7 @@ fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers:
             }
             let mut out = Vec::new();
             for (i, x) in obj.try_iter().map_err(|_| conv_err(path, "list", obj))?.enumerate() {
-                out.push(value_from_py(&x?, elem, schema, readers, &format!("{path}[{i}]"))?);
+                out.push(value_from_py(&x?, elem, cons.and_then(|c| c.items.as_deref()), schema, readers, &format!("{path}[{i}]"))?);
             }
             Ok(Value::list(out))
         }
@@ -351,9 +379,9 @@ fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers:
             let d = obj.cast::<PyDict>().map_err(|_| conv_err(path, "dict", obj))?;
             let mut out = BTreeMap::new();
             for (k, v) in d.iter() {
-                let kv = value_from_py(&k, kt, schema, readers, path)?;
+                let kv = value_from_py(&k, kt, None, schema, readers, path)?;
                 let key = Key::from_value(&kv).ok_or_else(|| PyTypeError::new_err(format!("unsupported map key type at '{path}'")))?;
-                let vv = value_from_py(&v, vt, schema, readers, &format!("{path}[{}]", kv))?;
+                let vv = value_from_py(&v, vt, None, schema, readers, &format!("{path}[{}]", kv))?;
                 out.insert(key, vv);
             }
             Ok(Value::Map(Arc::new(out)))
@@ -378,7 +406,7 @@ fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, readers:
                 };
                 match get_field(obj, &f.name, reader, &fpath)? {
                     Some(v) => {
-                        fields.insert(f.name.clone(), value_from_py(&v, &f.ty, schema, readers, &fpath)?);
+                        fields.insert(f.name.clone(), value_from_py(&v, &f.ty, Some(&f.constraints), schema, readers, &fpath)?);
                     }
                     None if matches!(f.ty, CelType::Nullable(_)) => {
                         fields.insert(f.name.clone(), Value::Null);
@@ -560,10 +588,13 @@ impl Core {
                         for (args, ok, r) in rows {
                             let mut lits = Vec::new();
                             for (a, t) in args.iter().zip(&params) {
-                                lits.extend(value_from_py(a, t, &s, None, &name).ok().as_ref().and_then(value_literal));
+                                lits.extend(value_from_py(a, t, None, &s, None, &name).ok().as_ref().and_then(value_literal));
                             }
-                            let res =
-                                if ok { value_from_py(&r, &result, &s, None, &name).ok().as_ref().and_then(value_literal) } else { None };
+                            let res = if ok {
+                                value_from_py(&r, &result, None, &s, None, &name).ok().as_ref().and_then(value_literal)
+                            } else {
+                                None
+                            };
                             if lits.len() != params.len() || (ok && res.is_none()) {
                                 out.clear();
                                 break;
@@ -679,7 +710,7 @@ fn activation(py_vars: &Bound<'_, PyDict>, schema: &Schema, readers: Readers) ->
         let name: String = k.extract()?;
         let val = match schema.vars.get(&name) {
             Some(d) => {
-                let val = value_from_py(&v, &d.ty, schema, readers, &name)?;
+                let val = value_from_py(&v, &d.ty, Some(&d.constraints), schema, readers, &name)?;
                 // proofs assume the schema's constraints, so evaluation enforces them
                 celspresso_eval::validate::validate(&val, &d.ty, &d.constraints, schema, &name).map_err(PyValueError::new_err)?;
                 val

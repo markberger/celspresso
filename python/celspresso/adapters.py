@@ -44,6 +44,7 @@ reads a relation that isn't itself a list. See `schema.Field`.
 from __future__ import annotations
 
 import dataclasses
+import typing
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from ._types import SchemaContext, _constraints_of, _metadata_constraints, is_model
@@ -88,7 +89,12 @@ class PydanticAdapter:
 
         def build() -> list[Any]:
             return [
-                ctx.field(name, info.annotation, constraints_from(info.metadata))
+                # the metadata goes in as Annotated, so a Decimal's max_digits and
+                # decimal_places reach its conversion (constraints_from would drop them)
+                ctx.field(
+                    name,
+                    typing.Annotated[(info.annotation, *info.metadata)] if info.metadata else info.annotation,
+                )
                 for name, info in tp.model_fields.items()
             ]
 

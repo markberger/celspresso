@@ -70,7 +70,7 @@ def test_syntax_error(env: Env) -> None:
 def test_decimal_rejected() -> None:
     import decimal
 
-    with pytest.raises(TypeError, match="minor units"):
+    with pytest.raises(TypeError, match="fixed precision"):
         Env(x=decimal.Decimal)
 
 

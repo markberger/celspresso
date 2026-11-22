@@ -15,7 +15,7 @@ from collections.abc import Set as AbstractSet
 from typing import Any, Union, get_args, get_origin
 
 from ._celspresso import pattern_error
-from .schema import Constraints, Field, Struct, TypeRef, _check_struct_name
+from .schema import Constraints, Field, Struct, TypeRef, _check_fixed, _check_map_value, _check_struct_name
 
 TypeSpec = Any  # "int" | ("list", TypeSpec) | ("nullable", TypeSpec) | ("struct", name) | ...
 
@@ -151,8 +151,13 @@ def _key_of(key: Any) -> Any:
 def _constraints_of(d: dict[str, Any] | None) -> Constraints:
     if not d:
         return Constraints()
+    plain: dict[str, Any] = {
+        k: float(v) if isinstance(v, decimal.Decimal) else v  # a Decimal bound on a non-Decimal
+        for k, v in d.items()
+        if k not in ("one_of", "items") and not k.startswith("_")
+    }
     return Constraints(
-        **{k: v for k, v in d.items() if k not in ("one_of", "items")},
+        **plain,
         one_of=tuple(d["one_of"]) if "one_of" in d else None,
         items=_constraints_of(d["items"]) if "items" in d else None,
     )
@@ -168,7 +173,37 @@ def type_name(spec: TypeSpec) -> str:
         return f"map({type_name(spec[1])}, {type_name(spec[2])})"
     if kind == "nullable":
         return f"{type_name(spec[1])}?"
+    if kind == "fixed":
+        return f"fixed({spec[1]}, {spec[2]})"
     return spec[1]
+
+
+def lower(spec: TypeSpec, cons: dict[str, Any] | None) -> tuple[TypeSpec, dict[str, Any] | None]:
+    """The core's view of a spec and its constraints: `fixed(d, p)` is an int with
+    `scale` p and bounds ±(10**d - 1), intersected with any bounds of its own."""
+    if isinstance(spec, str):
+        return spec, cons
+    kind = spec[0]
+    if kind == "fixed":
+        out = dict(cons or {})
+        lim = float(10 ** spec[1] - 1)
+        out["ge"] = max(out.get("ge", -lim), -lim)
+        out["le"] = min(out.get("le", lim), lim)
+        out["scale"] = spec[2]
+        return "int", out
+    if kind == "nullable":
+        inner, c = lower(spec[1], cons)
+        return ("nullable", inner), c
+    if kind == "list":
+        items = (cons or {}).get("items")
+        elem, ic = lower(spec[1], items)
+        out = dict(cons or {})
+        if ic:
+            out["items"] = ic
+        return ("list", elem), (out or None)
+    if kind == "map":
+        return ("map", lower(spec[1], None)[0], lower(spec[2], None)[0]), cons
+    return spec, cons
 
 
 class SchemaBuilder:
@@ -241,6 +276,10 @@ class SchemaBuilder:
         not name an adapter's struct: those names depend on registration order."""
         if isinstance(spec, str):
             return
+        if spec[0] == "fixed":
+            return
+        if spec[0] == "map":
+            _check_map_value(spec[2], where)
         if spec[0] == "struct":
             if by_name and spec[1] in self.owners:
                 raise TypeError(
@@ -379,10 +418,7 @@ class SchemaBuilder:
         if tp in _SCALARS:
             return _SCALARS[tp]
         if tp is decimal.Decimal:
-            raise TypeError(
-                f"{where}: Decimal has no exact CEL type; store money as integer minor units "
-                "(e.g. cents: int) so the verifier can reason about it exactly"
-            )
+            return _decimal_spec(cons, where)
         if isinstance(tp, type) and issubclass(tp, enum.Enum):
             values = [m.value for m in tp]
             base = {type(v) for v in values}
@@ -427,6 +463,7 @@ class SchemaBuilder:
         if origin in (dict, Mapping):
             k = self._convert(args[0], {}, f"{where} key") if args else "dyn"
             v = self._convert(args[1], {}, f"{where} value") if args else "dyn"
+            _check_map_value(v, f"{where} value")
             return ("map", k, v)
         if tp in (list, tuple, set, frozenset):
             return ("list", "dyn")
@@ -435,7 +472,38 @@ class SchemaBuilder:
         raise TypeError(f"{where}: cannot map {tp!r} to a CEL type")
 
 
-_NUMERIC = {"int", "uint", "double"}
+_NUMERIC = {"int", "uint", "double", "fixed"}
+
+
+def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
+    """`Decimal` with Pydantic's `max_digits` and `decimal_places`: `fixed`, with its
+    bounds (given in the field's own terms, e.g. `le=Decimal("999.99")`) moved to units."""
+    digits, places = cons.pop("_digits", None), cons.pop("_places", None)
+    if digits is None or places is None:
+        raise TypeError(
+            f"{where}: a Decimal needs a fixed precision to be exact in CEL: use "
+            "Annotated[Decimal, Field(max_digits=..., decimal_places=...)] or T.fixed(digits, places)"
+        )
+    try:
+        _check_fixed(digits, places)
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
+    for key in ("ge", "gt", "le", "lt"):
+        if key not in cons:
+            continue
+        raw = cons.pop(key)
+        units = (decimal.Decimal(repr(raw)) if isinstance(raw, float) else decimal.Decimal(raw)).scaleb(
+            places
+        )
+        if units == units.to_integral_value():
+            cons[key] = float(units)
+        elif key in ("ge", "gt"):  # x > 1.005 with cents means x >= 101
+            cons["ge"] = float(math.ceil(units))
+        else:
+            cons["le"] = float(math.floor(units))
+    return ("fixed", digits, places)
+
+
 _SIZED = {"string", "bytes", "list", "map"}
 
 
@@ -452,6 +520,10 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
     bounds = {k: v for k in ("ge", "gt", "le", "lt") if (v := getattr(c, k)) is not None}
     if bounds and kind not in _NUMERIC:
         raise bad("a numeric bound", "int, uint or double")
+    if kind == "fixed":  # the digits bound the value too
+        digits = int(spec[1])
+        lim = float(10**digits - 1)
+        bounds = {**bounds, "ge": max(bounds.get("ge", -lim), -lim), "le": min(bounds.get("le", lim), lim)}
     if kind == "uint" and (bounds.get("le", 0) < 0 or bounds.get("lt", 1) <= 0):
         raise ValueError(f"{where}: no uint satisfies {bounds}")
     # (bound, strict): on a tie between ge and gt, the strict one is the binding bound
@@ -476,7 +548,7 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
         if isinstance(c.one_of[0], str):
             if kind != "string":
                 raise bad("one_of with strings", "string")
-        elif kind == "int":
+        elif kind in ("int", "fixed"):
             if not all(-(2**63) <= v < 2**63 for v in c.one_of):
                 raise ValueError(f"{where}: one_of values must fit in int64")
         elif kind == "uint":
@@ -492,11 +564,17 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
 
 def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None:
     for m in metadata:
+        # Pydantic's Decimal precision; consumed by _decimal_spec, dropped elsewhere
+        for key, slot in (("max_digits", "_digits"), ("decimal_places", "_places")):
+            val = getattr(m, key, None)
+            if isinstance(val, int) and not isinstance(val, bool):
+                cons[slot] = val
         for key in ("ge", "gt", "le", "lt", "min_length", "max_length", "pattern"):
             val = getattr(m, key, None)
             if val is not None and not callable(val):
                 if key in ("ge", "gt", "le", "lt"):
-                    val = float(val)
+                    # a Decimal stays exact until its field's type is known (_decimal_spec)
+                    val = val if isinstance(val, decimal.Decimal) else float(val)
                 elif key == "pattern" and not isinstance(val, str):
                     val = getattr(val, "pattern", val)  # a compiled re.Pattern
                 cons[key] = val
@@ -513,6 +591,8 @@ def from_cel(value: Any, spec: TypeSpec, schema: SchemaBuilder) -> Any:
     kind = spec[0]
     if kind == "nullable":
         return from_cel(value, spec[1], schema)
+    if kind == "fixed":
+        return decimal.Decimal(value).scaleb(-spec[2])
     if kind == "list":
         return [from_cel(v, spec[1], schema) for v in value]
     if kind == "map":
