@@ -136,17 +136,19 @@ class T:
 
     @staticmethod
     def list(elem: TypeRef) -> TypeRef:
-        return TypeRef(("list", _ref(elem, "T.list")._spec))
+        return TypeRef._unchecked(("list", _ref(elem, "T.list")._spec))
 
     @staticmethod
     def map(key: TypeRef, value: TypeRef) -> TypeRef:
-        return TypeRef(("map", _ref(key, "T.map key")._spec, _ref(value, "T.map value")._spec))
+        return TypeRef._unchecked(("map", _ref(key, "T.map key")._spec, _ref(value, "T.map value")._spec))
 
     @staticmethod
     def nullable(inner: TypeRef) -> TypeRef:
         """A value that may be null (Python's `Optional[...]`)."""
         spec = _ref(inner, "T.nullable")._spec
-        return TypeRef(spec if isinstance(spec, tuple) and spec[0] == "nullable" else ("nullable", spec))
+        return TypeRef._unchecked(
+            spec if isinstance(spec, tuple) and spec[0] == "nullable" else ("nullable", spec)
+        )
 
     @staticmethod
     def struct(name: str) -> TypeRef:

@@ -471,7 +471,7 @@ class Env:
             w = Witness(out["witness"], self._specs(), self._builder, paths)
             try:
                 w.to_python()
-            except Exception as exc:  # noqa: BLE001 - any validator failure means the witness is not real
+            except ValueError as exc:  # a validator (or adapter) rejected it: not a real input
                 return Verdict(
                     Status.UNKNOWN,
                     reason=f"solver witness fails model validation ({type(exc).__name__}); "

@@ -10,6 +10,10 @@ pieces (`PydanticAdapter`, `DataclassAdapter`). An adapter answers two questions
   adapter, so a Django model's field may be a Pydantic model and vice versa.
 - `decode(tp, data)`: rebuild a `tp` from a verifier witness, given its fields as a
   dict (already decoded). Return the dict itself if there is nothing better to build.
+  Raise `ValueError` if the data can't be a real `tp` (a validator rejects it): the
+  verdict becomes UNKNOWN. Any other exception is treated as a bug and propagates.
+
+A `SchemaContext` is only valid during the `schema_for` call it was passed to.
 
 >>> import dataclasses
 >>> from celspresso import Env
@@ -58,7 +62,7 @@ class TypeAdapter(Protocol):
         ...
 
     def decode(self, tp: Any, data: dict[str, Any]) -> Any:
-        """A `tp` value built from a struct's decoded fields."""
+        """A `tp` value built from a struct's decoded fields; `ValueError` if invalid."""
         ...
 
 
@@ -105,4 +109,7 @@ class DataclassAdapter:
 
     def decode(self, tp: Any, data: dict[str, Any]) -> Any:
         init = {f.name for f in dataclasses.fields(tp) if f.init}
-        return tp(**{k: v for k, v in data.items() if k in init})
+        try:
+            return tp(**{k: v for k, v in data.items() if k in init})
+        except Exception as exc:  # __post_init__ validators may raise anything
+            raise ValueError(f"{tp.__name__} rejected the witness: {exc!r}") from exc

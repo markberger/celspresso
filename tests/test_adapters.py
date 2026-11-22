@@ -307,3 +307,153 @@ def test_local_class_names_survive_pickling() -> None:
     env = Env(x=Local)
     ref = TypeRef._unchecked(("struct", env.variables["x"]))
     assert pickle.loads(pickle.dumps(ref)) == ref
+
+
+def test_context_refs_can_be_wrapped_and_passed_back() -> None:
+    # e.g. a Django reverse relation: a list of another model's struct, where the
+    # models are historical versions sharing a preferred name (so it gets a #n suffix)
+    @dataclasses.dataclass
+    class Line:
+        qty: int
+
+    class Model:
+        def __init__(self, name: str, lines: type) -> None:
+            self.name, self.lines = name, lines
+
+    old, new = Model("app.Order@0003", Line), Model("app.Order@0003", Line)
+
+    class Versions:
+        def schema_for(self, tp: Any, ctx: SchemaContext) -> TypeRef | None:
+            if not isinstance(tp, Model):
+                return None
+            line = ctx.convert(tp.lines)[0]
+            return ctx.struct(
+                tp,
+                lambda: [ctx.field("lines", T.list(line)), ctx.field("first", T.nullable(line))],
+                name=tp.name,
+            )
+
+        def decode(self, tp: Any, data: dict[str, Any]) -> Any:
+            return data
+
+    env = Env(a=old, b=new, adapters=[Versions()])
+    assert env.variables == {"a": "app.Order@0003", "b": "app.Order@0003#2"}
+    assert env.predicate("a.lines.all(l, l.qty > 0) && b.first.qty < 0").satisfiable().sat
+
+
+def test_equal_keys_share_one_struct() -> None:
+    # a protobuf-style adapter keyed by full name, building a fresh string each time
+    messages = {"pkg.Node": {"value": int, "next": "pkg.Node"}}
+
+    class Message:
+        def __init__(self, full_name: str) -> None:
+            self.full_name = full_name
+
+    class Proto:
+        def schema_for(self, tp: Any, ctx: SchemaContext) -> TypeRef | None:
+            if not isinstance(tp, Message):
+                return None
+            key = "".join(tp.full_name)  # equal, not identical, every call
+
+            def build() -> list[Field]:
+                return [
+                    ctx.field(n, T.nullable(ctx.convert(Message(t))[0]) if isinstance(t, str) else t)
+                    for n, t in messages[key].items()
+                ]
+
+            return ctx.struct(key, build, name=key)
+
+        def decode(self, tp: Any, data: dict[str, Any]) -> Any:
+            return data
+
+    env = Env(n=Message("pkg.Node"), adapters=[Proto()])
+    assert env.variables == {"n": "pkg.Node"}
+    assert env.predicate("n.next.next.value == 3").satisfiable().sat
+
+
+def test_a_failed_build_leaves_nothing_behind() -> None:
+    import uuid
+
+    class Author: ...
+
+    class Book: ...
+
+    class Shelf: ...
+
+    tables: dict[type, dict[str, Any]] = {
+        Author: {"id": uuid.UUID, "name": str},  # uuid.UUID is unmappable
+        Book: {"author": Author, "title": str},
+        Shelf: {"book": Book, "favourite": Author},
+    }
+
+    class Lenient:
+        """Falls back to a string for fields it can't map."""
+
+        def schema_for(self, tp: Any, ctx: SchemaContext) -> TypeRef | None:
+            if tp not in tables:
+                return None
+
+            def field(n: str, t: Any) -> Field:
+                try:
+                    return ctx.field(n, t)
+                except TypeError:
+                    if tp is Author:
+                        raise  # Author's own build fails...
+                    return Field(n, T.string)  # ...and Book/Shelf fall back
+
+            def build() -> list[Field]:
+                return [field(n, t) for n, t in tables[tp].items()]
+
+            return ctx.struct(tp, build)
+
+        def decode(self, tp: Any, data: dict[str, Any]) -> Any:
+            return data
+
+    env = Env(s=Shelf, adapters=[Lenient()])
+    # Author failed to build inside Book; it must not linger as an empty struct
+    assert "Author" not in env.describe()
+    assert env.predicate("s.book.author == 'x' && s.favourite == 'y'").satisfiable().sat
+
+
+def test_a_stored_context_is_dead_after_schema_for() -> None:
+    kept: list[SchemaContext] = []
+
+    class Keeper:
+        def schema_for(self, tp: Any, ctx: SchemaContext) -> TypeRef | None:
+            kept.append(ctx)
+            return None
+
+        def decode(self, tp: Any, data: dict[str, Any]) -> Any:  # pragma: no cover
+            return data
+
+    Env(x=int, adapters=[Keeper()])
+    for call in (
+        lambda c: c.struct(Table, list),
+        lambda c: c.convert(int),
+        lambda c: c.field("x", int),
+        lambda c: c.type_hints(Table),
+    ):
+        with pytest.raises(RuntimeError, match="only usable during the schema_for call"):
+            call(kept[0])
+
+
+def test_decode_errors_other_than_valueerror_propagate() -> None:
+    @dataclasses.dataclass
+    class Checked:
+        v: int
+
+        def __post_init__(self) -> None:
+            if self.v == 7:
+                raise RuntimeError("seven is unlucky")
+
+    v = Env(c=Checked).predicate("c.v == 7").satisfiable()
+    assert v.unknown  # a dataclass validator's rejection still means UNKNOWN
+    assert v.reason is not None
+    assert "fails model validation" in v.reason
+
+    class Buggy(TableAdapter):
+        def decode(self, tp: Any, data: dict[str, Any]) -> Any:
+            raise AttributeError("adapter bug")
+
+    with pytest.raises(AttributeError, match="adapter bug"):
+        Env(c=Customer, adapters=[Buggy()]).predicate("c.credit == 1").satisfiable()

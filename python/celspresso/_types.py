@@ -63,18 +63,27 @@ class SchemaContext:
     """What a `TypeAdapter` gets while mapping a type: converting the types its fields
     are annotated with, and registering structs (with naming and recursion handled)."""
 
-    __slots__ = ("_adapter", "_b")
+    __slots__ = ("_adapter", "_b", "_live")
 
     def __init__(self, builder: SchemaBuilder, adapter: Any) -> None:
         self._b = builder
         self._adapter = adapter
+        self._live = True
+
+    def _check_live(self) -> None:
+        if not self._live:
+            raise RuntimeError("a SchemaContext is only usable during the schema_for call it was passed to")
 
     def struct(self, key: Any, build: Callable[[], Iterable[Field]], *, name: str | None = None) -> TypeRef:
         """The struct for `key` (usually a class), calling `build()` for its fields the
         first time. `build` may convert types that refer back to `key`: recursion works.
+        Keys are compared by equality if hashable (so a class, a string such as a
+        protobuf full name, or a tuple), else by identity. If `build` raises, the struct
+        (and any registered while building it) is forgotten.
 
         The struct is named `name` if given and free, else after the class
         (`Name`, then `module.Qualname`), with `#2`, `#3`, ... appended if taken."""
+        self._check_live()
         if name is not None:
             _check_struct_name(name)
         return TypeRef._unchecked(("struct", self._b._register(key, self._adapter, build, name)))
@@ -82,11 +91,13 @@ class SchemaContext:
     def convert(self, tp: Any, constraints: Constraints | None = None) -> tuple[TypeRef, Constraints]:
         """The CEL type for a Python annotation (through every adapter), and the
         constraints it carries, merged over `constraints`."""
+        self._check_live()
         where = self._b._building[-1] if self._b._building else repr(tp)
         return self._convert(tp, constraints, where)
 
     def field(self, name: str, tp: Any, constraints: Constraints | None = None) -> Field:
         """A struct field of Python type `tp`; for use inside `struct(..., build)`."""
+        self._check_live()
         where = f"{self._b._building[-1]}.{name}" if self._b._building else name
         ref, cons = self._convert(tp, constraints, where)
         return Field(name, ref, cons)
@@ -94,12 +105,39 @@ class SchemaContext:
     def type_hints(self, cls: type) -> dict[str, Any]:
         """`typing.get_type_hints(cls, include_extras=True)`, also resolving string
         annotations that name classes already registered (e.g. local classes)."""
+        self._check_live()
         return self._b.type_hints(cls)
 
     def _convert(self, tp: Any, constraints: Constraints | None, where: str) -> tuple[TypeRef, Constraints]:
         cons: dict[str, Any] = dict(constraints._spec() or {}) if constraints is not None else {}
+        if isinstance(tp, TypeRef):  # e.g. T.list(ref) of a ref this context returned
+            self._b._check_refs(tp._spec, where, by_name=False)
+            return tp, _constraints_of(cons)
         spec = self._b._convert(tp, cons, where)
         return TypeRef._unchecked(spec), _constraints_of(cons)
+
+
+class _Id:
+    """Identity key for an unhashable registration key."""
+
+    __slots__ = ("n",)
+
+    def __init__(self, obj: Any) -> None:
+        self.n = id(obj)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Id) and other.n == self.n
+
+    def __hash__(self) -> int:
+        return hash(self.n)
+
+
+def _key_of(key: Any) -> Any:
+    try:
+        hash(key)
+    except TypeError:
+        return _Id(key)
+    return key
 
 
 def _constraints_of(d: dict[str, Any] | None) -> Constraints:
@@ -132,7 +170,8 @@ class SchemaBuilder:
         self.structs: dict[str, list[tuple[str, TypeSpec, dict[str, Any] | None]]] = {}
         # struct name -> (the key an adapter registered it under, that adapter)
         self.owners: dict[str, tuple[Any, Any]] = {}
-        self._by_key: dict[int, str] = {}  # id(key) -> name; owners keeps the keys alive
+        self._by_key: dict[Any, str] = {}  # _key_of(key) -> name; owners keeps the keys alive
+        self._journal: list[str] = []  # names registered, in order, for rollback
         self.adapters: tuple[Any, ...] = _default_adapters()
         self._building: list[str] = []
         self.add_adapters(adapters)
@@ -142,6 +181,7 @@ class SchemaBuilder:
         b.structs = dict(self.structs)
         b.owners = dict(self.owners)
         b._by_key = dict(self._by_key)
+        b._journal = []
         b.adapters = self.adapters
         b._building = []
         return b
@@ -232,18 +272,32 @@ class SchemaBuilder:
     def _register(
         self, key: Any, adapter: Any, build: Callable[[], Iterable[Field]], preferred: str | None
     ) -> str:
-        known = self._by_key.get(id(key))
+        known = self._by_key.get(_key_of(key))
         if known is not None:
             return known
         name = self._struct_name(key, preferred)
+        mark = len(self._journal)
         self.owners[name] = (key, adapter)
-        self._by_key[id(key)] = name
+        self._by_key[_key_of(key)] = name
         self.structs[name] = []  # placeholder: fields may refer back to this struct
+        self._journal.append(name)
         self._building.append(name)
         try:
-            fields = list(build())
+            return self._finish(name, build)
+        except BaseException:
+            # undo this struct and everything registered while building it (which may
+            # refer to it), so an adapter that catches the error sees no half-built struct
+            for undone in self._journal[mark:]:
+                k, _ = self.owners.pop(undone)
+                del self._by_key[_key_of(k)]
+                del self.structs[undone]
+            del self._journal[mark:]
+            raise
         finally:
             self._building.pop()
+
+    def _finish(self, name: str, build: Callable[[], Iterable[Field]]) -> str:
+        fields = list(build())
         seen: set[str] = set()
         out: list[tuple[str, TypeSpec, dict[str, Any] | None]] = []
         for f in fields:
@@ -260,7 +314,7 @@ class SchemaBuilder:
         return name
 
     def type_hints(self, cls: type) -> dict[str, Any]:
-        where = self._by_key.get(id(cls), cls.__name__)
+        where = self._by_key.get(_key_of(cls), cls.__name__)
         # String annotations (``from __future__ import annotations``) on classes defined
         # inside a function cannot see that function's locals; give them the classes we know.
         # Names the class's own module defines win: `localns` outranks module globals
@@ -283,7 +337,11 @@ class SchemaBuilder:
             self._check_refs(tp._spec, where, by_name=True)
             return tp._spec
         for adapter in self.adapters:
-            result = adapter.schema_for(tp, SchemaContext(self, adapter))
+            ctx = SchemaContext(self, adapter)
+            try:
+                result = adapter.schema_for(tp, ctx)
+            finally:
+                ctx._live = False
             if result is None:
                 continue
             ref, extra = result if isinstance(result, tuple) else (result, None)
