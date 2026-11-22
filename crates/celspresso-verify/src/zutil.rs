@@ -160,3 +160,24 @@ pub fn double_trunc(d: &z3::ast::Float) -> z3::ast::Int {
     use z3::ast::{Int, RoundingMode};
     Int::from_real(&d.round_to_integral_with_rounding_mode(&RoundingMode::round_towards_zero()).to_real())
 }
+
+/// Z3 `str.indexof(s, t, i)`: first occurrence of `t` in `s` at or after `i` (in
+/// characters), `i` itself when `t` is empty and `0 <= i <= |s|`, -1 otherwise.
+pub fn str_index_of(s: &ZStr, t: &ZStr, start: &z3::ast::Int) -> z3::ast::Int {
+    let ctx = z3::Context::thread_local();
+    // SAFETY: handles from the thread-local context; the result is wrapped immediately.
+    unsafe {
+        let raw = z3_sys::Z3_mk_seq_index(ctx.get_z3_context(), s.get_z3_ast(), t.get_z3_ast(), start.get_z3_ast()).expect("seq index");
+        z3::ast::Int::wrap(&ctx, raw)
+    }
+}
+
+/// Z3 `str.lastindexof(s, t)`: last occurrence of `t` in `s`, `|s|` when `t` is empty, -1 if none.
+pub fn str_last_index_of(s: &ZStr, t: &ZStr) -> z3::ast::Int {
+    let ctx = z3::Context::thread_local();
+    // SAFETY: as above.
+    unsafe {
+        let raw = z3_sys::Z3_mk_seq_last_index(ctx.get_z3_context(), s.get_z3_ast(), t.get_z3_ast()).expect("seq last index");
+        z3::ast::Int::wrap(&ctx, raw)
+    }
+}

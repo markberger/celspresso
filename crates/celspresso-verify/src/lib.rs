@@ -113,9 +113,6 @@ fn unknown_reason(r: Option<String>) -> String {
     }
 }
 
-/// Rounds of "replay failed -> learn the custom functions' real values -> re-solve".
-const MAX_REFINEMENTS: usize = 8;
-
 fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>) {
     let schema = match q {
         Query::Satisfiable(e) | Query::AlwaysTrue(e) | Query::CanError(e) | Query::Implies(e, _) | Query::Equivalent(e, _, _) => {
@@ -141,54 +138,40 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
     solver.assert(&g);
     let readable = ReadablePass::new(&enc.soft);
 
-    let mut refinements = 0;
-    let status = loop {
-        match solver.check() {
-            SatResult::Sat => {
-                let mut model = solver.get_model().expect("model");
-                if let Some(m) = readable.run(&solver, &model, opts.timeout_ms) {
-                    model = m;
-                }
-                let _ = solver.set_params(&params); // restore the full timeout
-                let rec = Recording { inner: funcs, calls: RefCell::new(Vec::new()) };
-                let w = complete_witness(q, assumptions, enc.witness(&model));
-                if let Some(w) = w.filter(|w| replay(q, assumptions, w, &rec)) {
-                    break Status::Found(w);
-                }
-                let facts: Vec<Bool> = rec.calls.borrow().iter().filter_map(|(f, args, res)| enc.refine(f, args, res)).collect();
-                if facts.is_empty() || refinements == MAX_REFINEMENTS {
-                    break Status::Unknown(if approximations.is_empty() {
-                        "internal: solver witness did not replay in the evaluator".to_string()
-                    } else {
-                        format!("candidate witness did not replay; approximations: {}", approximations.join("; "))
-                    });
-                }
-                for f in &facts {
-                    solver.assert(f);
-                }
-                refinements += 1;
+    // One solve, one replay. Host functions are never called during solving: they are
+    // opaque (plus contracts) or tabulated, so a witness that doesn't replay is UNKNOWN.
+    let status = match solver.check() {
+        SatResult::Sat => {
+            let mut model = solver.get_model().expect("model");
+            if let Some(m) = readable.run(&solver, &model, opts.timeout_ms) {
+                model = m;
             }
-            SatResult::Unsat => {
-                // vacuity: if the assumptions alone are contradictory, the "proof" means nothing
-                let s2 = Solver::new();
-                let _ = s2.set_params(&params);
-                for a in enc.assumptions.iter().chain(&user) {
-                    s2.assert(a);
-                }
-                break match s2.check() {
-                    SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
-                    _ if bounded => Status::Unknown(format!(
-                        "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
-                        opts.unroll_limit
-                    )),
-                    _ => match sample_proofs(&enc, q, assumptions, &user, &params, funcs, opts) {
-                        Some(w) => Status::Found(w),
-                        None => Status::NotFound,
-                    },
-                };
+            let w = complete_witness(q, assumptions, enc.witness(&model));
+            match w.filter(|w| replay(q, assumptions, w, funcs)) {
+                Some(w) => Status::Found(w),
+                None => Status::Unknown(enc.unreplayed_reason()),
             }
-            SatResult::Unknown => break Status::Unknown(unknown_reason(solver.get_reason_unknown())),
         }
+        SatResult::Unsat => {
+            // vacuity: if the assumptions alone are contradictory, the "proof" means nothing
+            let s2 = Solver::new();
+            let _ = s2.set_params(&params);
+            for a in enc.assumptions.iter().chain(&user) {
+                s2.assert(a);
+            }
+            match s2.check() {
+                SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
+                _ if bounded => Status::Unknown(format!(
+                    "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
+                    opts.unroll_limit
+                )),
+                _ => match sample_proofs(&enc, q, assumptions, &user, &params, funcs, opts) {
+                    Some(w) => Status::Found(w),
+                    None => Status::NotFound,
+                },
+            }
+        }
+        SatResult::Unknown => Status::Unknown(unknown_reason(solver.get_reason_unknown())),
     };
     (status, bounded, approximations)
 }
@@ -241,23 +224,6 @@ fn sample_proofs(
         }
     }
     None
-}
-
-/// One host-function call: name, arguments and outcome.
-type Call = (String, Vec<Value>, Result<Value, String>);
-
-/// Records every host-function call made while replaying a witness.
-struct Recording<'a> {
-    inner: &'a dyn Functions,
-    calls: RefCell<Vec<Call>>,
-}
-
-impl Functions for Recording<'_> {
-    fn call(&self, function: &str, args: &[Value]) -> Option<Result<Value, String>> {
-        let r = self.inner.call(function, args)?;
-        self.calls.borrow_mut().push((function.to_string(), args.to_vec(), r.clone()));
-        Some(r)
-    }
 }
 
 /// Prefer small, readable witness values (soft constraints) without a fresh MaxSAT search.

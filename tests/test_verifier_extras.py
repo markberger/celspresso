@@ -65,13 +65,16 @@ def test_ensures_contracts_and_total_functions() -> None:
 
     e = Env(x=int).extend(functions=[risk, fee])
     assert e.predicate("risk(x) * 2 <= 200").always_true().proved
-    assert e.predicate("risk(x) > 50").satisfiable().sat
-    # fee's contract is wrong (fee(-100) == -1): every witness is replayed for real,
-    # so a broken contract shows up as a genuine counterexample, never a false proof
+    # the contract allows it, but only the real function could say which x: not UNSAT
+    assert not e.predicate("risk(x) > 50").satisfiable().unsat
+    assert e.predicate("risk(x) > 100").satisfiable().unsat
+    # fee's contract is wrong (fee(-100) == -1). Contracts are trusted, so the prover
+    # can't catch that; here fee may also fail (no total=True), so this isn't PROVED,
+    # and any counterexample it reports has been replayed with the real function
     v = e.predicate("fee(x) >= 0").always_true()
-    assert v.refuted
-    assert v.counterexample is not None
-    assert v.counterexample["x"] < 0
+    assert not v.proved
+    if v.counterexample is not None:
+        assert fee(v.counterexample["x"]) < 0
     assert any(
         "ensures contract of 'risk'" in a
         for a in e.predicate("risk(x) >= 0").always_true().stats.approximations

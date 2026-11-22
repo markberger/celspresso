@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import itertools
+import math
 import typing
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -61,25 +63,39 @@ def function(
     name: str | None = None,
     ensures: str | None = None,
     total: bool = False,
+    tabulate: bool = True,
 ) -> Any:
     """Mark a Python callable as a CEL function (optionally renaming it).
 
     Pass the result to `Env.extend(functions=[...])`. Parameter and return types
-    come from the type hints. The verifier treats custom functions as
-    uninterpreted: it knows they are deterministic, nothing more, unless you state a
+    come from the type hints. The verifier never calls a function while solving: it
+    treats it as opaque, knowing only that it is deterministic, unless you state a
     postcondition. `ensures` is a CEL predicate over the parameters (by name) and
     `result`, e.g. `@function(ensures="result >= 0 && result <= 100")`, trusted at
     every call that does not raise. `total=True` promises the function never raises
     (otherwise a proof must allow for it). Both are trusted, so they must really hold.
+
+    When every parameter has a small finite domain (bool, `Literal`, `Enum`, or an int
+    with `ge` and `le`; at most 1024 combinations), the function is called once per
+    input when declared and the verifier knows it exactly. Pass `tabulate=False` for a
+    function that is slow or has side effects. For logic you want fully verified,
+    write it in CEL instead: `env.define(name, body, params={...})`.
     """
 
     def wrap(f: Callable[..., Any]) -> Callable[..., Any]:
         f.__cel_name__ = name or f.__name__  # type: ignore[attr-defined]
         f.__cel_ensures__ = ensures  # type: ignore[attr-defined]
         f.__cel_total__ = total  # type: ignore[attr-defined]
+        f.__cel_tabulate__ = tabulate  # type: ignore[attr-defined]
         return f
 
     return wrap(fn) if fn is not None else wrap
+
+
+#: (name, source, parameters or None for a constant definition)
+_Def = tuple[str, str, "tuple[tuple[str, TypeSpec], ...] | None"]
+#: (arguments, returned normally, result or error message) for one tabulated input
+_Row = tuple[list[Any], bool, Any]
 
 
 @dataclass(frozen=True)
@@ -91,6 +107,7 @@ class _Fn:
     param_names: tuple[str, ...] = ()
     ensures: str | None = None
     total: bool = False
+    table: tuple[_Row, ...] | None = None
 
 
 class Env:
@@ -133,7 +150,7 @@ class Env:
         self._builder = SchemaBuilder()
         self._vars: dict[str, tuple[TypeSpec, dict[str, Any] | None]] = {}
         self._fns: dict[str, _Fn] = {}
-        self._defs: tuple[tuple[str, str], ...] = ()
+        self._defs: tuple[_Def, ...] = ()
         self._assumptions: tuple[str, ...] = ()
         for n, tp in variables.items():
             self._vars[n] = self._builder.convert(tp, n)
@@ -164,20 +181,23 @@ class Env:
                 False,
                 list(f.params),
                 f.result,
-                (list(f.param_names), f.ensures, f.total) if f.ensures or f.total else None,
+                (list(f.param_names), f.ensures, f.total, None if f.table is None else list(f.table))
+                if f.ensures or f.total or f.table is not None
+                else None,
             )
             for f in self._fns.values()
         ]
         try:
-            self._core = _core.Core(structs, variables, fns, list(self._defs))
+            defs = [(n, src, None if ps is None else list(ps)) for n, src, ps in self._defs]
+            self._core = _core.Core(structs, variables, fns, defs)
         except _core.CompileError as exc:
             # a definition (or a function's ensures contract) failed to compile
             _raise_compile(exc)
         self._fn_impls = {f.name: f.impl for f in self._fns.values()}
         self._fingerprint = (
             tuple(sorted((n, repr(s)) for n, s in self._vars.items())),
-            tuple(sorted((n, f.ensures or "", f.total) for n, f in self._fns.items())),
-            self._defs,
+            tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
+            tuple((n, src, repr(ps)) for n, src, ps in self._defs),
         )
 
     def extend(
@@ -226,13 +246,29 @@ class Env:
         e._assumptions = self._assumptions + tuple(new_asm)
         return e
 
-    def define(self, name: str, source: str) -> Env:
-        """Return a new Env where `name` is a reusable named sub-expression."""
+    def define(self, name: str, source: str, *, params: Mapping[str, Any] | None = None) -> Env:
+        """Return a new Env where `name` is a reusable named sub-expression.
+
+        With `params`, the definition is a function written in CEL, called as
+        `name(arg, ...)` with arguments in the order given. Unlike a Python `@function`,
+        the verifier sees its body, so proofs about it are complete:
+
+        >>> env = Env(score=int).define("clamp", "v < 0 ? 0 : (v > 100 ? 100 : v)", params={"v": int})
+        >>> env.predicate("clamp(score) <= 100").always_true().proved
+        True
+        """
         if not name.isidentifier():
             raise ValueError(f"invalid definition name {name!r}")
-        self.compile(source)  # type-check against the current env first
         e = self._clone()
-        e._defs = (*self._defs, (name, source))
+        specs: tuple[tuple[str, TypeSpec], ...] | None = None
+        if params is None:
+            self.compile(source)  # type-check against the current env first
+        else:
+            for p in params:
+                if not p.isidentifier():
+                    raise ValueError(f"invalid parameter name {p!r}")
+            specs = tuple((p, e._builder.convert(tp, f"{name}({p})")[0]) for p, tp in params.items())
+        e._defs = (*self._defs, (name, source, specs))
         e._build()
         return e
 
@@ -512,15 +548,57 @@ def _type_mismatch(source: str, e: Expr[Any], want: str) -> typing.NoReturn:
     raise CelTypeError(source, [Diagnostic(msg, 0, len(source), f"{msg}\n  | {source}")])
 
 
+#: Most inputs a host function is called on to tabulate it.
+TABULATE_LIMIT = 1024
+
+
+def _domain(spec: TypeSpec, cons: Mapping[str, Any] | None) -> list[Any] | None:
+    """Every value a parameter can take, if that is a short finite list."""
+    if spec == "bool":
+        return [False, True]
+    if cons and cons.get("one_of") is not None:
+        return list(cons["one_of"])
+    if spec in ("int", "uint") and cons:
+        lo = math.ceil(cons["ge"]) if cons.get("ge") is not None else None
+        if cons.get("gt") is not None:
+            lo = math.floor(cons["gt"]) + 1
+        hi = math.floor(cons["le"]) if cons.get("le") is not None else None
+        if cons.get("lt") is not None:
+            hi = math.ceil(cons["lt"]) - 1
+        if spec == "uint":
+            lo = max(lo or 0, 0)
+        if lo is not None and hi is not None and hi - lo < TABULATE_LIMIT:
+            return list(range(lo, hi + 1))
+    return None
+
+
+def _call_row(name: str, f: Callable[..., Any], args: tuple[Any, ...]) -> _Row:
+    try:
+        return (list(args), True, f(*args))
+    except Exception as exc:  # noqa: BLE001 - mirrors a runtime call that raises
+        return (list(args), False, f"function '{name}' raised {type(exc).__name__}")
+
+
+def _tabulate(name: str, f: Callable[..., Any], domains: list[list[Any] | None]) -> tuple[_Row, ...] | None:
+    """Call `f` on every input, if the inputs are few. A raising input is an erroring call."""
+    finite = [d for d in domains if d is not None]
+    if len(finite) != len(domains) or math.prod(len(d) for d in finite) > TABULATE_LIMIT:
+        return None
+    return tuple(_call_row(name, f, args) for args in itertools.product(*finite))
+
+
 def _function_decl(f: Callable[..., Any], builder: SchemaBuilder) -> _Fn:
     name = getattr(f, "__cel_name__", None) or f.__name__
     hints = typing.get_type_hints(f, include_extras=True)
     sig = inspect.signature(f)
-    params = []
+    params: list[TypeSpec] = []
+    domains: list[list[Any] | None] = []
     for p in sig.parameters.values():
         if p.name not in hints:
             raise TypeError(f"function '{name}': parameter '{p.name}' needs a type hint")
-        params.append(builder.convert(hints[p.name], f"{name}({p.name})")[0])
+        spec, cons = builder.convert(hints[p.name], f"{name}({p.name})")
+        params.append(spec)
+        domains.append(_domain(spec, cons))
     if "return" not in hints:
         raise TypeError(f"function '{name}' needs a return type hint")
     result = builder.convert(hints["return"], f"{name} result")[0]
@@ -528,7 +606,9 @@ def _function_decl(f: Callable[..., Any], builder: SchemaBuilder) -> _Fn:
     ensures = getattr(f, "__cel_ensures__", None)
     if ensures is not None and "result" in names:
         raise TypeError(f"function '{name}': a parameter named 'result' clashes with ensures")
-    return _Fn(name, f, tuple(params), result, names, ensures, bool(getattr(f, "__cel_total__", False)))
+    table = _tabulate(name, f, domains) if getattr(f, "__cel_tabulate__", True) else None
+    total = bool(getattr(f, "__cel_total__", False))
+    return _Fn(name, f, tuple(params), result, names, ensures, total, table)
 
 
 def _operand(env: Env, x: Any) -> str:

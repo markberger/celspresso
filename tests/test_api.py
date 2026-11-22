@@ -316,26 +316,6 @@ def test_define_and_table(env: Env) -> None:
     assert "adult" not in p.canonical
 
 
-def test_custom_function_uninterpreted() -> None:
-    @function
-    def risk(n: int) -> int:
-        return n * 2
-
-    env = Env(n=int).extend(functions=[risk])
-    p = env.predicate("risk(n) > 10")
-    assert p.evaluate({"n": 6}) is True
-    assert p.satisfiable().sat
-    # deterministic: same input, same output (and the same error, if it raises)
-    assert p.equivalent("risk(n) > 10 && risk(n) > 10").proved
-    # replaying candidate counterexamples with the real function makes refutations genuine
-    v = env.predicate("risk(n) > n").always_true()
-    assert v.refuted
-    assert v.counterexample is not None
-    n = v.counterexample["n"]
-    assert not risk(n) > n
-    assert any("risk" in a for a in v.stats.approximations)
-
-
 # -- RuleSet, diff, testing helpers ----------------------------------------
 
 
@@ -369,24 +349,6 @@ def test_testing_helpers(env: Env) -> None:
     ct.assert_no_errors(env.compile("user.age + 1"))
     with pytest.raises(AssertionError):
         ct.assert_equivalent(env.predicate("user.age > 1"), "user.age > 2")
-
-
-def test_custom_function_refinement_uses_real_values() -> None:
-    calls: list[int] = []
-
-    @function
-    def twice(n: int) -> int:
-        calls.append(n)
-        return n * 2
-
-    env = Env(n=Annotated[int, Field(ge=0, le=3)]).extend(functions=[twice])
-    v = env.predicate("twice(n) > 5").satisfiable()
-    # the solver's first guess for `double` is arbitrary; replaying it with the real
-    # function teaches the solver actual values until a genuine witness appears
-    assert v.sat
-    assert v.witness is not None
-    assert v.witness["n"] == 3
-    assert calls[-1] == 3
 
 
 def test_custom_function_cannot_shadow_builtin_overload() -> None:

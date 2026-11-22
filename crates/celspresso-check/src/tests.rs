@@ -96,10 +96,33 @@ fn refs_and_paths() {
 #[test]
 fn definitions() {
     let mut defs = std::collections::BTreeMap::new();
-    defs.insert("adult".to_string(), parse("user.age >= 18").unwrap());
-    defs.insert("ok".to_string(), parse("adult && size(user.roles) > 0").unwrap());
+    defs.insert("adult".to_string(), Definition::constant(parse("user.age >= 18").unwrap()));
+    defs.insert("ok".to_string(), Definition::constant(parse("adult && size(user.roles) > 0").unwrap()));
     let e = expand_definitions(parse("ok || xs.exists(adult, adult > 1)").unwrap(), &defs);
     assert_eq!(celspresso_syntax::unparse(&e), "user.age >= 18 && size(user.roles) > 0 || xs.exists(adult, adult > 1)");
     let c = check(e, schema()).unwrap();
     assert_eq!(c.output_type().to_string(), "bool");
+}
+
+#[test]
+fn parameterized_definitions() {
+    let def =
+        |params: &[&str], src: &str| Definition { params: Some(params.iter().map(|p| p.to_string()).collect()), body: parse(src).unwrap() };
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert("clamp".to_string(), def(&["v"], "v < 0 ? 0 : (v > 100 ? 100 : v)"));
+    defs.insert("between".to_string(), def(&["x", "lo", "hi"], "x >= lo && x <= hi"));
+    // a body comprehension variable named like an argument's variable, and an argument
+    // that mentions a parameter name: hygiene keeps them apart
+    defs.insert("anyAbove".to_string(), def(&["xs", "x"], "xs.exists(v, v > x)"));
+    let e = expand_definitions(
+        parse("clamp(user.age - 10) == 5 && between(user.age, 18, 65) && xs.exists(v, anyAbove(xs, v))").unwrap(),
+        &defs,
+    );
+    let text = celspresso_syntax::unparse(&e);
+    assert!(text.contains("@arg:clamp:v") && text.contains("@arg:anyAbove:x"), "{text}");
+    let c = check(e, schema()).unwrap();
+    assert_eq!(c.output_type().to_string(), "bool");
+    // the wrong number of arguments is left as a call (and reported by the checker)
+    let e = expand_definitions(parse("clamp(1, 2)").unwrap(), &defs);
+    assert!(matches!(e.kind, celspresso_syntax::ast::ExprKind::Call { .. }));
 }

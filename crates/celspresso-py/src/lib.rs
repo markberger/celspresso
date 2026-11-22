@@ -2,10 +2,11 @@
 //! module exposes a compiled-environment core, compiled programs, and `verify`.
 
 use celspresso_check::{
-    check, expand_definitions, CelType, CheckedExpr, Constraints, Contract, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl,
+    check, expand_definitions, CelType, CheckedExpr, Constraints, Contract, Definition, FieldDecl, FunctionDecl, Overload, Schema,
+    StructDecl, VarDecl,
 };
 use celspresso_eval::{date, evaluate, evaluate_traced, time, Functions, Key, Limits, StructValue, Value};
-use celspresso_syntax::{parse, render_diagnostic, unparse, Expr, Literal, Span};
+use celspresso_syntax::{parse, render_diagnostic, unparse, Literal, Span};
 use celspresso_verify::{bounds as run_bounds, verify as run_verify, ErrorMode, Extreme, Options, Query, Status};
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -457,7 +458,7 @@ fn compile_err(kind: &str, src: &str, diags: Vec<(String, Span)>) -> PyErr {
     CompileError::new_err((kind.to_string(), items, src.to_string()))
 }
 
-fn compile_source(schema: &Arc<Schema>, defs: &BTreeMap<String, Expr>, src: &str) -> PyResult<CheckedExpr> {
+fn compile_source(schema: &Arc<Schema>, defs: &BTreeMap<String, Definition>, src: &str) -> PyResult<CheckedExpr> {
     let parsed = parse(src).map_err(|e| compile_err("syntax", src, vec![(e.message, e.span)]))?;
     let expanded = if defs.is_empty() { parsed } else { expand_definitions(parsed, defs) };
     check(expanded, schema.clone()).map_err(|errs| compile_err("type", src, errs.into_iter().map(|e| (e.message, e.span)).collect()))
@@ -466,7 +467,24 @@ fn compile_source(schema: &Arc<Schema>, defs: &BTreeMap<String, Expr>, src: &str
 #[pyclass(frozen, module = "celspresso._celspresso")]
 struct Core {
     schema: Arc<Schema>,
-    defs: BTreeMap<String, Expr>,
+    defs: BTreeMap<String, Definition>,
+}
+
+/// One tabulated call: (arguments, returned normally, result value or error message).
+type TableRow<'py> = (Vec<Bound<'py, PyAny>>, bool, Bound<'py, PyAny>);
+/// (parameter names, ensures source, total, table) for a host function.
+type ContractSpec<'py> = (Vec<String>, Option<String>, bool, Option<Vec<TableRow<'py>>>);
+
+/// A Value as a literal for a function table (scalars only).
+fn value_literal(v: &Value) -> Option<Literal> {
+    Some(match v {
+        Value::Bool(b) => Literal::Bool(*b),
+        Value::Int(i) | Value::Date(i) => Literal::Int(*i),
+        Value::Uint(u) => Literal::Uint(*u),
+        Value::Double(d) => Literal::Double(*d),
+        Value::String(s) => Literal::String(s.to_string()),
+        _ => return None,
+    })
 }
 
 #[pymethods]
@@ -477,8 +495,8 @@ impl Core {
     fn new(
         structs: Vec<(String, Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>)>,
         vars: Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>,
-        functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>, Option<(Vec<String>, Option<String>, bool)>)>,
-        defs: Vec<(String, String)>,
+        functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>, Option<ContractSpec<'_>>)>,
+        defs: Vec<(String, String, Option<Vec<(String, Bound<'_, PyAny>)>>)>,
     ) -> PyResult<Self> {
         let mut s = Schema::with_stdlib();
         for (name, fields) in structs {
@@ -495,16 +513,36 @@ impl Core {
         for (name, id, receiver, params, result, ensures) in functions {
             let params = params.iter().map(type_from_py).collect::<PyResult<Vec<_>>>()?;
             let result = type_from_py(&result)?;
-            if let Some((names, src, total)) = ensures {
-                contracts.push((id.clone(), names, params.clone(), result.clone(), src, total));
+            if let Some((names, src, total, rows)) = ensures {
+                // a row that doesn't convert (an unsupported value) drops the whole table
+                let table = match rows {
+                    Some(rows) => {
+                        let mut out = Vec::new();
+                        for (args, ok, r) in rows {
+                            let mut lits = Vec::new();
+                            for (a, t) in args.iter().zip(&params) {
+                                lits.extend(value_from_py(a, t, &s, &name).ok().as_ref().and_then(value_literal));
+                            }
+                            let res = if ok { value_from_py(&r, &result, &s, &name).ok().as_ref().and_then(value_literal) } else { None };
+                            if lits.len() != params.len() || (ok && res.is_none()) {
+                                out.clear();
+                                break;
+                            }
+                            out.push((lits, res));
+                        }
+                        (!out.is_empty()).then_some(out)
+                    }
+                    None => None,
+                };
+                contracts.push((id.clone(), names, params.clone(), result.clone(), src, total, table));
             }
             s.add_function(FunctionDecl { name, overloads: vec![Overload { id, receiver, params, result }] })
                 .map_err(PyValueError::new_err)?;
         }
         // contracts see the structs, the parameters and `result`; never other functions (no recursion)
-        for (id, names, params, result, src, total) in contracts {
+        for (id, names, params, result, src, total, table) in contracts {
             let Some(src) = src else {
-                s.contracts.insert(id, Arc::new(Contract { params: names, ensures: None, total }));
+                s.contracts.insert(id, Arc::new(Contract { params: names, ensures: None, total, table }));
                 continue;
             };
             let mut cs = Schema::with_stdlib();
@@ -516,17 +554,44 @@ impl Core {
             if *ensures.output_type() != CelType::Bool {
                 return Err(PyValueError::new_err(format!("ensures for '{id}' must be a bool expression, not {}", ensures.output_type())));
             }
-            s.contracts.insert(id, Arc::new(Contract { params: names, ensures: Some(ensures), total }));
+            s.contracts.insert(id, Arc::new(Contract { params: names, ensures: Some(ensures), total, table }));
         }
-        let schema = Arc::new(s);
+        // definitions in order: each sees the ones before it. A definition with parameters
+        // is checked with them as variables, and declared as a function returning its type.
         let mut defmap = BTreeMap::new();
-        for (name, src) in defs {
-            if schema.vars.contains_key(&name) {
+        for (name, src, params) in defs {
+            if s.vars.contains_key(&name) {
                 return Err(PyValueError::new_err(format!("definition '{name}' shadows a variable")));
             }
-            let checked = compile_source(&schema, &defmap, &src)?;
-            defmap.insert(name, checked.expr);
+            match params {
+                None => {
+                    let checked = compile_source(&Arc::new(s.clone()), &defmap, &src)?;
+                    defmap.insert(name, Definition::constant(checked.expr));
+                }
+                Some(params) => {
+                    let mut ds = s.clone();
+                    let mut names = Vec::new();
+                    let mut types = Vec::new();
+                    for (p, t) in &params {
+                        let ty = type_from_py(t)?;
+                        ds.vars.insert(p.clone(), VarDecl { name: p.clone(), ty: ty.clone(), constraints: Constraints::default() });
+                        names.push(p.clone());
+                        types.push(ty);
+                    }
+                    let checked = compile_source(&Arc::new(ds), &defmap, &src)?;
+                    let result = checked.output_type().clone();
+                    s.add_function(FunctionDecl {
+                        name: name.clone(),
+                        overloads: vec![Overload { id: format!("{name}_def"), receiver: false, params: types, result }],
+                    })
+                    .map_err(PyValueError::new_err)?;
+                    // the body as written (parameters by their own names); expansion renames them
+                    let body = parse(&src).map_err(|e| compile_err("syntax", &src, vec![(e.message, e.span)]))?;
+                    defmap.insert(name, Definition { params: Some(names), body });
+                }
+            }
         }
+        let schema = Arc::new(s);
         Ok(Core { schema, defs: defmap })
     }
 

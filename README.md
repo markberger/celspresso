@@ -134,7 +134,10 @@ A Rust core parses, checks and evaluates CEL, and encodes its exact semantics in
 
 - **Types:** Pydantic models, dataclasses, `Optional`, lists, maps, `date`, timezone-aware `datetime` and `timedelta`. Store money as integer cents; `Decimal` is rejected.
 - **Extensions:** strings, math, lists, sets, base64, optionals, `cel.bind`, `cel.block` and the Kubernetes network library.
-- **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions. The prover can't see inside a Python function, so tell it what's true: `@function(ensures="result >= 0 && result <= 100", total=True)`.
+- **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions. The prover never runs your Python while it solves. Each function is handled in one of three ways:
+  - **Written in CEL**, so it is fully verified: `env.define("clamp", "v < 0 ? 0 : (v > 100 ? 100 : v)", params={"v": int})`, called as `clamp(x)`.
+  - **Tabulated automatically** when every parameter is a `bool`, `Literal`, `Enum` or bounded int (at most 1024 inputs in total). It is called once per input when declared and is then known exactly. Opt out with `tabulate=False`.
+  - **Opaque** otherwise. Tell the prover what holds with `@function(ensures="result >= 0 && result <= 100", total=True)`. If an answer depends on what the function returns, the verdict is `UNKNOWN`, and its reason says which of these three ways would fix that.
 - **Rule sets:** `RuleSet({...}).verify_all(invariants)` vets every rule at once; `unreachable()`, `can_error()` and `check_pairwise(...)` find dead, crashing and overlapping rules.
 - **Debugging and tests:** `expr.explain(data)` shows the value of every sub-expression; `celspresso.testing` has `assert_equivalent`, `assert_implies`, `assert_never` and more.
 - **Not yet supported:** protobuf messages and JSON values. The verifier models ints, doubles (IEEE, NaN included), strings, lists, maps, optionals, dates, timestamps and durations; bytes and named time zones return `UNKNOWN` with the reason. Proofs over a list or map need a `max_length` (or a larger `unroll_limit`), so the prover can cover every length.

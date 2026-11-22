@@ -36,6 +36,8 @@ pub struct Encoder {
     fresh: u32,
     /// The first date input, which later dates prefer to stay near (readable witnesses).
     first_date: Option<Int>,
+    /// (haystack, needle, result, is_last) of every indexOf(s, t) / lastIndexOf(s, t), to relate them.
+    index_terms: Vec<(ZStr, ZStr, ZInt, bool)>,
 }
 
 /// Days since 1970-01-01 today (UTC). Only steers *preferences*, never verdicts.
@@ -75,6 +77,7 @@ impl Encoder {
             func_overloads: HashMap::new(),
             fresh: 0,
             first_date: None,
+            index_terms: Vec::new(),
         }
     }
 
@@ -1081,6 +1084,33 @@ impl Encoder {
             ("contains", [Str(a), Str(b)]) => ok(Bool(a.contains(b))),
             ("startsWith", [Str(a), Str(b)]) => ok(Bool(b.prefix(a))),
             ("endsWith", [Str(a), Str(b)]) => ok(Bool(b.suffix(a))),
+            // positions count characters (code points) in both CEL and Z3
+            ("indexOf", [Str(a), Str(b)]) => ok(Int(self.index_of(a, b, &ZInt::from_i64(0)))),
+            ("indexOf", [Str(a), Str(b), Int(i)]) => {
+                let bad = or(&[&i.lt(ZInt::from_i64(0)), &i.gt(a.length())]);
+                Some(Ok((Int(self.index_of(a, b, i)), bad)))
+            }
+            ("lastIndexOf", [Str(a), Str(b)]) => ok(Int(self.last_index_of(a, b))),
+            ("lastIndexOf", [Str(a), Str(b), Int(i)]) => {
+                // the last match starting at or before i is the last match inside s[0, i + |b|)
+                let bad = or(&[&i.lt(ZInt::from_i64(0)), &i.gt(a.length())]);
+                let prefix = a.substr(ZInt::from_i64(0), i + b.length());
+                Some(Ok((Int(self.last_index_of(&prefix, b)), bad)))
+            }
+            ("substring", [Str(a), Int(i)]) => {
+                let bad = or(&[&i.lt(ZInt::from_i64(0)), &i.gt(a.length())]);
+                Some(Ok((Str(a.substr(i, a.length() - i)), bad)))
+            }
+            ("substring", [Str(a), Int(i), Int(j)]) => {
+                let zero = ZInt::from_i64(0);
+                let bad = or(&[&i.lt(&zero), &i.gt(a.length()), &j.lt(&zero), &j.gt(a.length()), &i.gt(j)]);
+                Some(Ok((Str(a.substr(i, j - i)), bad)))
+            }
+            ("charAt", [Str(a), Int(i)]) => {
+                // Z3's at() is "" past the end, which is CEL's answer at i == size
+                let bad = or(&[&i.lt(ZInt::from_i64(0)), &i.gt(a.length())]);
+                Some(Ok((Str(a.at(i)), bad)))
+            }
             ("matches", [Str(s), Str(p)]) => {
                 let Some(pat) = zutil::str_value(p) else {
                     return Some(Err("matches() with a non-constant pattern".into()));
@@ -1173,28 +1203,37 @@ impl Encoder {
     /// Custom (host) functions become uninterpreted functions of their arguments.
     /// A fact learned by running a real custom function: `f(args) == result` (and no
     /// error), or `f!err(args)` if it raised. None if the call cannot be expressed.
-    pub fn refine(&self, function: &str, args: &[Value], result: &Result<Value, String>) -> Option<Bool> {
-        let overloads = self.func_overloads.get(function)?;
-        let (overload, _) = overloads.iter().find(|(_, n)| *n == args.len())?;
-        let (f, ferr) = self.funcs.get(overload)?;
-        let lit = |v: &Value| -> Option<Dynamic> {
-            Some(match v {
-                Value::Bool(b) => Dynamic::from_ast(&Bool::from_bool(*b)),
-                Value::Int(i) | Value::Date(i) => Dynamic::from_ast(&Int::from_i64(*i)),
-                Value::Timestamp(n) | Value::Duration(n) => Dynamic::from_ast(&big(*n)),
-                Value::Double(d) => Dynamic::from_ast(&Float::from_f64(*d)),
-                Value::Uint(u) => Dynamic::from_ast(&Int::from_u64(*u)),
-                Value::String(s) => Dynamic::from_ast(&zutil::str_lit(s)),
-                _ => return None,
-            })
+    /// Why a solver witness didn't replay: almost always a host function's real value.
+    pub fn unreplayed_reason(&self) -> String {
+        let mut names: Vec<&String> = self.func_overloads.keys().collect();
+        names.sort();
+        let tabulated =
+            |n: &str| self.func_overloads[n].iter().all(|(o, _)| self.schema.contracts.get(o).is_some_and(|k| k.table.is_some()));
+        let quoted: Vec<String> =
+            names.iter().map(|n| if tabulated(n) { format!("'{n}' (outside its tabulated inputs)") } else { format!("'{n}'") }).collect();
+        let others: Vec<&String> =
+            self.approximations.iter().filter(|a| !a.starts_with("function '") && !a.starts_with("relies on")).collect();
+        let mut out = match quoted.len() {
+            0 => String::new(),
+            n => format!(
+                "the answer depends on what {} {}, which the verifier can't see; add an ensures= contract, \
+                 give the parameters small finite types (bool, Literal, Enum or an int with ge/le) so it can be tabulated, \
+                 or write it in CEL with env.define(name, body, params={{...}})",
+                quoted.join(", "),
+                if n == 1 { "returns" } else { "return" }
+            ),
         };
-        let arg_asts = args.iter().map(lit).collect::<Option<Vec<_>>>()?;
-        let refs: Vec<&dyn Ast> = arg_asts.iter().map(|d| d as &dyn Ast).collect();
-        let err = ferr.apply(&refs).as_bool()?;
-        Some(match result {
-            Err(_) => err,
-            Ok(v) => and(&[&f.apply(&refs).eq(lit(v)?), &err.not()]),
-        })
+        if !others.is_empty() {
+            if !out.is_empty() {
+                out.push_str("; ");
+            }
+            out.push_str(&format!("approximations: {}", others.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")));
+        }
+        if out.is_empty() {
+            "internal: solver witness did not replay in the evaluator".into()
+        } else {
+            out
+        }
     }
 
     fn uninterpreted(&mut self, c: &CheckedExpr, e: &Expr, function: &str, args: &[Sym]) -> SV {
@@ -1235,8 +1274,28 @@ impl Encoder {
             (FuncDecl::new(overload.clone(), &srefs, &rsort), FuncDecl::new(format!("{overload}!err"), &srefs, &Sort::bool()))
         });
         let refs: Vec<&dyn Ast> = arg_asts.iter().map(|d| d as &dyn Ast).collect();
-        let out: Dynamic = f.apply(&refs);
-        let err: Bool = ferr.apply(&refs).as_bool().unwrap();
+        let mut out: Dynamic = f.apply(&refs);
+        let mut err: Bool = ferr.apply(&refs).as_bool().unwrap();
+        // a tabulated function is exact on its table (opaque only outside it)
+        if let Some(table) = self.schema.contracts.get(&overload).and_then(|k| k.table.clone()) {
+            for (inputs, result) in table.iter().rev() {
+                let Some(conds) = inputs.iter().zip(&arg_asts).map(|(l, a)| Some(a.eq(literal_ast(l)?))).collect::<Option<Vec<Bool>>>()
+                else {
+                    continue;
+                };
+                let hit = and(&conds.iter().collect::<Vec<_>>());
+                match result {
+                    Some(r) => match literal_ast(r) {
+                        Some(r) if r.get_sort() == out.get_sort() => {
+                            out = hit.ite(&r, &out);
+                            err = hit.ite(&ff(), &err);
+                        }
+                        _ => continue,
+                    },
+                    None => err = hit.ite(&tt(), &err),
+                }
+            }
+        }
         let v = match result_ty {
             CelType::Bool => Sym::Bool(out.as_bool().unwrap()),
             CelType::Int => {
@@ -1284,6 +1343,51 @@ impl Encoder {
         SV { v, err }
     }
 
+    /// `str.indexof` plus lemmas that hold for it (Z3 reasons about string positions
+    /// poorly on its own): a hit is a real occurrence at or after `start`, and none
+    /// starts earlier. Facts about Z3's own function, so sound to assume.
+    fn index_of(&mut self, a: &ZStr, b: &ZStr, start: &ZInt) -> ZInt {
+        let r = zutil::str_index_of(a, b, start);
+        let zero = ZInt::from_i64(0);
+        let found = r.ge(&zero);
+        let occurs = and(&[&a.substr(&r, b.length()).eq(b), &(&r + b.length()).le(a.length()), &r.ge(start)]);
+        // no occurrence starting in [start, r): b is not inside a[start, r + |b| - 1)
+        let first = a.substr(start, &r + b.length() - ZInt::from_i64(1) - start).contains(b).not();
+        let lemma = and(&[&r.ge(ZInt::from_i64(-1)), &found.implies(and(&[&occurs, &or(&[&b.length().eq(&zero), &first])]))]);
+        self.assumptions.push(lemma);
+        if start.as_i64() == Some(0) {
+            self.relate_indexes(a, b, &r, false);
+        }
+        r
+    }
+
+    /// For each haystack/needle pair: found iff `contains`, and the first match is at or
+    /// before the last one (the solver rarely finds this ordering by itself).
+    fn relate_indexes(&mut self, a: &ZStr, b: &ZStr, r: &ZInt, is_last: bool) {
+        let found = r.ge(ZInt::from_i64(0));
+        self.assumptions.push(found.eq(a.contains(b)));
+        for (a2, b2, r2, last2) in &self.index_terms {
+            // hash-consed structural equality: the same terms, not just equal values
+            if *last2 != is_last && PartialEq::eq(a2, a) && PartialEq::eq(b2, b) {
+                let (first, last) = if is_last { (r2, r) } else { (r, r2) };
+                self.assumptions.push(first.le(last));
+            }
+        }
+        self.index_terms.push((a.clone(), b.clone(), r.clone(), is_last));
+    }
+
+    /// `str.lastindexof` plus lemmas: a hit is a real occurrence and none starts later.
+    fn last_index_of(&mut self, a: &ZStr, b: &ZStr) -> ZInt {
+        let r = zutil::str_last_index_of(a, b);
+        let found = r.ge(ZInt::from_i64(0));
+        let occurs = and(&[&a.substr(&r, b.length()).eq(b), &(&r + b.length()).le(a.length())]);
+        let last = a.substr(&r + ZInt::from_i64(1), a.length()).contains(b).not();
+        let lemma = and(&[&r.ge(ZInt::from_i64(-1)), &found.implies(and(&[&occurs, &or(&[&b.length().eq(ZInt::from_i64(0)), &last])]))]);
+        self.assumptions.push(lemma);
+        self.relate_indexes(a, b, &r, true);
+        r
+    }
+
     // --------------------------------------------------------------- witness
 
     /// The concrete value of any symbolic value in a model.
@@ -1307,6 +1411,19 @@ fn default_sym(t: &CelType) -> Option<Sym> {
         CelType::Optional(t) => Sym::Optional { has: ff(), val: Box::new(default_sym(t)?) },
         CelType::List(e) => Sym::List { slots: vec![], elem: (**e).clone(), trunc: false },
         CelType::Map(k, v) => Sym::Map { slots: vec![], key: (**k).clone(), val: (**v).clone(), trunc: false },
+        _ => return None,
+    })
+}
+
+/// A scalar literal as a Z3 term (function tables).
+fn literal_ast(l: &celspresso_syntax::Literal) -> Option<Dynamic> {
+    use celspresso_syntax::Literal as L;
+    Some(match l {
+        L::Bool(b) => Dynamic::from_ast(&Bool::from_bool(*b)),
+        L::Int(i) => Dynamic::from_ast(&Int::from_i64(*i)),
+        L::Uint(u) => Dynamic::from_ast(&Int::from_u64(*u)),
+        L::Double(d) => Dynamic::from_ast(&Float::from_f64(*d)),
+        L::String(s) => Dynamic::from_ast(&zutil::str_lit(s)),
         _ => return None,
     })
 }

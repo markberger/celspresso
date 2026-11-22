@@ -77,6 +77,9 @@ pub struct Contract {
     pub ensures: Option<crate::CheckedExpr>,
     /// The function never fails.
     pub total: bool,
+    /// Every result on a finite input domain (`None` result: the call fails), computed
+    /// by calling the function once per input. Exact on those inputs.
+    pub table: Option<Vec<(Vec<celspresso_syntax::Literal>, Option<celspresso_syntax::Literal>)>>,
 }
 
 /// The type environment the checker resolves against.

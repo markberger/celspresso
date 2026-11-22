@@ -420,22 +420,67 @@ fn run_host(q: Query) -> Outcome {
 }
 
 #[test]
-fn host_functions_are_uninterpreted_and_refined() {
+fn host_functions_are_opaque() {
     // the solver can't see inside risk(), so a universal claim is UNKNOWN, naming it
     match run_host(Query::AlwaysTrue(&c("x < 0 || x > 1000 || risk(x) == 2 * x"))).status {
-        Status::Unknown(r) => assert!(r.contains("risk"), "{r}"),
+        Status::Unknown(r) => assert!(r.contains("'risk'") && r.contains("ensures=") && r.contains("env.define"), "{r}"),
         s => panic!("{s:?}"),
     }
-    // witnesses are refined against the real function until they replay
-    if let Status::Found(w) = run_host(Query::Satisfiable(&c("risk(x) > 10 && x < 100"))).status {
-        assert!(matches!(w["x"], Value::Int(x) if x > 5 && x < 100));
+    // the solver's guess at risk() is never checked against it and retried: one replay,
+    // then UNKNOWN with the same actionable reason
+    match run_host(Query::Satisfiable(&c("risk(x) == 7"))).status {
+        Status::Unknown(r) => assert!(r.contains("'risk'"), "{r}"),
+        s => panic!("{s:?}"),
     }
-    if let Status::Found(w) = run_host(Query::CanError(&c("risk(x) > 0"))).status {
-        assert!(matches!(w["x"], Value::Int(x) if x < 0));
+    // a witness that happens to replay is still real
+    for src in ["risk(x) > 0 || x == 3", "scale(d) == 4.0 || d == 1.0", "size(words(s)) == 2 || s == 'a'"] {
+        let _ = run_host(Query::Satisfiable(&c(src)));
     }
-    let _ = run_host(Query::Satisfiable(&c("scale(d) == 4.0")));
-    let _ = run_host(Query::Satisfiable(&c("size(words(s)) == 2")));
-    let _ = run_host(Query::Satisfiable(&c("risk(int(n)) == 4 && risk(x) == 6")));
+    // deterministic: equal arguments give equal results, with no call needed
+    assert!(matches!(run_host(Query::Satisfiable(&c("risk(x) != risk(x + 0)"))).status, Status::NotFound));
+}
+
+/// `risk` tabulated on -2..=5 with its real values (an error below 0), as Python does it.
+fn tabulated_schema() -> Arc<Schema> {
+    use celspresso_syntax::Literal as L;
+    let mut s = (*schema()).clone();
+    let table = (-2..=5).map(|i| (vec![L::Int(i)], if i < 0 { None } else { Some(L::Int(2 * i)) })).collect();
+    s.contracts.insert(
+        "risk_int".into(),
+        Arc::new(celspresso_check::Contract { params: vec!["x".into()], ensures: None, total: false, table: Some(table) }),
+    );
+    Arc::new(s)
+}
+
+#[test]
+fn tabulated_functions_are_exact_on_their_table() {
+    let s = tabulated_schema();
+    let c = |src: &str| check(celspresso_syntax::parse(src).unwrap(), s.clone()).unwrap();
+    let go = |src: &str, kind: &str| {
+        let e = c(src);
+        let q = match kind {
+            "prove" => Query::AlwaysTrue(&e),
+            "sat" => Query::Satisfiable(&e),
+            _ => Query::CanError(&e),
+        };
+        verify(&q, &[], Options::default(), &Host).status
+    };
+    // on the table: proofs, witnesses and errors are exact
+    assert!(matches!(go("x < 0 || x > 5 || risk(x) == 2 * x", "prove"), Status::NotFound));
+    match go("x >= 0 && x <= 5 && risk(x) == 8", "sat") {
+        Status::Found(w) => assert_eq!(w["x"], Value::Int(4)),
+        st => panic!("{st:?}"),
+    }
+    assert!(matches!(go("x >= 0 && x <= 5 && risk(x) == 7", "sat"), Status::NotFound));
+    match go("x >= -2 && x <= 5 && risk(x) > 0", "error") {
+        Status::Found(w) => assert!(matches!(w["x"], Value::Int(-2 | -1)), "{w:?}"),
+        st => panic!("{st:?}"),
+    }
+    // off the table it is opaque again, and the reason says so
+    match go("x < 0 || risk(x) == 2 * x", "prove") {
+        Status::Unknown(r) => assert!(r.contains("outside its tabulated inputs"), "{r}"),
+        st => panic!("{st:?}"),
+    }
 }
 
 #[test]
@@ -495,4 +540,65 @@ fn bounds_of_numeric_expressions() {
     assert!(!r.max.unwrap().sound && r.reason.unwrap().contains("unroll"));
     assert!(b("s").reason.unwrap().contains("integer-valued"));
     assert!(b("1 / 0").reason.unwrap().contains("errors on every"));
+}
+
+#[test]
+fn index_of_matches_the_evaluator() {
+    let cases = [
+        "'hello world'.indexOf('o')",
+        "'hello world'.indexOf('o', 5)",
+        "'hello'.indexOf('z')",
+        "'hello'.indexOf('')",
+        "'hello'.indexOf('', 5)",
+        "'hello'.indexOf('lo', 4)",
+        "'ab'.indexOf('abc')",
+        "'héllo wörld'.indexOf('l')",
+        "'héllo wörld'.indexOf('ö')",
+        "'hello world'.lastIndexOf('o')",
+        "'hello world'.lastIndexOf('o', 6)",
+        "'hello world'.lastIndexOf('o', 7)",
+        "'hello'.lastIndexOf('')",
+        "'hello'.lastIndexOf('', 2)",
+        "'hello'.lastIndexOf('l', 0)",
+        "'aaa'.lastIndexOf('aa')",
+        "'aaa'.lastIndexOf('aa', 0)",
+        "'ab'.lastIndexOf('abc')",
+        "'héllo'.lastIndexOf('l', 3)",
+        "size('héllo wörld'.substring(2, 8))",
+        "'héllo wörld'.substring(7).indexOf('r')",
+        "'abc'.substring(3).size()",
+        "'héllo'.charAt(1).size() + 'héllo'.charAt(5).size() * 10",
+        "'héllo'.indexOf('héllo'.charAt(4))",
+    ];
+    for src in cases {
+        let want = celspresso_eval::evaluate(&c(src), &BTreeMap::new(), &NoFunctions, celspresso_eval::Limits::default());
+        let Ok(Value::Int(n)) = want else { panic!("{src}: {want:?}") };
+        exact(&format!("{src} == {n}"));
+    }
+    exact("'héllo wörld'.substring(1, 4) == 'éll' && 'abc'.substring(1) == 'bc' && 'abc'.substring(2, 2) == ''");
+    for src in [
+        "'abc'.charAt(4) == ''",
+        "'abc'.charAt(-1) == ''",
+        "'abc'.substring(2, 1) == ''",
+        "'abc'.substring(4) == ''",
+        "'abc'.substring(0, 4) == ''",
+        "'abc'.substring(-1) == ''",
+    ] {
+        assert!(matches!(run(Query::CanError(&c(src))).status, Status::Found(_)), "{src}");
+    }
+    for src in ["'hello'.indexOf('l', 6) == 0", "'hello'.indexOf('l', -1) == 0", "'hello'.lastIndexOf('l', 6) == 0"] {
+        assert!(matches!(run(Query::CanError(&c(src))).status, Status::Found(_)), "{src}");
+    }
+    // symbolic: a found index really is an occurrence, and the first one
+    exact("s.indexOf('@') == -1 || s.charAt(s.indexOf('@')) == '@'");
+    exact("s.indexOf('@') < 0 || !s.substring(0, s.indexOf('@')).contains('@')");
+    exact("!s.contains('-') || s.substring(0, s.indexOf('-')).size() < s.size()");
+    exact("(s.indexOf('ab') >= 0) == s.contains('ab')");
+    exact("s.lastIndexOf('a') >= s.indexOf('a')");
+    exact("(s.lastIndexOf('x') == -1) == (s.indexOf('x') == -1)");
+    let w = sat("s.substring(0, s.indexOf('-')) == 'CPT' && s.size() == 9");
+    assert!(matches!(&w["s"], Value::String(v) if v.starts_with("CPT-") && v.chars().count() == 9));
+    let w = sat("s.indexOf('@') > 2 && s.endsWith('.com') && size(s) < 10");
+    assert!(matches!(&w["s"], Value::String(v) if v.find('@').is_some_and(|i| v[..i].chars().count() > 2) && v.ends_with(".com")));
+    assert!(matches!(run(Query::CanError(&c("s.indexOf('x', x) >= 0"))).status, Status::Found(_)));
 }
