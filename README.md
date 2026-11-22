@@ -185,7 +185,7 @@ A Rust core parses, checks and evaluates CEL, and encodes its exact semantics in
 
 ## More
 
-- **Types:** Pydantic models, dataclasses, `Optional`, lists, maps, `date`, timezone-aware `datetime` and `timedelta`. Store money as integer cents; `Decimal` is rejected.
+- **Types:** Pydantic models, dataclasses, `Optional`, lists, maps, `date`, timezone-aware `datetime` and `timedelta`. Store money as integer cents; `Decimal` is rejected. Types without a Python class (an ORM's models, a historical schema, two versions of one model) can be declared directly with `celspresso.schema`: `Env(structs=[Struct("Order", [Field("total", T.int, Constraints(ge=0))])], order=T.struct("Order"))`.
 - **`None` is `null`:** an `Optional` field holding `None` is `null` in CEL, and `has(m.f)` is false for it. Guard with `has(m.note) && m.note.startsWith('x')` or `m.note != null && ...`. Calling a method on `null` is an evaluation error.
 - **Extensions:** strings, math, lists, sets, base64, optionals, `cel.bind`, `cel.block` and the Kubernetes network library.
 - **Your own building blocks:** `env.define(...)` for named sub-expressions, `env.table(...)` for lookup tables and `@function` for Python functions. The prover never runs your Python while it solves. Each function is handled in one of three ways:

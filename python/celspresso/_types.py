@@ -9,9 +9,11 @@ import enum
 import sys
 import types
 import typing
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from typing import Any, Union, get_args, get_origin
+
+from .schema import Struct, TypeRef
 
 TypeSpec = Any  # "int" | ("list", TypeSpec) | ("nullable", TypeSpec) | ("struct", name) | ...
 
@@ -80,6 +82,36 @@ class SchemaBuilder:
 
     # -- public -----------------------------------------------------------
 
+    def declare(self, structs: Iterable[Struct]) -> None:
+        """Add `schema.Struct` declarations. Redeclaring a name is fine if the definition
+        is identical; a different struct (or a class) under the same name is an error."""
+        new = list(structs)
+        for st in new:
+            if not isinstance(st, Struct):
+                raise TypeError(f"structs=[...] expects celspresso.schema.Struct values, got {st!r}")
+            spec = st._spec()
+            if st.name in self.structs:
+                if st.name in self.classes:
+                    raise ValueError(
+                        f"struct name '{st.name}' is already used by class {self.classes[st.name]!r}"
+                    )
+                if self.structs[st.name] != spec:
+                    raise ValueError(f"struct '{st.name}' is already declared with different fields")
+            self.structs[st.name] = spec
+        for st in new:
+            for f in st.fields:
+                self._check_refs(f.type.spec, f"{st.name}.{f.name}")
+
+    def _check_refs(self, spec: TypeSpec, where: str) -> None:
+        if isinstance(spec, str):
+            return
+        if spec[0] == "struct":
+            if spec[1] not in self.structs:
+                raise TypeError(f"{where}: unknown struct '{spec[1]}'; declare it with structs=[Struct(...)]")
+            return
+        for inner in spec[1:]:
+            self._check_refs(inner, where)
+
     def convert(self, tp: Any, where: str) -> tuple[TypeSpec, dict[str, Any] | None]:
         """Return (type spec, constraints) for a Python annotation."""
         cons: dict[str, Any] = {}
@@ -100,7 +132,7 @@ class SchemaBuilder:
         n = 2
         while True:
             for name in candidates:
-                if name not in self.classes:
+                if name not in self.structs:  # taken by a class or a declared Struct
                     return name
             candidates = [f"{qualified}#{n}"]
             n += 1
@@ -144,6 +176,9 @@ class SchemaBuilder:
             ) from None
 
     def _convert(self, tp: Any, cons: dict[str, Any], where: str) -> TypeSpec:
+        if isinstance(tp, TypeRef):
+            self._check_refs(tp.spec, where)
+            return tp.spec
         if isinstance(tp, str) and tp in _CEL_NAMES:
             return tp
         if tp in _SCALARS:

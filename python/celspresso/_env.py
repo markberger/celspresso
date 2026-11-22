@@ -12,6 +12,7 @@ from . import _celspresso as _core
 from ._errors import CelError, CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
 from ._types import SchemaBuilder, TypeSpec, cel_literal, from_cel, type_name
 from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness, lookup
+from .schema import Struct, TypeRef
 
 __all__ = ["Env", "Explanation", "Expr", "Predicate", "Problem", "RuleCheck", "function"]
 
@@ -36,6 +37,13 @@ def _check_options(timeout: Any, unroll_limit: Any, schema_constraints: Any) -> 
         raise _option_clash("unroll_limit", unroll_limit)
     if schema_constraints is not None and not isinstance(schema_constraints, bool):
         raise _option_clash("schema_constraints", schema_constraints)
+
+
+def _structs(structs: Any) -> list[Struct]:
+    """The `structs=` option, which a variable named 'structs' would collide with."""
+    if isinstance(structs, (str, type, Struct, TypeRef)) or not isinstance(structs, Iterable):
+        raise _option_clash("structs", structs)
+    return list(structs)
 
 
 def _merge_variables(positional: Mapping[str, Any] | None, keywords: dict[str, Any]) -> dict[str, Any]:
@@ -148,7 +156,7 @@ class Env:
     True
 
     Variables are keyword arguments, or a mapping when a name collides with an option
-    (`timeout`, `unroll_limit`, `schema_constraints`) or is not a Python keyword-safe name:
+    (`timeout`, `unroll_limit`, `structs`, ...) or is not a Python keyword-safe name:
 
     >>> Env({"timeout": int}, timeout=2.0).variables
     {'timeout': 'int'}
@@ -164,6 +172,7 @@ class Env:
         schema_constraints: bool = True,
         debug_sample_proofs: int = 0,
         limits: Limits | None = None,
+        structs: Iterable[Struct] = (),
         **more_variables: Any,
     ) -> None:
         _check_options(timeout, unroll_limit, schema_constraints)
@@ -186,6 +195,7 @@ class Env:
         self._fns: dict[str, _Fn] = {}
         self._defs: tuple[_Def, ...] = ()
         self._assumptions: tuple[str, ...] = ()
+        self._builder.declare(_structs(structs))
         for n, tp in variables.items():
             self._vars[n] = self._builder.convert(tp, n)
         self._build()
@@ -246,6 +256,7 @@ class Env:
         assumptions: Iterable[str | Predicate] = (),
         timeout: float | None = None,
         unroll_limit: int | None = None,
+        structs: Iterable[Struct] = (),
         **more_variables: Any,
     ) -> Env:
         """Return a new Env with more variables, functions, or standing assumptions.
@@ -265,6 +276,7 @@ class Env:
                 raise TypeError(f"functions=[...] expects plain callables, got {f!r}")
         variables = _merge_variables(variables, more_variables)
         e = self._clone()
+        e._builder.declare(_structs(structs))
         for n, tp in variables.items():
             if n in e._vars:
                 raise ValueError(f"variable '{n}' is already declared")
