@@ -358,6 +358,9 @@ impl Encoder {
                 }
                 SV { v: Sym::Struct { name: type_name.clone(), fields: out }, err: or(&errs.iter().collect::<Vec<_>>()) }
             }
+            ExprKind::Comprehension(comp) if comp.iter_var2.is_some() => {
+                self.approx(c, e, "two-variable comprehensions are not yet modeled")
+            }
             ExprKind::Comprehension(comp) => {
                 let range = self.enc(c, &comp.iter_range);
                 let Sym::List { slots, trunc, .. } = range.v.clone() else {
@@ -391,6 +394,16 @@ impl Encoder {
                 self.locals.truncate(accu_idx);
                 res.err = or(&[&res.err, &range.err]);
                 res
+            }
+            ExprKind::Call { function, .. }
+                if is_optional_op(function)
+                    || c.overload(e.id).is_some_and(|o| o.starts_with("optional_"))
+                    || matches!(c.type_of(e.id), CelType::Optional(_)) =>
+            {
+                self.approx(c, e, "optional values are not yet modeled")
+            }
+            ExprKind::Call { function, .. } if matches!(c.type_of(e.id), CelType::Opaque(_)) => {
+                self.approx(c, e, format!("'{function}' returns an extension type the verifier does not model"))
             }
             ExprKind::Call { target, function, args } => self.call(c, e, target.as_deref(), function, args),
         }
@@ -692,15 +705,15 @@ impl Encoder {
                 Sym::Bool(b) => (Dynamic::from_ast(b), Sort::bool()),
                 Sym::Int(i) | Sym::Uint(i) | Sym::Date(i) => (Dynamic::from_ast(i), Sort::int()),
                 Sym::Str(s) => (Dynamic::from_ast(s), Sort::string()),
-                _ => return self.approx(c, e, format!("custom function '{function}' with structured arguments")),
+                _ => return self.approx(c, e, format!("function '{function}' with structured arguments")),
             };
             arg_asts.push(d);
             sorts.push(s);
         }
         let Some(rsort) = sort_of(&result_ty) else {
-            return self.approx(c, e, format!("custom function '{function}' returning {result_ty}"));
+            return self.approx(c, e, format!("function '{function}' returning {result_ty}"));
         };
-        self.approximations.insert(format!("custom function '{function}' is uninterpreted"));
+        self.approximations.insert(format!("function '{function}' is uninterpreted"));
         let known = self.func_overloads.entry(function.to_string()).or_default();
         if !known.iter().any(|(o, _)| *o == overload) {
             known.push((overload.clone(), args.len()));
@@ -809,4 +822,9 @@ fn value_of(model: &Model, s: &Sym) -> Value {
             _ => Value::Null,
         },
     }
+}
+
+fn is_optional_op(function: &str) -> bool {
+    use celspresso_syntax::ast::ops;
+    matches!(function, ops::OPT_SELECT | ops::OPT_INDEX | ops::OPT_ENTRY)
 }

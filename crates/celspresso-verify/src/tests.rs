@@ -182,3 +182,28 @@ fn vacuous_assumptions_are_unknown() {
     let o = verify(&Query::AlwaysTrue(&p), &[&a1], Options::default(), &NoFunctions);
     assert!(matches!(o.status, Status::NotFound));
 }
+
+#[test]
+fn variables_hidden_by_approximations_never_fake_a_counterexample() {
+    // `s` and `user` appear only under approximated optionals, so the solver's model
+    // omits them; an unbound variable must not be read as "the predicate failed"
+    for src in ["optional.of(s).hasValue()", "optional.of(user).hasValue()", "optional.of(s).orValue('') == s"] {
+        match run(Query::AlwaysTrue(&c(src))).status {
+            Status::Unknown(_) => {}
+            s => panic!("{src}: expected UNKNOWN, got {s:?}"),
+        }
+    }
+    // any counterexample that is reported must carry every variable and replay
+    if let Status::Found(w) = run(Query::AlwaysTrue(&c("optional.of(s).hasValue() && x > 0"))).status {
+        assert!(w.contains_key("s") && w.contains_key("x"));
+    }
+}
+
+#[test]
+fn block_and_two_variable_macros() {
+    proved("cel.block([s + 'x', size(cel.index(0))], cel.index(1) > 0)");
+    match run(Query::AlwaysTrue(&c("xs.all(i, v, v > i)"))).status {
+        Status::Unknown(_) | Status::Found(_) => {}
+        s => panic!("two-variable comprehensions must not be PROVED: {s:?}"),
+    }
+}

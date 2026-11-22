@@ -90,6 +90,12 @@ impl Parser {
     fn mk(&mut self, span: Span, kind: ExprKind) -> Expr {
         Expr { id: self.id(), span, kind }
     }
+    /// A copy of `e` with fresh ids, for macros that repeat a subexpression.
+    fn renumber(&mut self, e: &Expr) -> Expr {
+        let mut e = e.clone();
+        e.walk_mut(&mut |n| n.id = self.id());
+        e
+    }
     fn call(&mut self, span: Span, function: &str, args: Vec<Expr>) -> Expr {
         self.mk(span, ExprKind::Call { target: None, function: function.to_string(), args })
     }
@@ -239,10 +245,14 @@ impl Parser {
         let mut e = self.primary()?;
         loop {
             match self.peek() {
+                Tok::Dot if matches!(self.tokens.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Question)) => {
+                    e = self.opt_select(e)?;
+                }
                 Tok::Dot => {
                     self.advance();
-                    let (name, nspan) = self.ident("field or method name")?;
-                    if self.peek() == &Tok::LParen {
+                    let quoted = matches!(self.peek(), Tok::QuotedIdent(_));
+                    let (name, nspan) = self.member_name()?;
+                    if self.peek() == &Tok::LParen && !quoted {
                         self.advance();
                         let args = self.expr_list(Tok::RParen)?;
                         let end = self.expect(Tok::RParen, "')'")?;
@@ -255,10 +265,11 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.advance();
+                    let optional = self.eat(&Tok::Question);
                     let idx = self.expr()?;
                     let end = self.expect(Tok::RBracket, "']'")?;
                     let span = e.span.to(end);
-                    e = self.call(span, ops::INDEX, vec![e, idx]);
+                    e = self.call(span, if optional { ops::OPT_INDEX } else { ops::INDEX }, vec![e, idx]);
                 }
                 Tok::LBrace if qualified_name(&e).is_some() => {
                     let type_name = qualified_name(&e).unwrap();
@@ -288,7 +299,22 @@ impl Parser {
                 let t = self.advance();
                 Ok((s, t.span))
             }
+            Tok::Reserved(w) => {
+                let span = self.advance().span;
+                Err(SyntaxError { message: format!("reserved identifier '{w}'"), span })
+            }
             _ => Err(self.unexpected(what)),
+        }
+    }
+
+    /// The name after `.`: identifiers, reserved words and backtick-quoted names are all allowed.
+    fn member_name(&mut self) -> Result<(String, Span), SyntaxError> {
+        match self.peek().clone() {
+            Tok::Ident(s) | Tok::Reserved(s) | Tok::QuotedIdent(s) => {
+                let t = self.advance();
+                Ok((s, t.span))
+            }
+            _ => Err(self.unexpected("field or method name")),
         }
     }
 
@@ -327,22 +353,33 @@ impl Parser {
                 self.ident_or_call(format!(".{name}"), span.to(nspan))
             }
             Tok::Ident(name) => self.ident_or_call(name, span),
+            Tok::Reserved(w) => Err(SyntaxError { message: format!("reserved identifier '{w}'"), span }),
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(Tok::RParen, "')'")?;
                 Ok(e)
             }
             Tok::LBracket => {
-                let items = self.expr_list(Tok::RBracket)?;
+                let mut items = Vec::new();
+                while self.peek() != &Tok::RBracket {
+                    items.push(self.maybe_optional_entry()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
                 let end = self.expect(Tok::RBracket, "']'")?;
                 Ok(self.mk(span.to(end), ExprKind::List(items)))
             }
             Tok::LBrace => {
                 let mut entries = Vec::new();
                 while self.peek() != &Tok::RBrace {
+                    let optional = self.eat(&Tok::Question);
                     let k = self.expr()?;
                     self.expect(Tok::Colon, "':'")?;
-                    let v = self.expr()?;
+                    let mut v = self.expr()?;
+                    if optional {
+                        v = self.call(v.span, ops::OPT_ENTRY, vec![v]);
+                    }
                     entries.push((k, v));
                     if !self.eat(&Tok::Comma) {
                         break;
@@ -386,29 +423,71 @@ impl Parser {
         }
     }
 
+    /// `e.?field` (the `.` is the current token).
+    #[inline(never)]
+    fn opt_select(&mut self, e: Expr) -> PResult {
+        self.advance();
+        self.advance();
+        let (name, nspan) = self.member_name()?;
+        let span = e.span.to(nspan);
+        let field = self.mk(nspan, ExprKind::Literal(Literal::String(name)));
+        Ok(self.call(span, ops::OPT_SELECT, vec![e, field]))
+    }
+
+    /// A list element, possibly marked optional with a leading `?`.
+    fn maybe_optional_entry(&mut self) -> PResult {
+        let optional = self.eat(&Tok::Question);
+        let e = self.expr()?;
+        Ok(if optional { self.call(e.span, ops::OPT_ENTRY, vec![e]) } else { e })
+    }
+
     fn receiver_call(&mut self, span: Span, target: Expr, name: String, args: Vec<Expr>) -> PResult {
-        let is_macro = matches!(
-            (name.as_str(), args.len()),
-            ("all", 2) | ("exists", 2) | ("exists_one", 2) | ("existsOne", 2) | ("map", 2) | ("map", 3) | ("filter", 2)
-        );
-        if !is_macro {
-            return Ok(self.mk(span, ExprKind::Call { target: Some(Box::new(target)), function: name, args }));
+        if (name == "optMap" || name == "optFlatMap") && args.len() == 2 {
+            return self.opt_map_macro(span, target, &name, args);
         }
-        let iter_var = match &args[0].kind {
-            ExprKind::Ident(v) => v.clone(),
-            _ => {
-                return Err(SyntaxError {
-                    message: format!("argument to {name}() must be a simple identifier"),
-                    span: args[0].span,
-                })
+        if matches!(&target.kind, ExprKind::Ident(n) if n == "cel") {
+            match (name.as_str(), args.len()) {
+                ("bind", 3) => return self.bind_macro(span, args),
+                ("block", 2) => return self.block_macro(span, args),
+                ("index", 1) | ("iterVar" | "accuVar", 2) => return self.block_var(span, &name, &args),
+                _ => {}
             }
-        };
-        if iter_var == ACCU_VAR {
-            return Err(SyntaxError { message: "iteration variable overwrites accumulator variable".into(), span: args[0].span });
         }
-        let mut args = args.into_iter().skip(1);
+        if name == "sortBy" && args.len() == 2 {
+            // xs.sortBy(e, key) => @sortByAssociatedKeys(xs, xs.map(e, key))
+            let copy = self.renumber(&target);
+            let keys = self.receiver_call(span, copy, "map".into(), args)?;
+            return Ok(self.call(span, "@sortByAssociatedKeys", vec![target, keys]));
+        }
+        // (macro, number of iteration variables) for every receiver-style macro
+        let vars = match (name.as_str(), args.len()) {
+            ("all" | "exists" | "exists_one" | "existsOne" | "filter", 2) | ("map", 2 | 3) => 1,
+            ("all" | "exists" | "exists_one" | "existsOne", 3) => 2,
+            ("transformList" | "transformMap" | "transformMapEntry", 3 | 4) => 2,
+            _ => return Ok(self.mk(span, ExprKind::Call { target: Some(Box::new(target)), function: name, args })),
+        };
+        let mut names = Vec::new();
+        for a in &args[..vars] {
+            match &a.kind {
+                ExprKind::Ident(v) if v == ACCU_VAR => {
+                    return Err(SyntaxError { message: "iteration variable overwrites accumulator variable".into(), span: a.span })
+                }
+                ExprKind::Ident(v) => names.push(v.clone()),
+                _ => {
+                    return Err(SyntaxError { message: format!("argument to {name}() must be a simple identifier"), span: a.span })
+                }
+            }
+        }
+        if vars == 2 && names[0] == names[1] {
+            return Err(SyntaxError { message: format!("duplicate variable name '{}' in {name}()", names[0]), span: args[1].span });
+        }
+        let iter_var = names[0].clone();
+        let iter_var2 = names.get(1).cloned();
+        let mut args = args.into_iter().skip(vars);
         let accu = |p: &mut Self| p.mk(span, ExprKind::Ident(ACCU_VAR.to_string()));
         let lit = |p: &mut Self, l: Literal| p.mk(span, ExprKind::Literal(l));
+        // value bound to the element: the single variable, or the second of two
+        let elem_var = iter_var2.clone().unwrap_or_else(|| iter_var.clone());
         let (init, cond, step, result) = match name.as_str() {
             "all" => {
                 let pred = args.next().unwrap();
@@ -443,23 +522,33 @@ impl Parser {
                 let result = self.call(span, ops::EQUALS, vec![a, one]);
                 (init, cond, step, result)
             }
-            "map" => {
+            "map" | "transformList" | "transformMap" | "transformMapEntry" => {
                 let first = args.next().unwrap();
                 let (filter, transform) = match args.next() {
                     Some(t) => (Some(first), t),
                     None => (None, first),
                 };
-                let init = self.mk(span, ExprKind::List(vec![]));
+                let to_map = name != "map" && name != "transformList";
+                let init = self.mk(span, if to_map { ExprKind::Map(vec![]) } else { ExprKind::List(vec![]) });
                 let cond = lit(self, Literal::Bool(true));
                 let a = accu(self);
-                let single = self.mk(transform.span, ExprKind::List(vec![transform]));
-                let appended = self.call(span, ops::ADD, vec![a, single]);
+                let updated = match name.as_str() {
+                    "transformMap" => {
+                        let k = self.mk(span, ExprKind::Ident(iter_var.clone()));
+                        self.call(span, ops::MAP_INSERT, vec![a, k, transform])
+                    }
+                    "transformMapEntry" => self.call(span, ops::MAP_INSERT, vec![a, transform]),
+                    _ => {
+                        let single = self.mk(transform.span, ExprKind::List(vec![transform]));
+                        self.call(span, ops::ADD, vec![a, single])
+                    }
+                };
                 let step = match filter {
                     Some(f) => {
                         let a = accu(self);
-                        self.call(span, ops::CONDITIONAL, vec![f, appended, a])
+                        self.call(span, ops::CONDITIONAL, vec![f, updated, a])
                     }
-                    None => appended,
+                    None => updated,
                 };
                 (init, cond, step, accu(self))
             }
@@ -468,7 +557,7 @@ impl Parser {
                 let init = self.mk(span, ExprKind::List(vec![]));
                 let cond = lit(self, Literal::Bool(true));
                 let a = accu(self);
-                let x = self.mk(span, ExprKind::Ident(iter_var.clone()));
+                let x = self.mk(span, ExprKind::Ident(elem_var));
                 let single = self.mk(span, ExprKind::List(vec![x]));
                 let appended = self.call(span, ops::ADD, vec![a, single]);
                 let a = accu(self);
@@ -482,6 +571,7 @@ impl Parser {
             span,
             ExprKind::Comprehension(Box::new(Comprehension {
                 iter_var,
+                iter_var2,
                 iter_range: target,
                 accu_var: ACCU_VAR.to_string(),
                 accu_init: init,
@@ -491,6 +581,100 @@ impl Parser {
                 macro_name,
             })),
         ))
+    }
+}
+
+impl Parser {
+    /// `cel.bind(x, init, body)`: evaluate `body` with `x` bound to `init`. Expands to a
+    /// comprehension over an empty list whose accumulator is `x`.
+    fn bind_macro(&mut self, span: Span, args: Vec<Expr>) -> PResult {
+        let mut args = args.into_iter();
+        let var = args.next().unwrap();
+        let ExprKind::Ident(name) = &var.kind else {
+            return Err(SyntaxError { message: "cel.bind() variable must be a simple identifier".into(), span: var.span });
+        };
+        let name = name.clone();
+        let (init, body) = (args.next().unwrap(), args.next().unwrap());
+        Ok(self.bind(span, name, init, body, "cel.bind"))
+    }
+
+    /// `cel.index(i)`, `cel.iterVar(i, j)`, `cel.accuVar(i, j)`: the slot and loop variables
+    /// of `cel.block`, as identifiers user code cannot spell (`@index0`, `@it:0:0`, `@ac:0:0`).
+    fn block_var(&mut self, span: Span, name: &str, args: &[Expr]) -> PResult {
+        let mut nums = Vec::new();
+        for a in args {
+            match &a.kind {
+                ExprKind::Literal(Literal::Int(i)) if *i >= 0 => nums.push(*i),
+                _ => return Err(SyntaxError { message: format!("cel.{name}() requires non-negative integer literals"), span: a.span }),
+            }
+        }
+        let ident = match (name, nums.as_slice()) {
+            ("index", [i]) => format!("{BLOCK_INDEX}{i}"),
+            ("iterVar", [i, j]) => format!("{BLOCK_ITER}{i}:{j}"),
+            (_, [i, j]) => format!("{BLOCK_ACCU}{i}:{j}"),
+            _ => unreachable!(),
+        };
+        Ok(self.mk(span, ExprKind::Ident(ident)))
+    }
+
+    /// `cel.block([e0, e1, ...], body)`: each slot `cel.index(i)` is bound to `ei` (which may
+    /// refer to earlier slots), as nested binds.
+    fn block_macro(&mut self, span: Span, args: Vec<Expr>) -> PResult {
+        let mut args = args.into_iter();
+        let slots = args.next().unwrap();
+        let body = args.next().unwrap();
+        let ExprKind::List(items) = slots.kind else {
+            return Err(SyntaxError { message: "cel.block() requires a list literal of slots".into(), span: slots.span });
+        };
+        let mut out = body;
+        for (i, init) in items.into_iter().enumerate().rev() {
+            out = self.bind(span, format!("{BLOCK_INDEX}{i}"), init, out, "cel.block");
+        }
+        Ok(out)
+    }
+
+    /// `opt.optMap(x, e)` => `opt.hasValue() ? optional.of(bind(x, opt.value(), e)) : optional.none()`;
+    /// `optFlatMap` is the same without the `optional.of` wrapper.
+    fn opt_map_macro(&mut self, span: Span, target: Expr, name: &str, args: Vec<Expr>) -> PResult {
+        let mut args = args.into_iter();
+        let var = args.next().unwrap();
+        let ExprKind::Ident(var_name) = &var.kind else {
+            return Err(SyntaxError { message: format!("{name}() variable name must be a simple identifier"), span: var.span });
+        };
+        let var_name = var_name.clone();
+        let body = args.next().unwrap();
+        let mk_call = |p: &mut Self, t: &Expr, f: &str| {
+            let t = p.renumber(t);
+            p.mk(span, ExprKind::Call { target: Some(Box::new(t)), function: f.into(), args: vec![] })
+        };
+        let has = mk_call(self, &target, "hasValue");
+        let value = mk_call(self, &target, "value");
+        let mut then = self.bind(span, var_name, value, body, name);
+        if name == "optMap" {
+            then = self.call(span, "optional.of", vec![then]);
+        }
+        let none = self.call(span, "optional.none", vec![]);
+        Ok(self.call(span, ops::CONDITIONAL, vec![has, then, none]))
+    }
+
+    fn bind(&mut self, span: Span, name: String, init: Expr, body: Expr, macro_name: &str) -> Expr {
+        let range = self.mk(span, ExprKind::List(vec![]));
+        let cond = self.mk(span, ExprKind::Literal(Literal::Bool(false)));
+        let step = self.mk(span, ExprKind::Ident(name.clone()));
+        self.mk(
+            span,
+            ExprKind::Comprehension(Box::new(Comprehension {
+                iter_var: "#unused".into(),
+                iter_var2: None,
+                iter_range: range,
+                accu_var: name,
+                accu_init: init,
+                loop_condition: cond,
+                loop_step: step,
+                result: body,
+                macro_name: macro_name.into(),
+            })),
+        )
     }
 }
 

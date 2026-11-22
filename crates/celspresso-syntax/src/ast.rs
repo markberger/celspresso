@@ -61,6 +61,10 @@ pub enum ExprKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Comprehension {
     pub iter_var: String,
+    /// Second variable of two-variable macros: `list.all(i, v, ...)` binds index and
+    /// element; `map.all(k, v, ...)` binds key and value. When set, `iter_var` is the
+    /// index/key and `iter_var2` the element/value.
+    pub iter_var2: Option<String>,
     pub iter_range: Expr,
     pub accu_var: String,
     pub accu_init: Expr,
@@ -72,6 +76,11 @@ pub struct Comprehension {
 }
 
 pub const ACCU_VAR: &str = "@result";
+
+/// Identifier prefixes for `cel.block` slots and loop variables (see the parser).
+pub const BLOCK_INDEX: &str = "@index";
+pub const BLOCK_ITER: &str = "@it:";
+pub const BLOCK_ACCU: &str = "@ac:";
 
 /// Operator function names.
 pub mod ops {
@@ -94,6 +103,16 @@ pub mod ops {
     pub const INDEX: &str = "_[_]";
     pub const IN: &str = "@in";
     pub const NOT_STRICTLY_FALSE: &str = "@not_strictly_false";
+    /// Internal: `@mapInsert(m, k, v)` adds one entry; `@mapInsert(m, other)` merges a
+    /// map. Fails on a duplicate key. Used by `transformMap` / `transformMapEntry`.
+    pub const MAP_INSERT: &str = "@mapInsert";
+    /// `x.?field`: `_?._(x, "field")`, an optional of the field when present.
+    pub const OPT_SELECT: &str = "_?._";
+    /// `x[?key]`: an optional of the element when present.
+    pub const OPT_INDEX: &str = "_[?_]";
+    /// Marks an optional element `[?e]` or entry value `{k: ?v}` / `{?k: v}` in a literal:
+    /// the element is included only when the optional `e` has a value.
+    pub const OPT_ENTRY: &str = "@optEntry";
 }
 
 impl Expr {
@@ -125,6 +144,36 @@ impl Expr {
                 c.loop_condition.walk(f);
                 c.loop_step.walk(f);
                 c.result.walk(f);
+            }
+        }
+    }
+
+    /// Visit every node mutably, pre-order.
+    pub fn walk_mut(&mut self, f: &mut impl FnMut(&mut Expr)) {
+        f(self);
+        match &mut self.kind {
+            ExprKind::Literal(_) | ExprKind::Ident(_) => {}
+            ExprKind::Select { operand, .. } => operand.walk_mut(f),
+            ExprKind::Call { target, args, .. } => {
+                if let Some(t) = target {
+                    t.walk_mut(f);
+                }
+                args.iter_mut().for_each(|a| a.walk_mut(f));
+            }
+            ExprKind::List(items) => items.iter_mut().for_each(|e| e.walk_mut(f)),
+            ExprKind::Map(entries) => {
+                for (k, v) in entries {
+                    k.walk_mut(f);
+                    v.walk_mut(f);
+                }
+            }
+            ExprKind::Struct { fields, .. } => fields.iter_mut().for_each(|(_, v)| v.walk_mut(f)),
+            ExprKind::Comprehension(c) => {
+                c.iter_range.walk_mut(f);
+                c.accu_init.walk_mut(f);
+                c.loop_condition.walk_mut(f);
+                c.loop_step.walk_mut(f);
+                c.result.walk_mut(f);
             }
         }
     }

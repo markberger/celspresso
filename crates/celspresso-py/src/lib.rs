@@ -5,7 +5,7 @@ use celspresso_check::{
     check, expand_definitions, CelType, CheckedExpr, Constraints, FieldDecl, FunctionDecl, Overload, Schema,
     StructDecl, VarDecl,
 };
-use celspresso_eval::{date, evaluate, evaluate_traced, Functions, Key, Limits, StructValue, Value};
+use celspresso_eval::{date, evaluate, time, evaluate_traced, Functions, Key, Limits, StructValue, Value};
 use celspresso_syntax::{parse, render_diagnostic, unparse, Expr, Literal, Span};
 use celspresso_verify::{verify as run_verify, ErrorMode, Options, Query, Status};
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
@@ -31,6 +31,8 @@ fn type_from_py(obj: &Bound<'_, PyAny>) -> PyResult<CelType> {
             "bytes" => CelType::Bytes,
             "null" => CelType::Null,
             "date" => CelType::Date,
+            "timestamp" => CelType::Timestamp,
+            "duration" => CelType::Duration,
             "dyn" => CelType::Dyn,
             other => return Err(PyValueError::new_err(format!("unknown CEL type '{other}'"))),
         });
@@ -57,6 +59,8 @@ fn type_to_py<'py>(py: Python<'py>, t: &CelType) -> PyResult<Bound<'py, PyAny>> 
         CelType::Bytes => s("bytes"),
         CelType::Null => s("null"),
         CelType::Date => s("date"),
+        CelType::Timestamp => s("timestamp"),
+        CelType::Duration => s("duration"),
         CelType::List(e) => ("list", type_to_py(py, e)?).into_bound_py_any(py),
         CelType::Map(k, v) => ("map", type_to_py(py, k)?, type_to_py(py, v)?).into_bound_py_any(py),
         CelType::Nullable(e) => ("nullable", type_to_py(py, e)?).into_bound_py_any(py),
@@ -121,7 +125,16 @@ fn date_class<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 
 fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
     Ok(match v {
-        Value::Null => py.None().into_bound(py),
+        // an absent optional is None, a present one its value
+        Value::Null | Value::Optional(None) => py.None().into_bound(py),
+        Value::Optional(Some(x)) => value_to_py(py, x)?,
+        // ipaddress.IPv4Address / IPv6Address, and IPv4Interface / IPv6Interface for CIDRs
+        // (an interface keeps the host bits that cidr('10.0.0.1/8') was written with)
+        Value::Net(n) => {
+            let ipaddress = py.import("ipaddress")?;
+            let ctor = if matches!(**n, celspresso_eval::net::Net::Ip(_)) { "ip_address" } else { "ip_interface" };
+            ipaddress.getattr(ctor)?.call1((n.to_string(),))?
+        }
         Value::Bool(b) => b.into_bound_py_any(py)?,
         Value::Int(i) => i.into_bound_py_any(py)?,
         Value::Uint(u) => u.into_bound_py_any(py)?,
@@ -132,6 +145,14 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             let (y, m, dd) = date::civil_from_days(*d);
             date_class(py)?.call1((y, m, dd))?
         }
+        Value::Timestamp(ns) => {
+            // aware UTC datetime; Python has microsecond precision
+            let dt = py.import("datetime")?;
+            let epoch = dt.getattr("datetime")?.call1((1970, 1, 1, 0, 0, 0, 0, dt.getattr("timezone")?.getattr("utc")?))?;
+            epoch.call_method1("__add__", (timedelta(py, *ns)?,))?
+        }
+        Value::Duration(ns) => timedelta(py, *ns)?,
+        Value::Type(t) => t.as_ref().into_bound_py_any(py)?,
         Value::List(items) => {
             let out = PyList::empty(py);
             for x in items.iter() {
@@ -154,6 +175,20 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             out.into_any()
         }
     })
+}
+
+/// `datetime.timedelta` for a nanosecond span, truncated to microseconds.
+fn timedelta<'py>(py: Python<'py>, ns: i128) -> PyResult<Bound<'py, PyAny>> {
+    let us = ns.div_euclid(1000);
+    let (secs, micros) = (us.div_euclid(1_000_000) as i64, us.rem_euclid(1_000_000) as i64);
+    py.import("datetime")?.getattr("timedelta")?.call1((0, secs, micros))
+}
+
+fn timedelta_ns(td: &Bound<'_, PyAny>) -> PyResult<i128> {
+    let days: i64 = td.getattr("days")?.extract()?;
+    let secs: i64 = td.getattr("seconds")?.extract()?;
+    let micros: i64 = td.getattr("microseconds")?.extract()?;
+    Ok((i128::from(days) * 86_400 + i128::from(secs)) * 1_000_000_000 + i128::from(micros) * 1000)
 }
 
 fn conv_err(path: &str, expected: &str, obj: &Bound<'_, PyAny>) -> PyErr {
@@ -239,6 +274,34 @@ fn value_from_py(obj: &Bound<'_, PyAny>, ty: &CelType, schema: &Schema, path: &s
             } else {
                 Err(conv_err(path, "datetime.date", obj))
             }
+        }
+        CelType::Timestamp => {
+            let datetime = obj.py().import("datetime")?.getattr("datetime")?;
+            if !obj.is_instance(&datetime)? {
+                return Err(conv_err(path, "datetime.datetime", obj));
+            }
+            if obj.call_method0("utcoffset")?.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "naive datetime at '{path}' has no time zone; attach one, e.g. tzinfo=datetime.timezone.utc"
+                )));
+            }
+            let epoch = value_to_py(obj.py(), &Value::Timestamp(0))?;
+            let ns = timedelta_ns(&obj.call_method1("__sub__", (epoch,))?)?;
+            if !time::ts_in_range(ns) {
+                return Err(PyValueError::new_err(format!("datetime at '{path}' is outside the CEL timestamp range")));
+            }
+            Ok(Value::Timestamp(ns))
+        }
+        CelType::Duration => {
+            let td = obj.py().import("datetime")?.getattr("timedelta")?;
+            if !obj.is_instance(&td)? {
+                return Err(conv_err(path, "datetime.timedelta", obj));
+            }
+            let ns = timedelta_ns(obj)?;
+            if !time::dur_in_range(ns) {
+                return Err(PyValueError::new_err(format!("timedelta at '{path}' is outside the CEL duration range")));
+            }
+            Ok(Value::Duration(ns))
         }
         CelType::Null => {
             if obj.is_none() {

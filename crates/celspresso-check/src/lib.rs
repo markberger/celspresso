@@ -4,7 +4,7 @@ pub mod checker;
 pub mod decls;
 pub mod types;
 
-pub use checker::{check, suggest, CheckError, CheckedExpr, Reference};
+pub use checker::{check, check_unchecked, suggest, CheckError, CheckedExpr, Reference};
 pub use decls::{Constraints, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl};
 pub use types::CelType;
 
@@ -63,11 +63,11 @@ fn expand(e: Expr, defs: &BTreeMap<String, Expr>, next: &mut u32, bound: &mut Ve
             c.accu_init = expand(c.accu_init, defs, next, bound, active);
             bound.push(c.accu_var.clone());
             bound.push(c.iter_var.clone());
+            bound.extend(c.iter_var2.clone());
             c.loop_condition = expand(c.loop_condition, defs, next, bound, active);
             c.loop_step = expand(c.loop_step, defs, next, bound, active);
             c.result = expand(c.result, defs, next, bound, active);
-            bound.pop();
-            bound.pop();
+            bound.truncate(bound.len() - 2 - usize::from(c.iter_var2.is_some()));
             ExprKind::Comprehension(Box::new(c))
         }
         k => k,

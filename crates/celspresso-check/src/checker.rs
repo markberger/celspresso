@@ -28,6 +28,8 @@ pub enum Reference {
     Local(String),
     /// The overload ids that may be selected at runtime (usually exactly one).
     Function(Vec<String>),
+    /// A type denotation used as a value (`int`, `google.protobuf.Duration`), by runtime name.
+    Type(String),
 }
 
 /// A type-checked expression: the AST plus a type for every node and a
@@ -66,6 +68,10 @@ fn collect_paths(e: &Expr, c: &CheckedExpr, out: &mut std::collections::BTreeSet
     fn path(e: &Expr, c: &CheckedExpr) -> Option<String> {
         match &e.kind {
             ExprKind::Ident(n) if matches!(c.refs.get(&e.id), Some(Reference::Var(_))) => Some(n.clone()),
+            ExprKind::Select { .. } if matches!(c.refs.get(&e.id), Some(Reference::Var(_))) => match c.refs.get(&e.id) {
+                Some(Reference::Var(n)) => Some(n.clone()),
+                _ => None,
+            },
             ExprKind::Select { operand, field, .. } => path(operand, c).map(|p| format!("{p}.{field}")),
             _ => None,
         }
@@ -98,7 +104,20 @@ fn collect_paths(e: &Expr, c: &CheckedExpr, out: &mut std::collections::BTreeSet
 }
 
 pub fn check(expr: Expr, schema: Arc<Schema>) -> Result<CheckedExpr, Vec<CheckError>> {
+    run(expr, schema, false)
+}
+
+/// Prepare an expression for evaluation without enforcing types (cel-go's "unchecked"
+/// ASTs): type errors widen to `dyn` and are deferred to runtime, and undeclared
+/// identifiers are looked up in the activation when evaluated. Never fails.
+pub fn check_unchecked(expr: Expr, schema: Arc<Schema>) -> CheckedExpr {
+    run(expr, schema, true).expect("lenient checking reports no errors")
+}
+
+fn run(mut expr: Expr, schema: Arc<Schema>, lenient: bool) -> Result<CheckedExpr, Vec<CheckError>> {
+    resolve_namespaces(&mut expr, &schema, &mut Vec::new());
     let mut c = Checker {
+        lenient,
         schema: &schema,
         types: HashMap::new(),
         refs: HashMap::new(),
@@ -118,6 +137,7 @@ pub fn check(expr: Expr, schema: Arc<Schema>) -> Result<CheckedExpr, Vec<CheckEr
 }
 
 struct Checker<'a> {
+    lenient: bool,
     schema: &'a Schema,
     types: HashMap<ExprId, CelType>,
     refs: HashMap<ExprId, Reference>,
@@ -129,6 +149,9 @@ struct Checker<'a> {
 
 impl<'a> Checker<'a> {
     fn error(&mut self, e: &Expr, message: String) -> CelType {
+        if self.lenient {
+            return CelType::Dyn;
+        }
         self.errors.push(CheckError { message, span: e.span, expr_id: e.id });
         CelType::Error
     }
@@ -154,12 +177,25 @@ impl<'a> Checker<'a> {
                 Literal::Bytes(_) => CelType::Bytes,
             },
             ExprKind::Ident(name) => self.ident(e, name),
-            ExprKind::Select { operand, field, test_only } => self.select(e, operand, field, *test_only),
+            ExprKind::Select { operand, field, test_only } => match self.qualified_var(e) {
+                // `a.b.c` where a variable named "a.b.c" (or "a.b") is declared: longest prefix wins
+                Some(name) => {
+                    self.refs.insert(e.id, Reference::Var(name.clone()));
+                    self.schema.vars[&name].ty.clone()
+                }
+                None => match self.qualified_type(e) {
+                    Some((name, t)) => {
+                        self.refs.insert(e.id, Reference::Type(name));
+                        CelType::Type(Box::new(t))
+                    }
+                    None => self.select(e, operand, field, *test_only),
+                },
+            },
             ExprKind::Call { target, function, args } => self.call(e, target.as_deref(), function, args),
             ExprKind::List(items) => {
                 let mut elem = self.fresh_param();
                 for it in items {
-                    let t = self.check(it);
+                    let t = self.entry(it);
                     elem = join(&elem, &t, &mut self.subst);
                 }
                 CelType::list(elem)
@@ -173,7 +209,7 @@ impl<'a> Checker<'a> {
                         self.error(k, format!("unsupported map key type '{}'", self.resolved(&t)));
                     }
                     kt = join(&kt, &t, &mut self.subst);
-                    let t = self.check(v);
+                    let t = self.entry(v);
                     vt = join(&vt, &t, &mut self.subst);
                 }
                 CelType::map(kt, vt)
@@ -184,9 +220,63 @@ impl<'a> Checker<'a> {
         self.set(e, t)
     }
 
+    /// A list element or map value; `?e` entries contribute the optional's value type.
+    fn entry(&mut self, e: &Expr) -> CelType {
+        let ExprKind::Call { target: None, function, args } = &e.kind else { return self.check(e) };
+        let ([x], true) = (args.as_slice(), function == ops::OPT_ENTRY) else { return self.check(e) };
+        let t = self.check(x);
+        let inner = match self.resolved(&t).clone() {
+            CelType::Optional(inner) => *inner,
+            CelType::Dyn | CelType::Error => CelType::Dyn,
+            other => self.error(x, format!("optional entry must be an optional value, got '{other}'")),
+        };
+        self.set(e, inner)
+    }
+
     fn fresh_param(&mut self) -> CelType {
         self.fresh += 1;
         CelType::Param(format!("_T{}", self.fresh))
+    }
+
+    /// The dotted name of a select chain (`a.b.c`), if it names a declared variable and
+    /// its root is not shadowed by a comprehension variable.
+    fn qualified_var(&self, e: &Expr) -> Option<String> {
+        let (name, root) = dotted(e)?;
+        if self.lookup_local(root).is_some() || !self.schema.vars.contains_key(&name) {
+            return None;
+        }
+        Some(name)
+    }
+
+    /// A dotted type name (`google.protobuf.Timestamp`) whose root is not a variable.
+    fn qualified_type(&self, e: &Expr) -> Option<(String, CelType)> {
+        let (name, root) = dotted(e)?;
+        if self.lookup_local(root).is_some() || self.schema.vars.contains_key(root) {
+            return None;
+        }
+        self.type_denotation(&name).map(|t| (name, t))
+    }
+
+    /// The type a type name denotes when used as a value.
+    fn type_denotation(&self, name: &str) -> Option<CelType> {
+        Some(match name {
+            "bool" => CelType::Bool,
+            "int" => CelType::Int,
+            "uint" => CelType::Uint,
+            "double" => CelType::Double,
+            "string" => CelType::String,
+            "bytes" => CelType::Bytes,
+            "null_type" => CelType::Null,
+            "list" => CelType::list(CelType::Dyn),
+            "map" => CelType::map(CelType::Dyn, CelType::Dyn),
+            "type" => CelType::Type(Box::new(CelType::Dyn)),
+            "optional_type" => CelType::optional(CelType::Dyn),
+            "net.IP" | "net.CIDR" => CelType::Opaque(name.to_string()),
+            "google.protobuf.Timestamp" => CelType::Timestamp,
+            "google.protobuf.Duration" => CelType::Duration,
+            n if self.schema.structs.contains_key(n) => CelType::Struct(n.to_string()),
+            _ => return None,
+        })
     }
 
     fn lookup_local(&self, name: &str) -> Option<CelType> {
@@ -202,6 +292,10 @@ impl<'a> Checker<'a> {
             self.refs.insert(e.id, Reference::Var(name.to_string()));
             return v.ty.clone();
         }
+        if let Some(t) = self.type_denotation(name) {
+            self.refs.insert(e.id, Reference::Type(name.to_string()));
+            return CelType::Type(Box::new(t));
+        }
         let mut msg = format!("undeclared reference to '{name}'");
         if let Some(s) = suggest(name, self.schema.vars.keys().map(|s| s.as_str())) {
             msg.push_str(&format!(" (did you mean '{s}'?)"));
@@ -211,7 +305,24 @@ impl<'a> Checker<'a> {
 
     fn select(&mut self, e: &Expr, operand: &Expr, field: &str, test_only: bool) -> CelType {
         let ot = self.check(operand);
-        let ft = match self.resolved(&ot).non_null().clone() {
+        // selecting through an optional yields an optional: optional.of(m).f is m.?f
+        let (ot, through_optional) = match self.resolved(&ot).clone() {
+            CelType::Optional(inner) => (*inner, true),
+            t => (t, false),
+        };
+        let ft = self.field_type(e, &ot, field);
+        if test_only {
+            CelType::Bool
+        } else if through_optional {
+            CelType::optional(ft)
+        } else {
+            ft
+        }
+    }
+
+    /// The type of `field` on a value of type `ot`.
+    fn field_type(&mut self, e: &Expr, ot: &CelType, field: &str) -> CelType {
+        match self.resolved(ot).non_null().clone() {
             CelType::Struct(name) => match self.schema.structs.get(&name) {
                 Some(sd) => match sd.field(field) {
                     Some(f) => f.ty.clone(),
@@ -233,11 +344,6 @@ impl<'a> Checker<'a> {
             }
             CelType::Dyn | CelType::Error | CelType::Param(_) => CelType::Dyn,
             other => self.error(e, format!("type '{other}' does not support field selection")),
-        };
-        if test_only {
-            CelType::Bool
-        } else {
-            ft
         }
     }
 
@@ -266,13 +372,15 @@ impl<'a> Checker<'a> {
 
     fn comprehension(&mut self, c: &Comprehension) -> CelType {
         let rt = self.check(&c.iter_range);
-        let var_t = match self.resolved(&rt).non_null().clone() {
-            CelType::List(e) => *e,
-            CelType::Map(k, _) => *k,
-            CelType::Dyn | CelType::Error | CelType::Param(_) => CelType::Dyn,
+        // (first variable, second variable): element, or (index, element) / (key, value)
+        let (var_t, var2_t) = match self.resolved(&rt).non_null().clone() {
+            CelType::List(e) if c.iter_var2.is_some() => (CelType::Int, *e),
+            CelType::List(e) => (*e, CelType::Dyn),
+            CelType::Map(k, v) => (*k, *v),
+            CelType::Dyn | CelType::Error | CelType::Param(_) => (CelType::Dyn, CelType::Dyn),
             other => {
                 self.error(&c.iter_range, format!("expression of type '{other}' cannot be the range of a comprehension (must be list, map, or dynamic)"));
-                CelType::Error
+                (CelType::Error, CelType::Error)
             }
         };
         let accu_t = self.check(&c.accu_init);
@@ -285,6 +393,9 @@ impl<'a> Checker<'a> {
         }
         let mut scope = HashMap::new();
         scope.insert(c.iter_var.clone(), var_t);
+        if let Some(v2) = &c.iter_var2 {
+            scope.insert(v2.clone(), var2_t);
+        }
         self.scopes.push(scope);
         let step_t = self.check(&c.loop_step);
         self.scopes.pop();
@@ -309,6 +420,38 @@ impl<'a> Checker<'a> {
         for a in args {
             arg_types.push(self.check(a));
         }
+        if target.is_none() && matches!(function, "math.greatest" | "math.least") {
+            return self.min_max(e, function, &arg_types);
+        }
+        if target.is_none() && function == ops::OPT_SELECT {
+            let field = match args.get(1).map(|a| &a.kind) {
+                Some(ExprKind::Literal(Literal::String(f))) => f.clone(),
+                _ => return self.error(e, "optional field selection requires a field name".into()),
+            };
+            let ot = match self.resolved(&arg_types[0]).clone() {
+                CelType::Optional(inner) => *inner,
+                t => t,
+            };
+            let ft = self.field_type(e, &ot, &field);
+            self.refs.insert(e.id, Reference::Function(vec!["select_optional_field".into()]));
+            return CelType::optional(ft);
+        }
+        // indexing through an optional, or with `[?k]`, yields an optional
+        if target.is_none() && (function == ops::OPT_INDEX || function == ops::INDEX) && arg_types.len() == 2 {
+            let (inner, through) = match self.resolved(&arg_types[0]).clone() {
+                CelType::Optional(inner) => (*inner, true),
+                t => (t, false),
+            };
+            if through || function == ops::OPT_INDEX {
+                let r = self.resolve(e, ops::INDEX, false, &[inner, arg_types[1].clone()]);
+                return CelType::optional(r);
+            }
+        }
+        self.resolve(e, function, target.is_some(), &arg_types)
+    }
+
+    /// Overload resolution for `function` applied to already-checked argument types.
+    fn resolve(&mut self, e: &Expr, function: &str, receiver: bool, arg_types: &[CelType]) -> CelType {
         let Some(decl) = self.schema.functions.get(function).cloned() else {
             let all = self.schema.functions.keys().filter(|k| !k.starts_with('_') && !k.starts_with('@') && !k.starts_with('!') && !k.starts_with('-')).map(|s| s.as_str());
             let mut msg = format!("undeclared reference to function '{function}'");
@@ -317,12 +460,11 @@ impl<'a> Checker<'a> {
             }
             return self.error(e, msg);
         };
-        let receiver = target.is_some();
         let mut matched: Vec<(Overload, CelType, Subst)> = Vec::new();
         for o in decl.overloads.iter().filter(|o| o.receiver == receiver && o.params.len() == arg_types.len()) {
             let o = self.instantiate(o);
             let mut s = self.subst.clone();
-            if o.params.iter().zip(&arg_types).all(|(p, a)| assignable(p, a, &mut s)) {
+            if o.params.iter().zip(arg_types).all(|(p, a)| assignable(p, a, &mut s)) {
                 matched.push((o.clone(), o.result.clone(), s));
             }
         }
@@ -330,7 +472,7 @@ impl<'a> Checker<'a> {
         if matched.len() > 1 {
             let exact: Vec<_> = matched
                 .iter()
-                .filter(|(o, _, s)| o.params.iter().zip(&arg_types).all(|(p, a)| strictly_matches(p, a, s)))
+                .filter(|(o, _, s)| o.params.iter().zip(arg_types).all(|(p, a)| strictly_matches(p, a, s)))
                 .cloned()
                 .collect();
             if !exact.is_empty() {
@@ -368,6 +510,28 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `math.greatest` / `math.least`: one numeric argument, a list of numbers, or
+    /// several numeric arguments. Mixed numeric types give `dyn`.
+    fn min_max(&mut self, e: &Expr, function: &str, arg_types: &[CelType]) -> CelType {
+        let resolved: Vec<CelType> = arg_types.iter().map(|t| self.resolved(t).non_null().clone()).collect();
+        let elems: Vec<CelType> = match resolved.as_slice() {
+            [] => return self.error(e, format!("{function}() requires at least one argument")),
+            [CelType::List(t)] => vec![self.resolved(t).clone()],
+            ts => ts.to_vec(),
+        };
+        let ok = |t: &CelType| t.is_numeric() || matches!(t, CelType::Dyn | CelType::Error | CelType::Param(_));
+        if let Some(bad) = elems.iter().find(|t| !ok(t)) {
+            return self.error(e, format!("found no matching overload for '{function}' applied to '({bad})'"));
+        }
+        let id = if function == "math.greatest" { "math_greatest" } else { "math_least" };
+        self.refs.insert(e.id, Reference::Function(vec![id.to_string()]));
+        if elems.iter().all(|t| t == &elems[0]) && elems[0].is_numeric() {
+            elems[0].clone()
+        } else {
+            CelType::Dyn
+        }
+    }
+
     fn instantiate(&mut self, o: &Overload) -> Overload {
         let mut map = HashMap::new();
         let mut rename = |t: &CelType, this: &mut Self| -> CelType { rename_params(t, &mut map, this) };
@@ -393,6 +557,8 @@ fn rename_params(t: &CelType, map: &mut HashMap<String, CelType>, c: &mut Checke
             CelType::map(k, rename_params(v, map, c))
         }
         CelType::Nullable(e) => CelType::nullable(rename_params(e, map, c)),
+        CelType::Type(e) => CelType::Type(Box::new(rename_params(e, map, c))),
+        CelType::Optional(e) => CelType::optional(rename_params(e, map, c)),
         t => t.clone(),
     }
 }
@@ -450,4 +616,60 @@ fn levenshtein(a: &str, b: &str) -> usize {
         prev = cur;
     }
     prev[b.len()]
+}
+
+/// `a.b.c` as ("a.b.c", "a") when `e` is a plain chain of field selections.
+fn dotted(e: &Expr) -> Option<(String, &str)> {
+    match &e.kind {
+        ExprKind::Ident(n) => Some((n.clone(), n.as_str())),
+        ExprKind::Select { operand, field, test_only: false } => {
+            let (p, root) = dotted(operand)?;
+            Some((format!("{p}.{field}"), root))
+        }
+        _ => None,
+    }
+}
+
+/// Turn `math.greatest(x)` (a receiver call on the identifier chain `math`) into a
+/// global call of the function `math.greatest`, when that function is declared and
+/// the chain's root is not a variable or comprehension local.
+fn resolve_namespaces(e: &mut Expr, schema: &Schema, bound: &mut Vec<String>) {
+    if let ExprKind::Call { target: Some(t), function, .. } = &e.kind {
+        if let Some((ns, root)) = dotted(t) {
+            let qualified = format!("{ns}.{function}");
+            if !bound.iter().any(|b| b == root) && !schema.vars.contains_key(root) && schema.functions.contains_key(&qualified) {
+                let ExprKind::Call { function, target, .. } = &mut e.kind else { unreachable!() };
+                *function = qualified;
+                *target = None;
+            }
+        }
+    }
+    match &mut e.kind {
+        ExprKind::Select { operand, .. } => resolve_namespaces(operand, schema, bound),
+        ExprKind::Call { target, args, .. } => {
+            if let Some(t) = target {
+                resolve_namespaces(t, schema, bound);
+            }
+            args.iter_mut().for_each(|a| resolve_namespaces(a, schema, bound));
+        }
+        ExprKind::List(items) => items.iter_mut().for_each(|a| resolve_namespaces(a, schema, bound)),
+        ExprKind::Map(entries) => entries.iter_mut().for_each(|(k, v)| {
+            resolve_namespaces(k, schema, bound);
+            resolve_namespaces(v, schema, bound);
+        }),
+        ExprKind::Struct { fields, .. } => fields.iter_mut().for_each(|(_, v)| resolve_namespaces(v, schema, bound)),
+        ExprKind::Comprehension(c) => {
+            resolve_namespaces(&mut c.iter_range, schema, bound);
+            resolve_namespaces(&mut c.accu_init, schema, bound);
+            let depth = bound.len();
+            bound.push(c.accu_var.clone());
+            bound.push(c.iter_var.clone());
+            bound.extend(c.iter_var2.clone());
+            resolve_namespaces(&mut c.loop_condition, schema, bound);
+            resolve_namespaces(&mut c.loop_step, schema, bound);
+            resolve_namespaces(&mut c.result, schema, bound);
+            bound.truncate(depth);
+        }
+        _ => {}
+    }
 }

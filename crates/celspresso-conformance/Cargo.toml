@@ -1,0 +1,18 @@
+[package]
+name = "celspresso-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Runs the cel-spec conformance suite against celspresso and ratchets the pass set."
+
+[dependencies]
+celspresso-syntax.workspace = true
+celspresso-check.workspace = true
+celspresso-eval.workspace = true
+prost-reflect = { version = "0.16", features = ["text-format"] }
+prost = "0.14"
+
+[build-dependencies]
+protox = "0.9"
+prost = "0.14"

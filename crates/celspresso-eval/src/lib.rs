@@ -1,6 +1,9 @@
 //! Tree-walking CEL evaluator over checked expressions.
 
 pub mod date;
+pub mod ext;
+pub mod net;
+pub mod time;
 pub mod value;
 
 pub use value::{Key, StructValue, Value};
@@ -136,7 +139,7 @@ impl<'a> Evaluator<'a> {
         }
         let r = self.eval_inner(e);
         if let Some(t) = self.trace.as_mut() {
-            t.insert(e.id, r.as_ref().map(|v| v.clone()).map_err(|er| er.message.clone()));
+            t.insert(e.id, r.clone().map_err(|er| er.message));
         }
         r
     }
@@ -157,11 +160,20 @@ impl<'a> Evaluator<'a> {
                     return v.clone();
                 }
                 match self.checked.refs.get(&e.id) {
+                    Some(Reference::Type(t)) => Ok(Value::Type(Arc::from(t.as_str()))),
                     Some(Reference::Var(_)) | None => {
                         self.act.resolve(name).ok_or_else(|| err(e, format!("no value bound for variable '{name}'")))
                     }
                     Some(_) => Err(err(e, format!("unresolved identifier '{name}'"))),
                 }
+            }
+            ExprKind::Select { .. } if matches!(self.checked.refs.get(&e.id), Some(Reference::Type(_))) => {
+                let Some(Reference::Type(t)) = self.checked.refs.get(&e.id) else { unreachable!() };
+                Ok(Value::Type(Arc::from(t.as_str())))
+            }
+            ExprKind::Select { .. } if matches!(self.checked.refs.get(&e.id), Some(Reference::Var(_))) => {
+                let Some(Reference::Var(name)) = self.checked.refs.get(&e.id) else { unreachable!() };
+                self.act.resolve(name).ok_or_else(|| err(e, format!("no value bound for variable '{name}'")))
             }
             ExprKind::Select { operand, field, test_only } => {
                 let v = self.eval(operand)?;
@@ -171,7 +183,9 @@ impl<'a> Evaluator<'a> {
             ExprKind::List(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
-                    out.push(self.eval(it)?);
+                    if let Some(v) = self.entry(it)? {
+                        out.push(v);
+                    }
                 }
                 Ok(Value::list(out))
             }
@@ -180,7 +194,7 @@ impl<'a> Evaluator<'a> {
                 for (k, v) in entries {
                     let kv = self.eval(k)?;
                     let key = Key::from_value(&kv).ok_or_else(|| err(k, format!("unsupported map key type '{}'", kv.type_name())))?;
-                    let vv = self.eval(v)?;
+                    let Some(vv) = self.entry(v)? else { continue };
                     if m.insert(key, vv).is_some() {
                         return Err(err(k, format!("duplicate map key {kv}")));
                     }
@@ -189,14 +203,18 @@ impl<'a> Evaluator<'a> {
             }
             ExprKind::Struct { type_name, fields } => {
                 let mut out = BTreeMap::new();
-                if let Some(sd) = self.checked.schema.structs.get(type_name) {
-                    for f in &sd.fields {
-                        if matches!(f.ty, celspresso_check::CelType::Nullable(_)) {
-                            out.insert(f.name.clone(), Value::Null);
-                        }
+                let Some(sd) = self.checked.schema.structs.get(type_name) else {
+                    return Err(err(e, format!("unknown type '{type_name}'")));
+                };
+                for f in &sd.fields {
+                    if matches!(f.ty, celspresso_check::CelType::Nullable(_)) {
+                        out.insert(f.name.clone(), Value::Null);
                     }
                 }
                 for (name, v) in fields {
+                    if sd.field(name).is_none() {
+                        return Err(err(v, format!("undefined field '{name}' on {type_name}")));
+                    }
                     let vv = self.eval(v)?;
                     out.insert(name.clone(), vv);
                 }
@@ -208,9 +226,12 @@ impl<'a> Evaluator<'a> {
 
     fn comprehension(&mut self, e: &Expr, c: &Comprehension) -> EvalResult {
         let range = self.eval(&c.iter_range)?;
-        let items: Vec<Value> = match &range {
-            Value::List(l) => l.as_ref().clone(),
-            Value::Map(m) => m.keys().map(Key::to_value).collect(),
+        // (first, second) variable values per iteration
+        let two = c.iter_var2.is_some();
+        let items: Vec<(Value, Value)> = match &range {
+            Value::List(l) if two => l.iter().enumerate().map(|(i, v)| (Value::Int(i as i64), v.clone())).collect(),
+            Value::List(l) => l.iter().map(|v| (v.clone(), Value::Null)).collect(),
+            Value::Map(m) => m.iter().map(|(k, v)| (k.to_value(), v.clone())).collect(),
             other => return Err(err(&c.iter_range, format!("cannot iterate over '{}'", other.type_name()))),
         };
         let accu = self.eval(&c.accu_init)?;
@@ -235,10 +256,14 @@ impl<'a> Evaluator<'a> {
                     break;
                 }
             }
-            self.locals.push((c.iter_var.clone(), Ok(item)));
+            let (first, second) = item;
+            self.locals.push((c.iter_var.clone(), Ok(first)));
+            if let Some(v2) = &c.iter_var2 {
+                self.locals.push((v2.clone(), Ok(second)));
+            }
             // errors are values for the accumulator: `err && false` must still be false
             let step = self.eval(&c.loop_step);
-            self.locals.pop();
+            self.locals.truncate(accu_idx + 1);
             self.locals[accu_idx].1 = step;
         }
         let r = match result {
@@ -300,6 +325,19 @@ impl<'a> Evaluator<'a> {
         self.builtin(e, function, &vals)
     }
 
+    /// A list element or map value; `?e` entries are dropped when the optional is empty.
+    fn entry(&mut self, e: &Expr) -> Result<Option<Value>, EvalError> {
+        match &e.kind {
+            ExprKind::Call { target: None, function, args } if function == ops::OPT_ENTRY && args.len() == 1 => {
+                match self.eval(&args[0])? {
+                    Value::Optional(o) => Ok(o.map(|v| v.as_ref().clone())),
+                    other => Err(err(e, format!("optional entry must be an optional value, got {}", other.type_name()))),
+                }
+            }
+            _ => self.eval(e).map(Some),
+        }
+    }
+
     fn check_len(&self, e: &Expr, v: Value) -> EvalResult {
         match &v {
             Value::String(s) if s.len() > self.limits.max_string_len => Err(err(e, "string length limit exceeded")),
@@ -328,8 +366,46 @@ impl<'a> Evaluator<'a> {
             let tys: Vec<std::string::String> = v.iter().map(|x| x.type_name()).collect();
             err(e, format!("no such overload: {function}({})", tys.join(", ")))
         };
+        let ts = |ns: Option<i128>| match ns {
+            Some(ns) if time::ts_in_range(ns) => Ok(Timestamp(ns)),
+            _ => Err(err(e, "timestamp out of range")),
+        };
+        let dur = |ns: Option<i128>| match ns {
+            Some(ns) if time::dur_in_range(ns) => Ok(Duration(ns)),
+            _ => Err(err(e, "duration out of range")),
+        };
         Ok(match (function, v) {
             (ops::LOGICAL_NOT, [Bool(b)]) => Bool(!b),
+            (ops::ADD, [Timestamp(t), Duration(d)]) | (ops::ADD, [Duration(d), Timestamp(t)]) => ts(t.checked_add(*d))?,
+            (ops::ADD, [Duration(a), Duration(b)]) => dur(a.checked_add(*b))?,
+            (ops::SUBTRACT, [Timestamp(t), Duration(d)]) => ts(t.checked_sub(*d))?,
+            (ops::SUBTRACT, [Timestamp(a), Timestamp(b)]) => dur(a.checked_sub(*b))?,
+            (ops::SUBTRACT, [Duration(a), Duration(b)]) => dur(a.checked_sub(*b))?,
+            ("type", [x]) => Type(Arc::from(x.type_name())),
+            ("timestamp", [String(s)]) => {
+                Timestamp(time::parse_timestamp(s).ok_or_else(|| err(e, format!("invalid timestamp {}", Value::String(s.clone()))))?)
+            }
+            ("timestamp", [Int(secs)]) => ts(time::ts_from_seconds(*secs))?,
+            ("timestamp", [Timestamp(t)]) => Timestamp(*t),
+            ("duration", [String(s)]) => {
+                Duration(time::parse_duration(s).ok_or_else(|| err(e, format!("invalid duration {}", Value::String(s.clone()))))?)
+            }
+            ("duration", [Duration(d)]) => Duration(*d),
+            ("int", [Timestamp(t)]) => Int(time::ts_seconds(*t)),
+            ("string", [Timestamp(t)]) => String(Arc::from(time::format_timestamp(*t))),
+            ("string", [Duration(d)]) => String(Arc::from(time::format_duration(*d))),
+            (f, [Timestamp(t), rest @ ..]) if rest.len() <= 1 && time::TsField::from_function(f).is_some() => {
+                let field = time::TsField::from_function(f).unwrap();
+                let tz = match rest {
+                    [String(z)] => Some(z.as_ref()),
+                    [] => None,
+                    _ => return Err(no_overload()),
+                };
+                Int(time::ts_field(*t, field, tz).map_err(|m| err(e, m))?)
+            }
+            (f, [Duration(d)]) if time::TsField::from_function(f).is_some() => {
+                Int(time::dur_field(*d, time::TsField::from_function(f).unwrap()).ok_or_else(no_overload)?)
+            }
             (ops::NEGATE, [Int(i)]) => Int(i.checked_neg().ok_or_else(overflow)?),
             (ops::NEGATE, [Double(d)]) => Double(-d),
             (ops::ADD, [Int(a), Int(b)]) => Int(a.checked_add(*b).ok_or_else(overflow)?),
@@ -367,6 +443,7 @@ impl<'a> Evaluator<'a> {
                     (Bytes(x), Bytes(y)) => Some(x.cmp(y)),
                     (Bool(x), Bool(y)) => Some(x.cmp(y)),
                     (Date(x), Date(y)) => Some(x.cmp(y)),
+                    (Timestamp(x), Timestamp(y)) | (Duration(x), Duration(y)) => Some(x.cmp(y)),
                     _ if matches!(a, Int(_) | Uint(_) | Double(_)) && matches!(b, Int(_) | Uint(_) | Double(_)) => {
                         match value::numeric_cmp(a, b) {
                             Some(o) => Some(o),
@@ -383,6 +460,25 @@ impl<'a> Evaluator<'a> {
                     _ => ord != O::Less,
                 })
             }
+            (ops::OPT_SELECT, [x, String(f)]) => opt_select(e, x, f)?,
+            (ops::INDEX, [Optional(None), _]) | (ops::OPT_INDEX, [Optional(None), _]) => Optional(None),
+            (ops::INDEX | ops::OPT_INDEX, [Optional(Some(x)), idx]) => {
+                let x = x.as_ref().clone();
+                return self.builtin(e, ops::OPT_INDEX, &[x, idx.clone()]);
+            }
+            (ops::OPT_INDEX, [List(l), idx]) => {
+                let i = match idx {
+                    Int(i) => *i,
+                    Uint(u) => i64::try_from(*u).unwrap_or(i64::MAX),
+                    Double(d) if d.fract() == 0.0 => *d as i64,
+                    _ => return Err(no_overload()),
+                };
+                Optional(usize::try_from(i).ok().and_then(|i| l.get(i)).map(|v| Arc::new(v.clone())))
+            }
+            (ops::OPT_INDEX, [Map(m), k]) => {
+                let key = Key::from_value(k).ok_or_else(no_overload)?;
+                Optional(m.get(&key).map(|v| Arc::new(v.clone())))
+            }
             (ops::INDEX, [List(l), idx]) => {
                 let i = match idx {
                     Int(i) => *i,
@@ -398,6 +494,23 @@ impl<'a> Evaluator<'a> {
             (ops::INDEX, [Map(m), k]) => {
                 let key = Key::from_value(k).ok_or_else(no_overload)?;
                 m.get(&key).cloned().ok_or_else(|| err(e, format!("no such key: {k}")))?
+            }
+            (ops::MAP_INSERT, [Map(m), k, val]) => {
+                let key = Key::from_value(k).ok_or_else(no_overload)?;
+                let mut out = m.as_ref().clone();
+                if out.insert(key, val.clone()).is_some() {
+                    return Err(err(e, format!("insert failed: key {k} already exists")));
+                }
+                Map(Arc::new(out))
+            }
+            (ops::MAP_INSERT, [Map(m), Map(other)]) => {
+                let mut out = m.as_ref().clone();
+                for (k, val) in other.iter() {
+                    if out.insert(k.clone(), val.clone()).is_some() {
+                        return Err(err(e, format!("insert failed: key {} already exists", k.to_value())));
+                    }
+                }
+                Map(Arc::new(out))
             }
             (ops::IN, [x, List(l)]) => Bool(l.iter().any(|y| x.cel_eq(y))),
             (ops::IN, [x, Map(m)]) => Bool(Key::from_value(x).is_some_and(|k| m.contains_key(&k))),
@@ -487,13 +600,33 @@ impl<'a> Evaluator<'a> {
             ("ageOn", [Date(b), Date(on)]) => Int(date::age_on(*b, *on)),
             ("daysUntil", [Date(a), Date(b)]) => Int(b - a),
             ("year", [Date(d)]) => Int(date::civil_from_days(*d).0),
-            _ => return Err(no_overload()),
+            _ => match ext::call(function, v) {
+                Some(Ok(out)) => return self.check_len(e, out),
+                Some(Err(m)) => return Err(err(e, m)),
+                None => return Err(no_overload()),
+            },
         })
+    }
+}
+
+/// `v.?field`: an optional of the field, empty when it is absent.
+fn opt_select(e: &Expr, v: &Value, field: &str) -> EvalResult {
+    let some = |x: &Value| Value::Optional(Some(Arc::new(x.clone())));
+    match v {
+        Value::Optional(None) => Ok(Value::Optional(None)),
+        Value::Optional(Some(x)) => opt_select(e, x, field),
+        Value::Map(m) => Ok(m.get(&Key::String(Arc::from(field))).map_or(Value::Optional(None), some)),
+        Value::Struct(s) => Ok(s.fields.get(field).map_or(Value::Optional(None), some)),
+        other => select(e, other, field, false).map(|x| some(&x)),
     }
 }
 
 fn select(e: &Expr, v: &Value, field: &str, test_only: bool) -> EvalResult {
     match v {
+        // selecting through an optional behaves like `.?`; has() on an empty one is false
+        Value::Optional(None) if test_only => Ok(Value::Bool(false)),
+        Value::Optional(Some(x)) if test_only => select(e, x, field, true),
+        Value::Optional(_) => opt_select(e, v, field),
         Value::Struct(s) => {
             if test_only {
                 return Ok(Value::Bool(s.fields.contains_key(field)));

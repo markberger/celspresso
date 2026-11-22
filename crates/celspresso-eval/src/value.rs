@@ -15,9 +15,19 @@ pub enum Value {
     Bytes(Arc<[u8]>),
     /// Days since 1970-01-01.
     Date(i64),
+    /// Nanoseconds since the Unix epoch (`google.protobuf.Timestamp`).
+    Timestamp(i128),
+    /// Signed nanoseconds (`google.protobuf.Duration`).
+    Duration(i128),
+    /// A type value (`type(1)`, `int`), by its runtime name.
+    Type(Arc<str>),
     List(Arc<Vec<Value>>),
     Map(Arc<BTreeMap<Key, Value>>),
     Struct(Arc<StructValue>),
+    /// `optional_type`: `optional.of(x)` holds a value, `optional.none()` does not.
+    Optional(Option<Arc<Value>>),
+    /// `net.IP` / `net.CIDR` from the network extension.
+    Net(Arc<crate::net::Net>),
 }
 
 #[derive(Clone, Debug)]
@@ -101,9 +111,14 @@ impl Value {
             Value::String(_) => "string".into(),
             Value::Bytes(_) => "bytes".into(),
             Value::Date(_) => "date".into(),
+            Value::Timestamp(_) => "google.protobuf.Timestamp".into(),
+            Value::Duration(_) => "google.protobuf.Duration".into(),
+            Value::Type(_) => "type".into(),
             Value::List(_) => "list".into(),
             Value::Map(_) => "map".into(),
             Value::Struct(s) => s.type_name.clone(),
+            Value::Optional(_) => "optional_type".into(),
+            Value::Net(n) => n.type_name().into(),
         }
     }
 
@@ -116,6 +131,14 @@ impl Value {
             (String(a), String(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
             (Date(a), Date(b)) => a == b,
+            (Timestamp(a), Timestamp(b)) | (Duration(a), Duration(b)) => a == b,
+            (Type(a), Type(b)) => a == b,
+            (Net(a), Net(b)) => a == b,
+            (Optional(a), Optional(b)) => match (a, b) {
+                (None, None) => true,
+                (Some(x), Some(y)) => x.cel_eq(y),
+                _ => false,
+            },
             (Int(_) | Uint(_) | Double(_), Int(_) | Uint(_) | Double(_)) => {
                 numeric_cmp(self, other) == Some(Ordering::Equal)
             }
@@ -142,30 +165,16 @@ pub fn numeric_cmp(a: &Value, b: &Value) -> Option<Ordering> {
         (Int(x), Uint(y)) => Some((*x as i128).cmp(&(*y as i128))),
         (Uint(x), Int(y)) => Some((*x as i128).cmp(&(*y as i128))),
         (Double(x), Double(y)) => x.partial_cmp(y),
-        (Double(x), Int(y)) => cmp_f64_i128(*x, *y as i128),
-        (Double(x), Uint(y)) => cmp_f64_i128(*x, *y as i128),
-        (Int(x), Double(y)) => cmp_f64_i128(*y, *x as i128).map(Ordering::reverse),
-        (Uint(x), Double(y)) => cmp_f64_i128(*y, *x as i128).map(Ordering::reverse),
+        // The spec compares int/uint against double by converting to double (lossy):
+        // 9223372036854775807 < 9223372036854775808.0 is false.
+        (Double(x), Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Double(x), Uint(y)) => x.partial_cmp(&(*y as f64)),
+        (Int(x), Double(y)) => (*x as f64).partial_cmp(y),
+        (Uint(x), Double(y)) => (*x as f64).partial_cmp(y),
         _ => None,
     }
 }
 
-fn cmp_f64_i128(x: f64, y: i128) -> Option<Ordering> {
-    if x.is_nan() {
-        return None;
-    }
-    if x < -1.8e19 {
-        return Some(Ordering::Less);
-    }
-    if x > 1.8e19 {
-        return Some(Ordering::Greater);
-    }
-    let t = x.trunc() as i128;
-    Some(match t.cmp(&y) {
-        Ordering::Equal => x.fract().partial_cmp(&0.0).unwrap(),
-        o => o,
-    })
-}
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -178,6 +187,12 @@ impl fmt::Display for Value {
             Value::String(s) => write!(f, "{}", celspresso_syntax::ast::quote_string(s)),
             Value::Bytes(b) => write!(f, "b{:?}", String::from_utf8_lossy(b)),
             Value::Date(d) => write!(f, "date(\"{}\")", crate::date::format_date(*d)),
+            Value::Timestamp(t) => write!(f, "timestamp(\"{}\")", crate::time::format_timestamp(*t)),
+            Value::Duration(d) => write!(f, "duration(\"{}\")", crate::time::format_duration(*d)),
+            Value::Type(t) => write!(f, "{t}"),
+            Value::Net(n) => write!(f, "{}(\"{n}\")", if matches!(**n, crate::net::Net::Ip(_)) { "ip" } else { "cidr" }),
+            Value::Optional(None) => write!(f, "optional.none()"),
+            Value::Optional(Some(v)) => write!(f, "optional.of({v})"),
             Value::List(items) => {
                 write!(f, "[")?;
                 for (i, v) in items.iter().enumerate() {

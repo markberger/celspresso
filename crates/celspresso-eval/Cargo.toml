@@ -9,3 +9,4 @@ celspresso-syntax.workspace = true
 celspresso-check.workspace = true
 thiserror.workspace = true
 regex.workspace = true
+jiff = { version = "1.0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }

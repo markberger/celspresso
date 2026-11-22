@@ -21,12 +21,26 @@ _SCALARS: dict[Any, str] = {
     str: "string",
     bytes: "bytes",
     _dt.date: "date",
+    _dt.datetime: "timestamp",
+    _dt.timedelta: "duration",
     type(None): "null",
     Any: "dyn",
     object: "dyn",
 }
 
-_CEL_NAMES = {"bool", "int", "uint", "double", "string", "bytes", "null", "date", "dyn"}
+_CEL_NAMES = {
+    "bool",
+    "int",
+    "uint",
+    "double",
+    "string",
+    "bytes",
+    "null",
+    "date",
+    "timestamp",
+    "duration",
+    "dyn",
+}
 
 
 def is_model(tp: Any) -> bool:
@@ -232,7 +246,14 @@ def cel_literal(value: Any) -> str:
     if isinstance(value, bytes):
         return "b" + cel_literal(value.decode("latin-1"))
     if isinstance(value, _dt.datetime):
-        raise TypeError("datetime is not supported; use datetime.date")
+        if value.utcoffset() is None:
+            raise TypeError("naive datetime has no time zone; attach one, e.g. tzinfo=datetime.timezone.utc")
+        utc = value.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+        return f'timestamp("{utc.isoformat()}Z")'
+    if isinstance(value, _dt.timedelta):
+        micros = (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+        sign, micros = ("-", -micros) if micros < 0 else ("", micros)
+        return f'duration("{sign}{micros // 1_000_000}s{micros % 1_000_000}us")'
     if isinstance(value, _dt.date):
         return f'date("{value.isoformat()}")'
     if isinstance(value, (list, tuple, set, frozenset)):

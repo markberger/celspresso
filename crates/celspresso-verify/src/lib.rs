@@ -8,7 +8,7 @@ mod encode;
 mod sym;
 mod zutil;
 
-use celspresso_check::CheckedExpr;
+use celspresso_check::{CelType, CheckedExpr, Reference};
 use celspresso_eval::{evaluate, Functions, Limits, Value};
 use encode::Encoder;
 use std::cell::RefCell;
@@ -147,9 +147,9 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
                     model = m;
                 }
                 let _ = solver.set_params(&params); // restore the full timeout
-                let w = enc.witness(&model);
                 let rec = Recording { inner: funcs, calls: RefCell::new(Vec::new()) };
-                if replay(q, assumptions, &w, &rec) {
+                let w = complete_witness(q, assumptions, enc.witness(&model));
+                if let Some(w) = w.filter(|w| replay(q, assumptions, w, &rec)) {
                     break Status::Found(w);
                 }
                 let facts: Vec<Bool> =
@@ -270,6 +270,52 @@ impl<'a> ReadablePass<'a> {
         }
         None
     }
+}
+
+/// The encoding only sees variables it modeled: one referenced only under an
+/// approximation (`optional.of(s).hasValue()`) is absent from the model. Give each such
+/// variable a concrete default so the replay below checks the witness for real; without
+/// a default the variable stays unbound, replay fails, and the verdict is UNKNOWN.
+fn complete_witness(q: &Query, assumptions: &[&CheckedExpr], mut w: BTreeMap<String, Value>) -> Option<BTreeMap<String, Value>> {
+    let exprs: Vec<&CheckedExpr> = match q {
+        Query::Satisfiable(p) | Query::AlwaysTrue(p) | Query::CanError(p) => vec![p],
+        Query::Equivalent(a, b, _) | Query::Implies(a, b) => vec![a, b],
+    };
+    for c in exprs.into_iter().chain(assumptions.iter().copied()) {
+        for r in c.refs.values() {
+            if let Reference::Var(name) = r {
+                if !w.contains_key(name) {
+                    match c.schema.vars.get(name).and_then(|d| default_value(&d.ty)) {
+                        Some(v) => {
+                            w.insert(name.clone(), v);
+                        }
+                        // an unbound variable would make evaluation error, which replay could
+                        // mistake for a confirmed counterexample: mark the witness unusable
+                        None => return None,
+                    }
+                }
+            }
+        }
+    }
+    Some(w)
+}
+
+fn default_value(t: &CelType) -> Option<Value> {
+    Some(match t {
+        CelType::Bool => Value::Bool(false),
+        CelType::Int => Value::Int(0),
+        CelType::Uint => Value::Uint(0),
+        CelType::Double => Value::Double(0.0),
+        CelType::String => Value::str(""),
+        CelType::Bytes => Value::Bytes(std::sync::Arc::from(&b""[..])),
+        CelType::Null | CelType::Nullable(_) | CelType::Dyn => Value::Null,
+        CelType::Date => Value::Date(0),
+        CelType::Timestamp => Value::Timestamp(0),
+        CelType::Duration => Value::Duration(0),
+        CelType::List(_) => Value::list(vec![]),
+        CelType::Map(..) => Value::Map(std::sync::Arc::new(BTreeMap::new())),
+        _ => return None,
+    })
 }
 
 fn replay(q: &Query, assumptions: &[&CheckedExpr], w: &BTreeMap<String, Value>, funcs: &dyn Functions) -> bool {

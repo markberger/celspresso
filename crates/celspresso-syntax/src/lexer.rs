@@ -6,6 +6,10 @@ use crate::error::SyntaxError;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Ident(String),
+    /// A reserved word: an error as an identifier, but allowed as a field or method name.
+    Reserved(String),
+    /// A backtick-quoted field name, e.g. `` `content-type` ``.
+    QuotedIdent(String),
     Int(u64),     // magnitude; sign handled by the parser
     Uint(u64),
     Double(f64),
@@ -47,6 +51,8 @@ impl Tok {
     pub fn describe(&self) -> String {
         match self {
             Tok::Ident(s) => format!("identifier '{s}'"),
+            Tok::Reserved(s) => format!("reserved identifier '{s}'"),
+            Tok::QuotedIdent(s) => format!("quoted identifier `{s}`"),
             Tok::Int(_) | Tok::Uint(_) | Tok::Double(_) => "number".into(),
             Tok::Str(_) => "string".into(),
             Tok::Bytes(_) => "bytes".into(),
@@ -162,6 +168,19 @@ impl<'a> Lexer<'a> {
                     let s = self.bytes_body(true)?;
                     self.push(Tok::Bytes(s), start);
                 }
+                b'`' => {
+                    self.pos += 1;
+                    let body = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-' | b'/' | b' ')) {
+                        self.pos += 1;
+                    }
+                    if self.peek() != Some(b'`') || self.pos == body {
+                        return Err(self.err(start, "invalid quoted identifier; allowed: letters, digits, '_', '.', '-', '/', ' '".to_string()));
+                    }
+                    let name = self.src[body..self.pos].to_string();
+                    self.pos += 1;
+                    self.push(Tok::QuotedIdent(name), start);
+                }
                 c if c == b'_' || c.is_ascii_alphabetic() => {
                     while matches!(self.peek(), Some(c) if c == b'_' || c.is_ascii_alphanumeric()) {
                         self.pos += 1;
@@ -172,9 +191,7 @@ impl<'a> Lexer<'a> {
                         "false" => Tok::False,
                         "null" => Tok::Null,
                         "in" => Tok::In,
-                        w if RESERVED.contains(&w) => {
-                            return Err(self.err(start, format!("reserved identifier '{w}'")));
-                        }
+                        w if RESERVED.contains(&w) => Tok::Reserved(w.to_string()),
                         w => Tok::Ident(w.to_string()),
                     };
                     self.push(tok, start);

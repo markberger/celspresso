@@ -128,7 +128,8 @@ Every method takes `assuming=` for extra preconditions and `timeout=` in seconds
 - `@function` and `env.extend(functions=[...])` call your own Python functions from CEL.
 - `expr.explain(data)` shows the value of every sub-expression, for debugging and audit logs.
 - `celspresso.testing` provides `assert_equivalent`, `assert_implies`, `assert_never` and more for your test suite.
-- Pydantic models, dataclasses, `Optional`, lists, maps and `datetime.date` are all supported. `Decimal` is rejected: store money as integer cents.
+- Pydantic models, dataclasses, `Optional`, lists, maps `datetime.date`, `datetime.datetime` (timezone-aware) and `timedelta` are all supported. `Decimal` is rejected: store money as integer cents.
+- The standard CEL extensions are built in: strings, math, lists, sets, base64, optionals (`m.?key.orValue(0)`), `cel.bind`, `cel.block`, and the Kubernetes network library (`ip()`, `cidr()`).
 
 ## Performance
 
@@ -143,7 +144,7 @@ Reproduce these numbers with `uv run python benchmarks/bench_verify.py`.
 
 ## Not yet supported
 
-Protobuf messages, doubles, maps and bytes inside the verifier, timestamps and durations, and function contracts. Constructs the verifier doesn't model yet return `UNKNOWN`, with the reason named in `verdict.reason`.
+Protobuf messages and JSON values. The verifier doesn't yet model doubles, maps, bytes, optionals, timestamps or function contracts. Constructs the verifier doesn't model yet return `UNKNOWN`, with the reason named in `verdict.reason`.
 
 ## Contributing
 

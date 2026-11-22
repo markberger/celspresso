@@ -43,6 +43,16 @@ fn macros_roundtrip() {
         "xs.map(x, x > 0, x * 2)",
         "xs.filter(x, x > 0)",
         "has(user.name)",
+        "xs.all(i, x, x > i)",
+        "m.transformMap(k, v, v + 1)",
+        "m.transformList(k, v, k > 0, v)",
+        "cel.bind(x, 1, x + 1)",
+        "xs.sortBy(e, -e)",
+        "m.?a.b[?0]",
+        "[?a, b]",
+        r#"{?"k": v, "j": w}"#,
+        "cel.block([1, cel.index(0) + 1], [cel.index(1)].map(cel.iterVar(0, 0), cel.iterVar(0, 0) * 2))",
+        "o.optMap(x, x + 1).optFlatMap(y, optional.of(y)) == optional.none()",
     ] {
         assert_eq!(roundtrip(src), src);
     }
@@ -77,4 +87,17 @@ fn unique_ids() {
     let e = parse("xs.map(x, x > 0, x * 2) + [a.b[c]]").unwrap();
     let mut ids = std::collections::HashSet::new();
     e.walk(&mut |n| assert!(ids.insert(n.id), "duplicate id {}", n.id));
+}
+
+#[test]
+fn macro_copies_have_fresh_ids() {
+    for src in ["a.b.sortBy(e, e)", "a.b.optMap(x, x)"] {
+        let e = parse(src).unwrap();
+        let mut ids = Vec::new();
+        e.walk(&mut |n| ids.push(n.id));
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "{src}");
+    }
 }
