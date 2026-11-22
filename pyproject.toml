@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "celspresso"
+description = "Typed CEL expressions for Python with formal verification (Rust + Z3)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.6"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pydantic>=2.6", "maturin>=1.9,<2", "pyright>=1.1.400", "ruff>=0.8"]
+
+[tool.maturin]
+manifest-path = "crates/celspresso-py/Cargo.toml"
+python-source = "python"
+module-name = "celspresso._celspresso"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
