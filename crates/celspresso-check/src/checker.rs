@@ -304,7 +304,9 @@ impl<'a> Checker<'a> {
             return CelType::Type(Box::new(t));
         }
         let mut msg = format!("undeclared reference to '{name}'");
-        if let Some(s) = suggest(name, self.schema.vars.keys().map(|s| s.as_str())) {
+        if let Some(h) = ident_hint(name) {
+            msg.push_str(&format!(" ({h})"));
+        } else if let Some(s) = suggest(name, self.schema.vars.keys().map(|s| s.as_str())) {
             msg.push_str(&format!(" (did you mean '{s}'?)"));
         }
         self.error(e, msg)
@@ -350,7 +352,13 @@ impl<'a> Checker<'a> {
                 *v
             }
             CelType::Dyn | CelType::Error | CelType::Param(_) => CelType::Dyn,
-            other => self.error(e, format!("type '{other}' does not support field selection")),
+            other => {
+                let hint = match field {
+                    "length" | "len" | "size" | "count" => " (CEL's length is size(x) or x.size())",
+                    _ => "",
+                };
+                self.error(e, format!("type '{other}' does not support field selection{hint}"))
+            }
         }
     }
 
@@ -474,7 +482,9 @@ impl<'a> Checker<'a> {
                 .filter(|k| !k.starts_with('_') && !k.starts_with('@') && !k.starts_with('!') && !k.starts_with('-'))
                 .map(|s| s.as_str());
             let mut msg = format!("undeclared reference to function '{function}'");
-            if let Some(s) = suggest(function, all) {
+            if let Some(h) = function_hint(function) {
+                msg.push_str(&format!(" ({h})"));
+            } else if let Some(s) = suggest(function, all) {
                 msg.push_str(&format!(" (did you mean '{s}'?)"));
             }
             return self.error(e, msg);
@@ -502,11 +512,14 @@ impl<'a> Checker<'a> {
             0 => {
                 let shown: Vec<String> = arg_types.iter().map(|t| self.resolved(t).to_string()).collect();
                 let name = display_fn(function);
-                let msg = if receiver {
+                let mut msg = if receiver {
                     format!("found no matching overload for '{name}' applied to '{}.({})'", shown[0], shown[1..].join(", "))
                 } else {
                     format!("found no matching overload for '{name}' applied to '({})'", shown.join(", "))
                 };
+                if let Some(h) = overload_hint(function, &shown) {
+                    msg.push_str(&format!(" ({h})"));
+                }
                 self.error(e, msg)
             }
             1 => {
@@ -613,6 +626,52 @@ fn display_fn(f: &str) -> &str {
 }
 
 /// Closest candidate within a small edit distance.
+/// Hints for names other languages use where CEL has a keyword or literal.
+fn ident_hint(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "None" | "nil" | "NULL" | "Null" | "undefined" => "CEL's null is 'null'",
+        "True" | "TRUE" => "CEL's true is 'true'",
+        "False" | "FALSE" => "CEL's false is 'false'",
+        "and" => "CEL's 'and' is '&&'",
+        "or" => "CEL's 'or' is '||'",
+        "not" => "CEL writes 'not x' as '!x'",
+        _ => return None,
+    })
+}
+
+/// Hints for functions from Python, JavaScript or SQL, pointing at the CEL equivalent.
+fn function_hint(function: &str) -> Option<&'static str> {
+    Some(match function {
+        "len" | "length" | "count" | "size_of" => "CEL's length is size(x) or x.size()",
+        "lower" | "lowercase" | "toLowerCase" | "tolower" | "casefold" => "use s.lowerAscii()",
+        "upper" | "uppercase" | "toUpperCase" | "toupper" => "use s.upperAscii()",
+        "strip" | "trimSpace" => "use s.trim()",
+        "includes" | "has_substring" => "use s.contains(t) for strings, 'x in list' for lists",
+        "isinstance" | "typeof" => "compare types with type(x) == int",
+        "str" | "toString" => "convert with string(x)",
+        "any" | "some" => "use list.exists(x, cond)",
+        "every" => "use list.all(x, cond)",
+        "abs" => "write it as x < 0 ? -x : x",
+        "keys" => "maps iterate over their keys: m.all(k, ...), 'k in m'",
+        _ => return None,
+    })
+}
+
+/// Hints for overload mismatches with a common cause.
+fn overload_hint(function: &str, shown: &[String]) -> Option<String> {
+    match (function, shown) {
+        (ops::IN, [_, s]) if s == "string" => Some("for a substring, use s.contains(t)".into()),
+        (ops::EQUALS | ops::NOT_EQUALS, [a, b]) if (a == "null_type") != (b == "null_type") => {
+            let t = if a == "null_type" { b } else { a };
+            Some(format!("a value of type {t} is never null; declare it Optional[...] if it can be missing"))
+        }
+        (ops::CONDITIONAL, [c, a, b]) if c == "bool" && a != b && (a == "bool" || b == "bool") => {
+            Some("'c ? a : b == x' parses as 'c ? a : (b == x)'; add parentheses".into())
+        }
+        _ => None,
+    }
+}
+
 pub fn suggest<'s>(name: &str, candidates: impl Iterator<Item = &'s str>) -> Option<&'s str> {
     let max = (name.len() / 3).max(1);
     candidates.map(|c| (levenshtein(name, c), c)).filter(|(d, _)| *d <= max).min_by_key(|(d, _)| *d).map(|(_, c)| c)

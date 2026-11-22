@@ -101,3 +101,16 @@ fn macro_copies_have_fresh_ids() {
         assert_eq!(ids.len(), n, "{src}");
     }
 }
+
+#[test]
+fn hints_for_other_languages() {
+    let msg = |src: &str| crate::parse(src).unwrap_err().message;
+    assert!(msg("a and b").ends_with("(CEL's 'and' is '&&')"));
+    assert!(msg("a OR b").ends_with("(CEL's 'or' is '||')"));
+    assert!(msg("not a").ends_with("(CEL writes 'not x' as '!x')"));
+    assert!(msg("a = 1").contains("use '=='"));
+    assert!(msg("a === 1").contains("no '==='"));
+    assert!(msg("a & b").contains("'&&'"));
+    assert!(msg("xs contains 1").contains("x in list"));
+    assert!(msg("a b").ends_with("found identifier 'b'"), "no hint when nothing fits");
+}

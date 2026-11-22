@@ -124,3 +124,94 @@ def test_witness_dates_are_near_today() -> None:
         assert abs((d - dt.date.today()).days) <= 400
     assert "today = " in str(v.counterexample)
     assert "p.license_expires = " in str(v)
+
+
+# -- useful, not just safe: require=, examples=, warnings -------------------------
+
+NARROW = SAFE + " && p.malpractice_claims == 7 && p.work_gap_months == 3"
+MUST_ALLOW = {
+    "clean credentialed MDs": "p.type == 'MD' && p.status == 'credentialed' && p.license_expires >= today"
+    " && p.oig_cleared && p.malpractice_claims == 0"
+}
+
+
+def provider(**over: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "type": "MD",
+        "status": "credentialed",
+        "state": "NY",
+        "applied_on": dt.date(2026, 1, 1),
+        "license_expires": dt.date(2027, 1, 1),
+        "oig_cleared": True,
+        "malpractice_claims": 0,
+        "work_gap_months": 0,
+        "board_certified": True,
+        "has_collab_agreement": False,
+    }
+    return base | over
+
+
+TODAY = dt.date(2026, 11, 21)
+EXAMPLES = [
+    ({"p": provider(), "today": TODAY, "m": {}}, True),
+    ({"p": provider(oig_cleared=False), "today": TODAY, "m": {}}, False),
+]
+
+
+def test_require_catches_rules_too_narrow_to_be_useful() -> None:
+    # safe, so the invariants alone accept it, but it allows almost nobody
+    assert env.check_rule(NARROW, INVARIANTS).ok
+    r = env.check_rule(NARROW, INVARIANTS, require=MUST_ALLOW)
+    assert kinds(r) == ["too_narrow"]
+    assert r.problems[0].invariant == "clean credentialed MDs"
+    assert "too narrow: doesn't allow 'clean credentialed MDs', e.g. when" in str(r)
+    assert env.check_rule(SAFE, INVARIANTS, require=MUST_ALLOW).ok
+    # unnamed requirements are keyed by their source
+    r = env.check_rule("p.oig_cleared && p.board_certified", require=["p.oig_cleared"])
+    assert r.problems[0].invariant == "p.oig_cleared"
+
+
+def test_examples_are_replayed() -> None:
+    assert env.check_rule(SAFE, INVARIANTS, examples=EXAMPLES).ok
+    r = env.check_rule(NARROW, examples=EXAMPLES)
+    assert kinds(r) == ["wrong_example"]
+    assert "example 0 should give True, but the rule gives False" in str(r)
+    r = env.check_rule("100 / p.work_gap_months > 1", examples=EXAMPLES)
+    assert kinds(r)[0] == "wrong_example"
+    assert "evaluation fails" in str(r)
+    # examples that break the schema are the caller's bug, not the rule's
+    with pytest.raises(ValueError, match="malpractice_claims"):
+        env.check_rule(
+            SAFE, examples=[({"p": provider(malpractice_claims=99), "today": TODAY, "m": {}}, True)]
+        )
+
+
+def test_impossible_literals_are_flagged() -> None:
+    p = env.predicate("p.state == 'CA' || p.status in ['credentialed', 'Credentialed']")
+    assert [w.message for w in p.warnings] == [
+        "'CA' is not a possible value of p.state (one of 'OH', 'NY'), so this comparison is never true",
+        "'Credentialed' is not a possible value of p.status"
+        " (one of 'applied', 'provisional', 'credentialed')",
+    ]
+    assert "^^^^" in p.warnings[0].rendered
+    r = env.check_rule(f"({SAFE}) || p.state == 'CA'", INVARIANTS)
+    assert kinds(r) == ["suspicious"]
+    assert env.predicate(SAFE).warnings == []
+
+
+def test_describe_is_a_prompt_ready_spec() -> None:
+    d = (
+        env.extend(assumptions=["p.malpractice_claims < 10"])
+        .define("clean", "p.malpractice_claims == 0")
+        .describe()
+    )
+    for line in [
+        "  p: Provider",
+        '    type: string, one of "MD", "NP"',
+        "    malpractice_claims: int, >= 0, <= 20",
+        "    applied_on: date",
+        "  clean := p.malpractice_claims == 0",
+        "  p.malpractice_claims < 10",
+        "CEL quick reference:",
+    ]:
+        assert line in d.splitlines(), (line, d)

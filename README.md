@@ -53,7 +53,7 @@ uv sync --group dev && uv run maturin develop --release
 | `a.diff(b)` | Where do they disagree, and why? | one input per distinct reason |
 | `e.can_error()` | Can evaluation fail (÷0, overflow, missing key)? | `SAT` + example / `UNSAT` |
 | `e.bounds()` | What's the smallest and largest value it can take? | proved `[min, max]` + an input for each |
-| `env.check_rule(src, invariants)` | Is this rule safe to accept? | report |
+| `env.check_rule(src, invariants, require=...)` | Is this rule safe, and useful enough, to accept? | report |
 
 **Catch a refactor that changes behavior.** Someone tidies `<= 30` into `< 30`:
 
@@ -100,13 +100,26 @@ print(env.check_rule("order.status == 'lost' || (order.tier == 'gold' && order.d
 # - violates 'nothing is refunded after 90 days' when order.days_since_delivery = 91, order.status = 'lost', ...
 ```
 
-The report is plain text that a person or an LLM can act on, so it can drive a repair loop:
+Invariants keep a rule *safe*. `require=` and `examples=` keep it *useful*. Without them, a rule that refunds almost nothing passes every safety check:
 
 ```python
-feedback = ""
+MUST_REFUND = {"small lost orders": "order.status == 'lost' && order.total_cents <= 10000"}
+
+rule = "order.status == 'lost' && order.total_cents == 700 && order.days_since_delivery <= 90"
+print(env.check_rule(rule, POLICY, require=MUST_REFUND))
+# rejected:
+# - too narrow: doesn't allow 'small lost orders', e.g. when order.days_since_delivery = 91, order.status = 'lost', order.total_cents = 0
+```
+
+`check_rule` also flags code that type-checks but can't be what was meant. For example, `order.tier == 'Gold'` can never be true when the tier is `'standard'` or `'gold'`. Habits from other languages get a pointer to the CEL form: `and` → `&&`, `len(x)` → `size(x)`, `None` → `null`.
+
+`env.describe()` gives an LLM everything it needs in one block of text: variables, fields, types and constraints, functions, definitions and a CEL cheat sheet. The report is plain text too, so the two drive a repair loop:
+
+```python
+spec, feedback = env.describe(), ""
 for _ in range(5):
-    src = llm.draft_rule(policy_doc, feedback)   # your LLM call
-    report = env.check_rule(src, POLICY)
+    src = llm.draft_rule(spec, policy_doc, feedback)   # your LLM call
+    report = env.check_rule(src, POLICY, require=MUST_REFUND, examples=golden_set)
     if report.ok:
         break
     feedback = str(report)

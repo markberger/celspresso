@@ -358,6 +358,42 @@ class Env:
     def assumptions(self) -> tuple[str, ...]:
         return self._assumptions
 
+    def describe(self) -> str:
+        """Everything a rule author (person or LLM) needs, as compact text for a prompt.
+
+        Lists the variables, every model's fields with their types and constraints, the
+        functions and definitions in scope, the assumed facts, and a short CEL reference.
+        """
+        out = ["Write one CEL expression (https://cel.dev) over these variables.", "", "Variables:"]
+        out += [f"  {n}: {_spec_text(s, c)}" for n, (s, c) in self._vars.items()]
+        structs = self._builder.structs
+        if structs:
+            out += ["", "Types:"]
+            for name, fields in structs.items():
+                out.append(f"  {name}")
+                out += [f"    {f}: {_spec_text(s, c)}" for f, s, c in fields]
+        if self._fns:
+            out += ["", "Functions:"]
+            for f in self._fns.values():
+                names = f.param_names or tuple(f"arg{i}" for i in range(len(f.params)))
+                ps = ", ".join(f"{n}: {type_name(t)}" for n, t in zip(names, f.params, strict=False))
+                line = f"  {f.name}({ps}) -> {type_name(f.result)}"
+                out.append(line + (f"  (guarantees: {f.ensures})" if f.ensures else ""))
+        if self._defs:
+            out += ["", "Definitions (use them by name):"]
+            for name, src, params in self._defs:
+                body = " ".join(src.split())
+                if params is None:
+                    out.append(f"  {name} := {body}")
+                else:
+                    ps = ", ".join(f"{p}: {type_name(t)}" for p, t in params)
+                    out.append(f"  {name}({ps}) := {body}")
+        if self._assumptions:
+            out += ["", "Always true (you may rely on these):"]
+            out += [f"  {a}" for a in self._assumptions]
+        out += ["", _CEL_REFERENCE]
+        return "\n".join(out)
+
     def __repr__(self) -> str:
         vs = ", ".join(f"{n}: {t}" for n, t in self.variables.items())
         return f"Env({vs})"
@@ -498,27 +534,39 @@ class Env:
         rule: str | Predicate,
         invariants: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
         *,
+        require: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
+        examples: Iterable[tuple[Mapping[str, Any], bool]] = (),
         assuming: Iterable[str | Predicate] | str | Predicate = (),
         timeout: float | None = None,
     ) -> RuleCheck:
         """Vet a rule you didn't write (from a customer, an admin UI or an LLM) before accepting it.
 
-        Checks, in order: it compiles to a predicate; it can fire at all; it can't fail
-        at runtime; and it implies every invariant (named, or keyed by their source).
-        A check that comes back UNKNOWN is a problem too, so `.ok` means *proved* safe.
+        Checks, in order: it compiles to a predicate; nothing in it is a likely mistake
+        (see `Expr.warnings`); it gives the expected answer on every labelled example;
+        it can fire at all; it can't fail at runtime; it implies every invariant (what it
+        must never allow); and every `require` case implies it (what it must allow).
+        Invariants keep a rule safe, `require` and `examples` keep it useful: without them
+        a rule that allows almost nothing passes. A check that comes back UNKNOWN is a
+        problem too, so `.ok` means *proved*.
         """
         src = rule if isinstance(rule, str) else rule.source
         try:
             pred = self.predicate(rule) if isinstance(rule, str) else rule
         except CelError as e:
             return RuleCheck(src, None, (Problem("invalid", str(e)),))
-        named: dict[str, str | Predicate] = {}
-        if isinstance(invariants, Mapping):
-            named.update(typing.cast("Mapping[str, str | Predicate]", invariants))
-        else:
-            for i in invariants:
-                named[i if isinstance(i, str) else i.source] = i
-        problems: list[Problem] = []
+        named = _named(invariants)
+        required = _named(require)
+        problems: list[Problem] = [Problem("suspicious", w.rendered) for w in pred.warnings]
+        for i, (data, expected) in enumerate(examples):
+            try:
+                got: Any = pred.evaluate(data)
+            except CelEvaluationError as e:
+                why = f"example {i} should give {expected}, but evaluation fails: {e}"
+                problems.append(Problem("wrong_example", why))
+                continue
+            if got is not expected:
+                why = f"example {i} should give {expected}, but the rule gives {got}"
+                problems.append(Problem("wrong_example", why))
 
         def undecided(what: str, v: Verdict, invariant: str | None = None) -> None:
             problems.append(Problem("unverified", f"could not verify {what}: {v.reason}", invariant, v))
@@ -540,10 +588,75 @@ class Env:
                 problems.append(Problem("violates", f"violates '{name}' when {v.counterexample}", name, v))
             elif v.unknown:
                 undecided(f"'{name}'", v, name)
+        for name, req in required.items():
+            v = self._as_predicate(req).implies(pred, assuming=assuming, timeout=timeout)
+            if v.refuted:
+                msg = f"too narrow: doesn't allow '{name}', e.g. when {v.counterexample}"
+                problems.append(Problem("too_narrow", msg, name, v))
+            elif v.unknown:
+                undecided(f"that it allows '{name}'", v, name)
         return RuleCheck(src, pred, tuple(problems))
 
+    def _as_predicate(self, p: str | Predicate) -> Predicate:
+        return self.predicate(p) if isinstance(p, str) else p
 
-ProblemKind = Literal["invalid", "never_fires", "can_error", "violates", "unverified"]
+
+ProblemKind = Literal[
+    "invalid",
+    "suspicious",
+    "wrong_example",
+    "never_fires",
+    "can_error",
+    "violates",
+    "too_narrow",
+    "unverified",
+]
+
+
+def _named(items: Mapping[str, str | Predicate] | Iterable[str | Predicate]) -> dict[str, str | Predicate]:
+    """Name each condition: by its key, or by its source."""
+    if isinstance(items, Mapping):
+        return dict(typing.cast("Mapping[str, str | Predicate]", items))
+    return {i if isinstance(i, str) else i.source: i for i in items}
+
+
+def _spec_text(spec: TypeSpec, cons: Mapping[str, Any] | None) -> str:
+    """A type and its constraints, as a rule author needs them."""
+    nullable = isinstance(spec, tuple) and spec[0] == "nullable"
+    base = spec[1] if nullable else spec
+    parts = [type_name(base) + (" or null" if nullable else "")]
+    parts += _cons_text(cons)
+    return ", ".join(parts)
+
+
+def _cons_text(cons: Mapping[str, Any] | None) -> list[str]:
+    if not cons:
+        return []
+    out: list[str] = []
+    if cons.get("one_of") is not None:
+        out.append("one of " + ", ".join(cel_literal(v) for v in cons["one_of"]))
+    for key, op in (("ge", ">="), ("gt", ">"), ("le", "<="), ("lt", "<")):
+        if cons.get(key) is not None:
+            b = cons[key]
+            out.append(f"{op} {int(b) if float(b).is_integer() else b}")
+    if cons.get("min_length") is not None:
+        out.append(f"size >= {cons['min_length']}")
+    if cons.get("max_length") is not None:
+        out.append(f"size <= {cons['max_length']}")
+    if cons.get("pattern") is not None:
+        out.append(f"matches {cons['pattern']!r}")
+    if cons.get("items"):
+        out.append("each item: " + ", ".join(_cons_text(cons["items"])))
+    return out
+
+
+_CEL_REFERENCE = """CEL quick reference:
+  logic: a && b, a || b, !a, cond ? x : y        (no 'and', 'or', 'not', 'if')
+  compare: == != < <= > >=, x in [1, 2], k in map  (no '=' or '===')
+  literals: true, false, null, 42, 4.2, 'text', [1, 2], {'k': 1}
+  strings: size(s), s.contains(t), s.startsWith(t), s.endsWith(t), s.matches(regex), s.lowerAscii()
+  lists: size(l), l.all(x, p), l.exists(x, p), l.exists_one(x, p), l.filter(x, p), l.map(x, f)
+  fields: m.f; has(m.f) tests presence; ints are 64-bit and overflow is an error"""
 
 
 @dataclass(frozen=True)
@@ -682,6 +795,15 @@ class Expr(Generic[T]):
     def references(self) -> list[str]:
         """Variables and field paths this expression reads, e.g. ['user.age']."""
         return self._prog.references
+
+    @property
+    def warnings(self) -> list[Diagnostic]:
+        """Code that type-checks but is almost certainly a mistake.
+
+        For example `order.tier == 'Gold'` when the schema says the tier is 'standard'
+        or 'gold': the comparison can never be true.
+        """
+        return [Diagnostic(m, a, b, r) for (m, a, b, r) in self._prog.lint()]
 
     @property
     def env(self) -> Env:

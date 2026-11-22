@@ -2,6 +2,7 @@
 
 pub mod checker;
 pub mod decls;
+pub mod lint;
 pub mod types;
 
 pub use checker::{check, check_unchecked, suggest, CheckError, CheckedExpr, Reference};

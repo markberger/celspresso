@@ -664,6 +664,19 @@ impl Program {
     fn references(&self) -> Vec<String> {
         self.checked.references()
     }
+    /// Warnings: (message, start, end, rendered) for code that type-checks but looks wrong.
+    fn lint(&self) -> Vec<(String, usize, usize, String)> {
+        let len = self.source.len() as u32;
+        celspresso_check::lint::lint(&self.checked)
+            .into_iter()
+            .filter(|w| w.span.end <= len) // spans from expanded definitions point elsewhere
+            .map(|w| {
+                let (a, b) = span_chars(&self.source, w.span);
+                let rendered = render_diagnostic(&self.source, w.span, &w.message);
+                (w.message, a, b, rendered)
+            })
+            .collect()
+    }
 
     #[pyo3(signature = (vars, functions=None, limits=None))]
     fn evaluate<'py>(

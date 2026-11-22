@@ -126,3 +126,34 @@ fn parameterized_definitions() {
     let e = expand_definitions(parse("clamp(1, 2)").unwrap(), &defs);
     assert!(matches!(e.kind, celspresso_syntax::ast::ExprKind::Call { .. }));
 }
+
+#[test]
+fn hints_for_other_languages() {
+    assert!(err("len(xs) > 0").ends_with("(CEL's length is size(x) or x.size())"));
+    assert!(err("user.nick.lower() == 'a'").ends_with("(use s.lowerAscii())"));
+    assert!(err("user.age == None").ends_with("(CEL's null is 'null')"));
+    assert!(err("True").ends_with("(CEL's true is 'true')"));
+    assert!(err("xs.length > 0").ends_with("(CEL's length is size(x) or x.size())"));
+    assert!(err("'a' in user.roles[0]").ends_with("(for a substring, use s.contains(t))"));
+    assert!(err("user.age == null").contains("never null"));
+    assert!(err("true ? 'a' : 'b' == 'a'").contains("add parentheses"));
+    assert!(err("usr.age > 1").ends_with("(did you mean 'user'?)"), "suggestions still apply");
+}
+
+#[test]
+fn lint_flags_impossible_literals() {
+    let mut s = (*schema()).clone();
+    let tier = Constraints { one_of: Some(vec![Literal::String("free".into()), Literal::String("pro".into())]), ..Default::default() };
+    s.structs.get_mut("User").unwrap().fields.push(FieldDecl { name: "tier".into(), ty: CelType::String, constraints: tier.clone() });
+    s.vars.insert("t".into(), VarDecl { name: "t".into(), ty: CelType::String, constraints: tier });
+    let s = Arc::new(s);
+    let warnings =
+        |src: &str| -> Vec<String> { lint::lint(&check(parse(src).unwrap(), s.clone()).unwrap()).into_iter().map(|w| w.message).collect() };
+    assert_eq!(warnings("user.tier == 'pro' || t in ['free', 'pro']"), Vec::<String>::new());
+    let w = warnings("user.tier == 'Pro'");
+    assert_eq!(w, vec!["'Pro' is not a possible value of user.tier (one of 'free', 'pro'), so this comparison is never true"]);
+    assert!(warnings("'gold' != t")[0].ends_with("always true"));
+    assert_eq!(warnings("t in ['free', 'gold', 'x']").len(), 2);
+    // comprehension variables that shadow nothing declared are not checked
+    assert!(warnings("user.roles.exists(t, t == 'admin')").is_empty());
+}

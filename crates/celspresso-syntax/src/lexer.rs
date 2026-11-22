@@ -243,7 +243,17 @@ impl<'a> Lexer<'a> {
                         _ => {
                             let ch = self.src[start..].chars().next().unwrap();
                             self.pos += ch.len_utf8();
-                            return Err(self.err(start, format!("unexpected character '{ch}'")));
+                            let after_eq = start > 0 && self.src.as_bytes()[start - 1] == b'=';
+                            let hint = match ch {
+                                '=' if after_eq => " (CEL has no '===' or '!==': use '==' or '!=')",
+                                '=' => " (to compare, use '=='; CEL has no assignment)",
+                                '&' => " (CEL's 'and' is '&&')",
+                                '|' => " (CEL's 'or' is '||')",
+                                '#' => " (CEL has no comments)",
+                                '~' | '^' => " (CEL has no bitwise operators)",
+                                _ => "",
+                            };
+                            return Err(self.err(start, format!("unexpected character '{ch}'{hint}")));
                         }
                     };
                     self.pos += len;

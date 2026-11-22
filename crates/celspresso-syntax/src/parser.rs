@@ -77,7 +77,33 @@ impl Parser {
         }
     }
     fn unexpected(&self, expected: &str) -> SyntaxError {
-        SyntaxError { message: format!("expected {expected}, found {}", self.peek().describe()), span: self.peek_span() }
+        let mut message = format!("expected {expected}, found {}", self.peek().describe());
+        if let Some(h) = self.hint() {
+            message.push_str(&format!(" ({h})"));
+        }
+        SyntaxError { message, span: self.peek_span() }
+    }
+    /// What the author probably meant, for habits from Python, SQL or JavaScript.
+    fn hint(&self) -> Option<&'static str> {
+        let prev = self.pos.checked_sub(1).map(|i| &self.tokens[i].tok);
+        if let Some(Tok::Ident(p)) = prev {
+            if p == "not" || p == "NOT" {
+                return Some("CEL writes 'not x' as '!x'");
+            }
+        }
+        let Tok::Ident(s) = self.peek() else { return None };
+        Some(match s.as_str() {
+            "and" | "AND" => "CEL's 'and' is '&&'",
+            "or" | "OR" => "CEL's 'or' is '||'",
+            "is" => "CEL compares with '==' and '!=', e.g. 'x == null'",
+            "contains" | "includes" => "for a substring use s.contains(t); for a list element use 'x in list'",
+            "if" | "else" => "CEL's conditional is 'cond ? a : b'",
+            "matches" => "use s.matches(pattern)",
+            "startswith" | "startsWith" => "use s.startsWith(prefix)",
+            "endswith" | "endsWith" => "use s.endsWith(suffix)",
+            "for" => "iterate with macros: list.all(x, ...), list.exists(x, ...), list.map(x, ...)",
+            _ => return None,
+        })
     }
     fn id(&mut self) -> ExprId {
         let id = self.next_id;
