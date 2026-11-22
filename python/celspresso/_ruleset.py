@@ -89,13 +89,14 @@ class RuleSet:
     def diff(
         self, other: RuleSet, *, limit: int = 5, timeout: float | None = None
     ) -> dict[str, list[Witness]]:
-        """For each rule name in both sets, inputs on which old and new disagree."""
+        """For each rule name in both sets, inputs on which old and new disagree (under
+        this set's assumptions)."""
         out = {}
         for n, old in self.rules.items():
             new = other.rules.get(n)
             if new is None:
                 continue
-            ws = old.diff(new, limit=limit, timeout=timeout)
+            ws = old.diff(new, limit=limit, assuming=self.assumptions, timeout=timeout)
             if ws:
                 out[n] = ws
         return out

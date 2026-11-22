@@ -1,0 +1,11 @@
+# Check every rule:      celspresso check examples/refunds/rules.toml
+# Review a change:       celspresso diff examples/refunds/rules.toml --against main --format markdown
+vars = { order = "models:Order" }
+
+[rules]
+damaged = "order.status == 'damaged' && order.days_since_delivery <= 30 && order.total_cents <= 50000"
+lost = "order.status == 'lost' && order.days_since_delivery <= 60 && order.total_cents <= 20000"
+
+[invariants]   # what no rule may ever allow
+capped = "order.total_cents <= 50000"
+recent = "order.days_since_delivery <= 90"

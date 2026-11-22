@@ -944,13 +944,24 @@ class Expr(Generic[T]):
         timestamp and duration expressions only (found with Z3 Optimize, then proved)."""
         return self._env._bounds(self, assuming, timeout)
 
-    def diff(self, other: Expr[Any], *, limit: int = 5, timeout: float | None = None) -> list[Witness]:
-        """Up to `limit` distinct inputs on which the two expressions disagree."""
+    def diff(
+        self,
+        other: Expr[Any],
+        *,
+        limit: int = 5,
+        assuming: Iterable[str | Predicate] | str | Predicate = (),
+        timeout: float | None = None,
+    ) -> list[Witness]:
+        """Up to `limit` distinct inputs on which the two expressions disagree (and that
+        satisfy every assumption)."""
+        if isinstance(assuming, (str, Predicate)):
+            assuming = [assuming]
+        base: list[str | Predicate] = list(assuming)
         found: list[Witness] = []
         blockers: list[str] = []
         paths = sorted(set(self.references) | set(other.references))
         while len(found) < limit:
-            v = self.equivalent(other, assuming=blockers, timeout=timeout)
+            v = self.equivalent(other, assuming=[*base, *blockers], timeout=timeout)
             if not v.refuted or v.witness is None:
                 break
             found.append(v.witness)

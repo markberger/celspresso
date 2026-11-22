@@ -297,6 +297,17 @@ def test_diff_with_no_differences_and_flat_vars() -> None:
     assert [w["x"] in (2, 3) for w in ws] == [True]
 
 
+def test_diff_witnesses_respect_assumptions() -> None:
+    env = Env(x=int, y=int)
+    old, new = env.predicate("x > 1"), env.predicate("x > 1 || y > 5")
+    ws = old.diff(new, limit=5, assuming="y == 777")
+    assert ws
+    assert all(w["y"] == 777 for w in ws)
+    assert old.diff(new, assuming=[env.predicate("y <= 5")]) == []
+    rs_old = RuleSet({"r": old}, assumptions=["y == 9"])
+    assert [w["y"] for w in rs_old.diff(RuleSet({"r": new}))["r"]] == [9]
+
+
 def test_explain_error_and_nesting() -> None:
     env = Env(x=int, y=int)
     ex = env.compile("x > 0 && x / y > 1").explain({"x": 1, "y": 0})

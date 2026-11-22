@@ -127,6 +127,46 @@ for _ in range(5):
 
 `report.ok` means *proved*: a check that comes back `UNKNOWN` is a problem, never a pass. For a fuller example, see [`examples/credentialing.py`](examples/credentialing.py), where an agent drafts provider-scheduling rules for a healthcare back office against compliance invariants.
 
+## Rule files and code review
+
+Rules that live in your repository can be checked from the command line. A rule file (TOML, JSON, or YAML with PyYAML installed) names the variables' types and lists the rules, the invariants no rule may break, and optionally the cases every rule must allow:
+
+```toml
+# examples/refunds/rules.toml
+vars = { order = "models:Order" }     # module:attribute; or env = "policy:env" for a full Env
+
+[rules]
+damaged = "order.status == 'damaged' && order.days_since_delivery <= 30 && order.total_cents <= 50000"
+lost = "order.status == 'lost' && order.days_since_delivery <= 60 && order.total_cents <= 20000"
+
+[invariants]
+capped = "order.total_cents <= 50000"
+recent = "order.days_since_delivery <= 90"
+```
+
+`celspresso check rules.toml` runs `check_rule` on every rule and exits non-zero if any is rejected. `celspresso diff rules.toml --against main` compares each rule with its version at a git revision. Instead of a text diff, it reports what the change *does*:
+
+```
+$ celspresso diff rules.toml --against main
+damaged: unchanged (rewritten, but proved equivalent)
+lost: changed
+  when order.days_since_delivery = 0, order.status = 'damaged', order.total_cents = 0: false -> true
+  when order.days_since_delivery = 0, order.status = 'lost', order.total_cents = 20001: false -> true
+
+checks on added and changed rules:
+rules.toml:7: lost: rejected
+  - violates 'capped' when order.days_since_delivery = 0, order.status = 'damaged', order.total_cents = 50001
+0 of 1 rules proved ok
+```
+
+Old and new rules are compared only under the assumptions both versions share, so adding an assumption can't hide a change. Edits to the invariants, `require` entries or assumptions are listed too, and then every rule is rechecked, not just the added and changed ones (`--no-check` skips the checks). A file renamed in git has no old version under its new path, so all its rules show as `added`.
+
+Both commands take `--format markdown` (for a pull-request comment), `json`, or `sarif` (for GitHub code scanning). Rewrites the prover can't decide are reported as `undecided`, never as unchanged. Exit status:
+
+- **0**: everything was proved.
+- **1**: `check` rejected a rule; or `diff` found a rule in the new file that is invalid or undecided, or that fails its check. With `--fail-on-change`, `diff` also exits 1 on any change to a rule's behaviour, an invariant, a `require` entry or an assumption.
+- **2**: the command line or the file can't be used, for example a file with no rules or a condition that doesn't compile. Internal errors also exit 2, so a crash never looks like a rejected rule.
+
 ## Verdicts are never guesses
 
 - **Every counterexample is real.** It is replayed through the evaluator and validated by your Pydantic model before you see it.
