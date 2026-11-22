@@ -34,7 +34,9 @@ A `SchemaContext` is only valid during the `schema_for` call it was passed to.
 >>> env.predicate("row.id > 0 && row.email.endsWith('@example.com')").satisfiable().sat
 True
 
-Values are read from attributes or mapping keys named like the fields.
+Values are read from attributes or mapping keys named like the fields, unless a field
+has a `reader`: `ctx.field("lines", list[Line], reader=lambda o: o.line_set.all())`
+reads a relation that isn't itself a list. See `schema.Field`.
 """
 
 from __future__ import annotations

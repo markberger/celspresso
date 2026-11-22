@@ -239,7 +239,7 @@ class Env:
         ]
         try:
             defs = [(n, src, None if ps is None else list(ps)) for n, src, ps in self._defs]
-            self._core = _core.Core(structs, variables, fns, defs)
+            self._core = _core.Core(structs, variables, fns, defs, self._builder.readers)
         except _core.CompileError as exc:
             # a definition (or a function's ensures contract) failed to compile
             _raise_compile(exc)

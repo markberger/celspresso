@@ -18,8 +18,8 @@ all. Everything here is a frozen value, and accepted anywhere an annotation is:
 >>> env.predicate("order.total < 0").satisfiable().unsat
 True
 
-Values of a declared struct are read from mappings or attributes and come back from
-the verifier as plain dicts.
+Values of a declared struct are read from mappings or attributes (or by a field's
+`reader`) and come back from the verifier as plain dicts.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from ._types import TypeSpec
 
@@ -235,11 +235,19 @@ class Constraints:
 
 @dataclass(frozen=True)
 class Field:
-    """One field of a `Struct`."""
+    """One field of a `Struct`.
+
+    By default a field's value is read from the mapping key or attribute named like it.
+    `reader`, if given, is called with the containing object instead and returns the
+    value, e.g. `lambda claim: list(claim.lines.all())` for a related-object manager
+    that isn't itself a list. Whatever it returns is converted and validated against the
+    field's type as usual; an exception it raises propagates. Readers affect evaluation
+    only: proofs are about the field's type and constraints."""
 
     name: str
     type: TypeRef
     constraints: Constraints = field(default_factory=Constraints)
+    reader: Callable[[Any], Any] | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.isidentifier():
@@ -247,6 +255,8 @@ class Field:
         _ref(self.type, f"field '{self.name}'")
         if not isinstance(self.constraints, Constraints):
             raise TypeError(f"field '{self.name}': constraints must be Constraints, got {self.constraints!r}")
+        if self.reader is not None and not callable(self.reader):
+            raise TypeError(f"field '{self.name}': reader must be callable, got {self.reader!r}")
 
 
 @dataclass(frozen=True)
@@ -273,3 +283,6 @@ class Struct:
 
     def _spec(self) -> list[tuple[str, TypeSpec, dict[str, Any] | None]]:
         return [(f.name, f.type._spec, f.constraints._spec()) for f in self.fields]
+
+    def _readers(self) -> dict[str, Callable[[Any], Any]]:
+        return {f.name: f.reader for f in self.fields if f.reader is not None}

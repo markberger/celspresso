@@ -95,12 +95,20 @@ class SchemaContext:
         where = self._b._building[-1] if self._b._building else repr(tp)
         return self._convert(tp, constraints, where)
 
-    def field(self, name: str, tp: Any, constraints: Constraints | None = None) -> Field:
-        """A struct field of Python type `tp`; for use inside `struct(..., build)`."""
+    def field(
+        self,
+        name: str,
+        tp: Any,
+        constraints: Constraints | None = None,
+        *,
+        reader: Callable[[Any], Any] | None = None,
+    ) -> Field:
+        """A struct field of Python type `tp`; for use inside `struct(..., build)`.
+        `reader` reads the value from the containing object (see `schema.Field`)."""
         self._check_live()
         where = f"{self._b._building[-1]}.{name}" if self._b._building else name
         ref, cons = self._convert(tp, constraints, where)
-        return Field(name, ref, cons)
+        return Field(name, ref, cons, reader=reader)
 
     def type_hints(self, cls: type) -> dict[str, Any]:
         """`typing.get_type_hints(cls, include_extras=True)`, also resolving string
@@ -168,6 +176,8 @@ class SchemaBuilder:
 
     def __init__(self, adapters: Iterable[Any] = ()) -> None:
         self.structs: dict[str, list[tuple[str, TypeSpec, dict[str, Any] | None]]] = {}
+        # struct name -> {field name: reader}, for fields with a custom reader
+        self.readers: dict[str, dict[str, Callable[[Any], Any]]] = {}
         # struct name -> (the key an adapter registered it under, that adapter)
         self.owners: dict[str, tuple[Any, Any]] = {}
         self._by_key: dict[Any, str] = {}  # _key_of(key) -> name; owners keeps the keys alive
@@ -179,6 +189,7 @@ class SchemaBuilder:
     def copy(self) -> SchemaBuilder:
         b = SchemaBuilder.__new__(SchemaBuilder)
         b.structs = dict(self.structs)
+        b.readers = dict(self.readers)
         b.owners = dict(self.owners)
         b._by_key = dict(self._by_key)
         b._journal = []
@@ -215,9 +226,10 @@ class SchemaBuilder:
                     raise ValueError(
                         f"struct name '{st.name}' is already used by {self.owners[st.name][0]!r}"
                     )
-                if self.structs[st.name] != spec:
+                if self.structs[st.name] != spec or self.readers.get(st.name, {}) != st._readers():
                     raise ValueError(f"struct '{st.name}' is already declared with different fields")
             self.structs[st.name] = spec
+            self._set_readers(st.name, st._readers())
         for st in new:
             for f in st.fields:
                 where = f"{st.name}.{f.name}"
@@ -291,6 +303,7 @@ class SchemaBuilder:
                 k, _ = self.owners.pop(undone)
                 del self._by_key[_key_of(k)]
                 del self.structs[undone]
+                self.readers.pop(undone, None)
             del self._journal[mark:]
             raise
         finally:
@@ -311,7 +324,14 @@ class SchemaBuilder:
             _check_constraints(f.type._spec, f.constraints, where)
             out.append((f.name, f.type._spec, f.constraints._spec()))
         self.structs[name] = out
+        self._set_readers(name, {f.name: f.reader for f in fields if f.reader is not None})
         return name
+
+    def _set_readers(self, name: str, readers: dict[str, Callable[[Any], Any]]) -> None:
+        if readers:
+            self.readers[name] = readers
+        else:
+            self.readers.pop(name, None)
 
     def type_hints(self, cls: type) -> dict[str, Any]:
         where = self._by_key.get(_key_of(cls), cls.__name__)
