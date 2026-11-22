@@ -99,6 +99,36 @@ _Row = tuple[list[Any], bool, Any]
 
 
 @dataclass(frozen=True)
+class Limits:
+    """Resource caps for evaluating rules you didn't write.
+
+    Exceeding one makes evaluation fail with a `CelEvaluationError`, never hang.
+    The defaults suit trusted rules; tighten them for user- or LLM-written ones:
+    `Env(..., limits=Limits(max_cost=100_000))`.
+    """
+
+    max_cost: int = 10_000_000
+    max_iterations: int = 1_000_000
+    max_string_len: int = 10_000_000
+    max_list_len: int = 1_000_000
+    max_regex_size: int = 1 << 20
+
+    def __post_init__(self) -> None:
+        for name, v in self.__dict__.items():
+            if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                raise ValueError(f"Limits.{name} must be a positive int, got {v!r}")
+
+    def _spec(self) -> tuple[int, int, int, int, int]:
+        return (
+            self.max_cost,
+            self.max_iterations,
+            self.max_string_len,
+            self.max_list_len,
+            self.max_regex_size,
+        )
+
+
+@dataclass(frozen=True)
 class _Fn:
     name: str
     impl: Callable[..., Any]
@@ -133,6 +163,7 @@ class Env:
         unroll_limit: int = 5,
         schema_constraints: bool = True,
         debug_sample_proofs: int = 0,
+        limits: Limits | None = None,
         **more_variables: Any,
     ) -> None:
         _check_options(timeout, unroll_limit, schema_constraints)
@@ -143,6 +174,9 @@ class Env:
         ):
             raise _option_clash("debug_sample_proofs", debug_sample_proofs)
         self._sample = debug_sample_proofs
+        if limits is not None and not isinstance(limits, Limits):
+            raise _option_clash("limits", limits)
+        self._limits = (limits or Limits())._spec()
         variables = _merge_variables(variables, more_variables)
         self._timeout = timeout
         self._unroll = unroll_limit
@@ -164,6 +198,7 @@ class Env:
         e._unroll = self._unroll
         e._schema_constraints = self._schema_constraints
         e._sample = self._sample
+        e._limits = self._limits
         e._builder = self._builder.copy()
         e._vars = dict(self._vars)
         e._fns = dict(self._fns)
@@ -678,7 +713,7 @@ class Expr(Generic[T]):
     def evaluate(self, data: Mapping[str, Any] | None = None) -> T:
         """Evaluate against a mapping of variable values (models, dicts, scalars)."""
         try:
-            raw = self._prog.evaluate(dict(data or {}), self._env._fn_impls)
+            raw = self._prog.evaluate(dict(data or {}), self._env._fn_impls, self._env._limits)
         except _core.EvalError as exc:
             msg, eid, a, b, rendered = exc.args
             raise CelEvaluationError(msg, eid, (a, b), rendered) from None
@@ -686,7 +721,7 @@ class Expr(Generic[T]):
 
     def explain(self, data: Mapping[str, Any] | None = None) -> Explanation:
         """Evaluate and record the value of every sub-expression."""
-        ok, value, nodes = self._prog.explain(dict(data or {}), self._env._fn_impls)
+        ok, value, nodes = self._prog.explain(dict(data or {}), self._env._fn_impls, self._env._limits)
         return Explanation(self.source, ok, value, [(a, b, k, v) for (a, b, k, v) in nodes])
 
     # -- comparisons that build predicates --------------------------------

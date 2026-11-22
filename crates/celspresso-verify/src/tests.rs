@@ -602,3 +602,21 @@ fn index_of_matches_the_evaluator() {
     assert!(matches!(&w["s"], Value::String(v) if v.find('@').is_some_and(|i| v[..i].chars().count() > 2) && v.ends_with(".com")));
     assert!(matches!(run(Query::CanError(&c("s.indexOf('x', x) >= 0"))).status, Status::Found(_)));
 }
+
+#[test]
+fn unknown_reasons_name_unmodeled_builtins() {
+    // a builtin the verifier doesn't model: say so, and never suggest a contract for it
+    for (src, name) in [("s.split(' ').size() == 2", "'split'"), ("s.replace('a', 'b') == 'bb'", "'replace'")] {
+        match run(Query::Satisfiable(&c(src))).status {
+            Status::Unknown(r) => {
+                assert!(r.contains(name) && r.contains("doesn't model") && !r.contains("ensures") && !r.contains("internal"), "{r}")
+            }
+            st => panic!("{src}: {st:?}"),
+        }
+    }
+    // a builtin and a host function together: both named, each with its own advice
+    match run_host(Query::Satisfiable(&c("risk(x) == 3 && s.split(' ').size() == 2"))).status {
+        Status::Unknown(r) => assert!(r.contains("'split'") && r.contains("it also depends on what 'risk' returns"), "{r}"),
+        st => panic!("{st:?}"),
+    }
+}

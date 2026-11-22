@@ -5,7 +5,7 @@ pub mod decls;
 pub mod types;
 
 pub use checker::{check, check_unchecked, suggest, CheckError, CheckedExpr, Reference};
-pub use decls::{Constraints, Contract, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl};
+pub use decls::{is_builtin_overload, Constraints, Contract, FieldDecl, FunctionDecl, Overload, Schema, StructDecl, VarDecl};
 pub use types::CelType;
 
 use celspresso_syntax::ast::{Comprehension, Expr, ExprKind, Literal};

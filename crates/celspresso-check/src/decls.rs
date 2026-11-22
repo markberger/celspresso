@@ -2,7 +2,8 @@
 
 use crate::types::CelType;
 use celspresso_syntax::Literal;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
 
 /// Value constraints from the schema (Pydantic `Field(ge=..)`, `Literal[..]`, ...).
 /// They are used as solver assumptions and never change evaluation semantics.
@@ -145,6 +146,13 @@ fn func(name: &str, overloads: Vec<Overload>) -> FunctionDecl {
 }
 
 /// Standard library declarations (cel-go overload ids).
+/// Whether `id` names an overload of the standard library or a bundled extension
+/// (as opposed to a host function the user declared).
+pub fn is_builtin_overload(id: &str) -> bool {
+    static IDS: OnceLock<HashSet<String>> = OnceLock::new();
+    IDS.get_or_init(|| stdlib().into_iter().flat_map(|f| f.overloads.into_iter().map(|o| o.id)).collect()).contains(id)
+}
+
 pub fn stdlib() -> Vec<FunctionDecl> {
     use celspresso_syntax::ast::ops;
     use CelType::*;

@@ -612,12 +612,29 @@ struct Program {
     source: String,
 }
 
+/// (max_cost, max_iterations, max_string_len, max_list_len, max_regex_size) from Python.
+type LimitsSpec = (u64, u64, usize, usize, usize);
+
+fn limits(spec: Option<LimitsSpec>) -> Limits {
+    match spec {
+        Some((max_cost, max_iterations, max_string_len, max_list_len, max_regex_size)) => {
+            Limits { max_cost, max_iterations, max_string_len, max_list_len, max_regex_size }
+        }
+        None => Limits::default(),
+    }
+}
+
 fn activation(py_vars: &Bound<'_, PyDict>, schema: &Schema) -> PyResult<HashMap<String, Value>> {
     let mut act = HashMap::new();
     for (k, v) in py_vars.iter() {
         let name: String = k.extract()?;
         let val = match schema.vars.get(&name) {
-            Some(d) => value_from_py(&v, &d.ty, schema, &name)?,
+            Some(d) => {
+                let val = value_from_py(&v, &d.ty, schema, &name)?;
+                // proofs assume the schema's constraints, so evaluation enforces them
+                celspresso_eval::validate::validate(&val, &d.ty, &d.constraints, schema, &name).map_err(PyValueError::new_err)?;
+                val
+            }
             None => continue, // extra keys are ignored
         };
         act.insert(name, val);
@@ -648,32 +665,34 @@ impl Program {
         self.checked.references()
     }
 
-    #[pyo3(signature = (vars, functions=None))]
+    #[pyo3(signature = (vars, functions=None, limits=None))]
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
         vars: &Bound<'py, PyDict>,
         functions: Option<&Bound<'py, PyDict>>,
+        limits: Option<LimitsSpec>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let act = activation(vars, &self.checked.schema)?;
         let funcs = PyFunctions::from_dict(functions)?;
-        match evaluate(&self.checked, &act, &funcs, Limits::default()) {
+        match evaluate(&self.checked, &act, &funcs, self::limits(limits)) {
             Ok(v) => value_to_py(py, &v),
             Err(e) => Err(self.eval_error(e.message, e.expr_id)),
         }
     }
 
     /// Returns (ok, value_or_message, [(start, end, ok, value_or_message)] in pre-order).
-    #[pyo3(signature = (vars, functions=None))]
+    #[pyo3(signature = (vars, functions=None, limits=None))]
     fn explain<'py>(
         &self,
         py: Python<'py>,
         vars: &Bound<'py, PyDict>,
         functions: Option<&Bound<'py, PyDict>>,
+        limits: Option<LimitsSpec>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let act = activation(vars, &self.checked.schema)?;
         let funcs = PyFunctions::from_dict(functions)?;
-        let (r, trace) = evaluate_traced(&self.checked, &act, &funcs, Limits::default());
+        let (r, trace) = evaluate_traced(&self.checked, &act, &funcs, self::limits(limits));
         let nodes = PyList::empty(py);
         let mut err = None;
         self.checked.expr.walk(&mut |e| {

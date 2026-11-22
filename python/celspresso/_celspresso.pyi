@@ -19,9 +19,17 @@ class Program:
     def output_type_name(self) -> str: ...
     @property
     def references(self) -> list[str]: ...
-    def evaluate(self, vars: dict[str, Any], functions: dict[str, Any] | None = None) -> Any: ...
+    def evaluate(
+        self,
+        vars: dict[str, Any],
+        functions: dict[str, Any] | None = None,
+        limits: tuple[int, int, int, int, int] | None = None,
+    ) -> Any: ...
     def explain(
-        self, vars: dict[str, Any], functions: dict[str, Any] | None = None
+        self,
+        vars: dict[str, Any],
+        functions: dict[str, Any] | None = None,
+        limits: tuple[int, int, int, int, int] | None = None,
     ) -> tuple[bool, Any, list[tuple[int, int, bool, Any]]]: ...
 
 #: (parameter names, ensures source, total, table rows of (args, ok, result or error))

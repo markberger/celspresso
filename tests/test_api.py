@@ -364,3 +364,48 @@ def test_custom_function_cannot_shadow_builtin_overload() -> None:
         return n
 
     assert Env(n=int).extend(functions=[size_of_int]).compile("size(n)").evaluate({"n": 4}) == 4
+
+
+# -- inputs are held to the schema the proofs assume -------------------------
+
+
+def test_evaluate_enforces_schema_constraints() -> None:
+    class M(BaseModel):
+        x: Annotated[int, Field(le=10)]
+        tags: Annotated[list[Annotated[str, Field(max_length=3)]], Field(max_length=2)] = []
+
+    env = Env(m=M)
+    p = env.predicate("m.x <= 10")
+    assert p.always_true().proved
+    assert p.evaluate({"m": {"x": 10, "tags": []}}) is True
+    # a dict (or a mutated model) that breaks a constraint the proof relied on is rejected,
+    # naming the path and the constraint but never the value
+    with pytest.raises(ValueError, match=r"input 'm.x' violates the schema: must be <= 10") as exc:
+        p.evaluate({"m": {"x": 99, "tags": []}})
+    assert "99" not in str(exc.value)
+    m = M(x=1)
+    m.x = 99
+    with pytest.raises(ValueError, match=r"m\.x"):
+        p.evaluate({"m": m})
+    with pytest.raises(ValueError, match=r"'m.tags\[1\]' violates the schema: length must be <= 3"):
+        p.evaluate({"m": {"x": 1, "tags": ["ok", "toolong"]}})
+    with pytest.raises(ValueError, match="must be one of"):
+        Env(t=Literal["a", "b"]).predicate("t == 'a'").explain({"t": "c"})
+
+
+def test_limits_cap_evaluation_cost() -> None:
+    from celspresso import Limits
+
+    env = Env(xs=list[int], limits=Limits(max_iterations=10))
+    p = env.predicate("xs.all(x, x > 0)")
+    assert p.evaluate({"xs": [1, 2, 3]}) is True
+    with pytest.raises(CelEvaluationError, match="iteration limit"):
+        p.evaluate({"xs": list(range(1, 100))})
+    # limits survive extending the env
+    wider = env.extend(assumptions=["size(xs) >= 0"])
+    with pytest.raises(CelEvaluationError, match="iteration limit"):
+        wider.predicate("xs.all(x, x > 0)").evaluate({"xs": list(range(1, 100))})
+    with pytest.raises(ValueError, match="positive int"):
+        Limits(max_cost=0)
+    with pytest.raises(TypeError, match="limits"):
+        Env(x=int, limits=5)  # type: ignore[arg-type]

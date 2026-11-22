@@ -118,7 +118,7 @@ for _ in range(5):
 
 - **Every counterexample is real.** It is replayed through the evaluator and validated by your Pydantic model before you see it.
 - **`UNKNOWN` can't be mistaken for an answer.** `bool(verdict)` raises, and `verdict.reason` names the timeout or the construct that isn't modeled yet.
-- **The semantics are CEL's.** Integers are 64-bit with overflow errors, division truncates toward zero, and `&&` and `||` absorb errors. Your schema's `ge`, `le`, `max_length`, `Literal` and `Enum` become facts the prover relies on.
+- **The semantics are CEL's.** Integers are 64-bit with overflow errors, division truncates toward zero, and `&&` and `||` absorb errors. Your schema's `ge`, `le`, `max_length`, `Literal` and `Enum` become facts the prover relies on, and `evaluate()` rejects inputs that break them, so a rule never runs on data its proofs don't cover. For rules you didn't write, `Env(..., limits=Limits(max_cost=...))` caps evaluation cost.
 
 ## How it compares
 

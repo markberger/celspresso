@@ -33,6 +33,10 @@ pub struct Encoder {
     funcs: HashMap<String, (FuncDecl, FuncDecl)>,
     /// CEL function name -> (overload id, arity) of uninterpreted functions in use.
     func_overloads: HashMap<String, Vec<(String, usize)>>,
+    /// Host functions the encoding treats as opaque (named in UNKNOWN reasons).
+    opaque_host: BTreeSet<String>,
+    /// Standard-library functions the verifier doesn't model yet.
+    unmodeled_builtins: BTreeSet<String>,
     fresh: u32,
     /// The first date input, which later dates prefer to stay near (readable witnesses).
     first_date: Option<Int>,
@@ -75,6 +79,8 @@ impl Encoder {
             locals: Vec::new(),
             funcs: HashMap::new(),
             func_overloads: HashMap::new(),
+            opaque_host: BTreeSet::new(),
+            unmodeled_builtins: BTreeSet::new(),
             fresh: 0,
             first_date: None,
             index_terms: Vec::new(),
@@ -695,6 +701,7 @@ impl Encoder {
         match self.builtin(c, e, function, &syms) {
             Some(Ok((v, err))) => SV { v, err: or(&[&err_in, &err]) },
             Some(Err(why)) => {
+                self.unmodeled_builtins.insert(function.to_string());
                 let mut r = self.approx(c, e, why);
                 r.err = or(&[&r.err, &err_in]);
                 r
@@ -918,7 +925,7 @@ impl Encoder {
                         Some(o) => o,
                         None => return Some(Err(format!("'{f}' with a named or computed time zone"))),
                     },
-                    _ => return Some(Err(format!("'{f}' on these operand types is not yet modeled"))),
+                    _ => return Some(Err(format!("builtin '{f}' on these operand types is not modeled"))),
                 };
                 ok(Int(ts_field(t, f, offset)))
             }
@@ -1195,44 +1202,68 @@ impl Encoder {
                 | ops::INDEX
                 | ops::IN,
                 _,
-            ) => Some(Err(format!("'{function}' on these operand types is not yet modeled"))),
+            ) => Some(Err(format!("builtin '{function}' on these operand types is not modeled"))),
             _ => None,
         }
     }
 
-    /// Custom (host) functions become uninterpreted functions of their arguments.
-    /// A fact learned by running a real custom function: `f(args) == result` (and no
-    /// error), or `f!err(args)` if it raised. None if the call cannot be expressed.
-    /// Why a solver witness didn't replay: almost always a host function's real value.
+    /// Why a solver witness didn't replay: something the encoding couldn't see exactly,
+    /// a host function's real value or a builtin that isn't modeled yet.
     pub fn unreplayed_reason(&self) -> String {
-        let mut names: Vec<&String> = self.func_overloads.keys().collect();
-        names.sort();
-        let tabulated =
-            |n: &str| self.func_overloads[n].iter().all(|(o, _)| self.schema.contracts.get(o).is_some_and(|k| k.table.is_some()));
-        let quoted: Vec<String> =
-            names.iter().map(|n| if tabulated(n) { format!("'{n}' (outside its tabulated inputs)") } else { format!("'{n}'") }).collect();
-        let others: Vec<&String> =
-            self.approximations.iter().filter(|a| !a.starts_with("function '") && !a.starts_with("relies on")).collect();
-        let mut out = match quoted.len() {
-            0 => String::new(),
-            n => format!(
-                "the answer depends on what {} {}, which the verifier can't see; add an ensures= contract, \
+        let tabulated = |n: &str| {
+            self.func_overloads
+                .get(n)
+                .is_some_and(|os| os.iter().all(|(o, _)| self.schema.contracts.get(o).is_some_and(|k| k.table.is_some())))
+        };
+        let quoted: Vec<String> = self
+            .opaque_host
+            .iter()
+            .map(|n| if tabulated(n) { format!("'{n}' (outside its tabulated inputs)") } else { format!("'{n}'") })
+            .collect();
+        let others: Vec<&String> = self
+            .approximations
+            .iter()
+            .filter(|a| !a.starts_with("function '") && !a.starts_with("relies on") && !a.starts_with("builtin '"))
+            .collect();
+        let mut parts = Vec::new();
+        if !self.unmodeled_builtins.is_empty() {
+            let names: Vec<String> = self.unmodeled_builtins.iter().map(|n| format!("'{n}'")).collect();
+            parts.push(format!(
+                "the answer depends on {}, which the verifier doesn't model yet; rewrite the rule without {}, \
+                 or treat this check as unverified",
+                names.join(", "),
+                if names.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        match quoted.len() {
+            0 => {}
+            n => parts.push(format!(
+                "{} on what {} {}, which the verifier can't see; add an ensures= contract, \
                  give the parameters small finite types (bool, Literal, Enum or an int with ge/le) so it can be tabulated, \
                  or write it in CEL with env.define(name, body, params={{...}})",
+                if parts.is_empty() { "the answer depends" } else { "it also depends" },
                 quoted.join(", "),
                 if n == 1 { "returns" } else { "return" }
-            ),
-        };
-        if !others.is_empty() {
-            if !out.is_empty() {
-                out.push_str("; ");
-            }
-            out.push_str(&format!("approximations: {}", others.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")));
+            )),
         }
-        if out.is_empty() {
+        if !others.is_empty() {
+            parts.push(format!("approximations: {}", others.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("; ")));
+        }
+        if parts.is_empty() {
             "internal: solver witness did not replay in the evaluator".into()
         } else {
-            out
+            parts.join("; ")
+        }
+    }
+
+    /// Note that `function` (overload `overload`) is opaque here; returns how to describe it.
+    fn note_opaque(&mut self, function: &str, overload: &str) -> String {
+        if celspresso_check::is_builtin_overload(overload) {
+            self.unmodeled_builtins.insert(function.to_string());
+            format!("builtin '{function}' is not modeled by the verifier")
+        } else {
+            self.opaque_host.insert(function.to_string());
+            format!("function '{function}' is uninterpreted")
         }
     }
 
@@ -1256,15 +1287,19 @@ impl Encoder {
                 Sym::Int(i) | Sym::Uint(i) | Sym::Date(i) | Sym::Timestamp(i) | Sym::Duration(i) => (Dynamic::from_ast(i), Sort::int()),
                 Sym::Str(s) => (Dynamic::from_ast(s), Sort::string()),
                 Sym::Double(d) => (Dynamic::from_ast(d), Sort::double()),
-                _ => return self.approx(c, e, format!("function '{function}' with structured arguments")),
+                _ => {
+                    let why = self.note_opaque(function, &overload);
+                    return self.approx(c, e, why);
+                }
             };
             arg_asts.push(d);
             sorts.push(s);
         }
+        let why = self.note_opaque(function, &overload);
         let Some(rsort) = sort_of(&result_ty) else {
-            return self.approx(c, e, format!("function '{function}' returning {result_ty}"));
+            return self.approx(c, e, why);
         };
-        self.approximations.insert(format!("function '{function}' is uninterpreted"));
+        self.approximations.insert(why);
         let known = self.func_overloads.entry(function.to_string()).or_default();
         if !known.iter().any(|(o, _)| *o == overload) {
             known.push((overload.clone(), args.len()));
