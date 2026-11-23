@@ -258,9 +258,8 @@ def test_expr_type_assertions() -> None:
     env = Env(x=int, d=dict)
     p = env.expr("x > 1", bool)
     assert isinstance(p, Predicate)
-    dyn = env.expr("d['k']", int)  # dyn is accepted for any requested type
-    assert dyn.output_type == "dyn"
-    assert isinstance(env.expr("d['k']", bool), Predicate)
+    with pytest.raises(CelTypeError, match="unknown type"):  # dyn values are outside the subset
+        env.expr("d['k']", int)
 
 
 # -- expressions ------------------------------------------------------------

@@ -134,8 +134,15 @@ limit. Also:
   time out. A static "one side constant" rule would reject 13 of the 14 shapes.
 - `ageOn` is allowed although satisfiability can take seconds; `string(int)` relating two
   differently computed numbers can reach the timeout (see the cents benchmark case).
-- Values of type `dyn` (`Any` fields, `dyn(x)`) are rejected. `dict[str, Any]` can still
-  be tested with `in`/`size`, but its values can't be used.
+- Values of type `dyn` (`Any` fields, host functions returning `Any`, `dyn(x)`,
+  heterogeneous literals like `[1, 'a']`) are rejected where they originate.
+  `dict[str, Any]` can still be tested with `in`/`size`, but its values can't be used.
+- `Env(d=float)` is accepted though every use of `d` is an error; it could fail at
+  construction. `describe()` still lists such variables without saying so.
+- `o.?r` on an optional double field is rejected even when only `.hasValue()` is used.
+- The verifier answers UNSAT for `[1, 'a'][0] == 1` (heterogeneous list, true at
+  runtime). The subset rejects it now, but the encoder bug remains for the Rust
+  conformance path; fix it before allowing any dyn back in.
 - `matches` patterns are limited to 16 ranges per character class, so Unicode `\d`, `\w`
   and `\p{..}` are rejected (`^\d{5}$` took 4.5 s to come back UNKNOWN; `\p{L}+` ran far
   past the 5 s timeout, so the solver timeout isn't always honored either).

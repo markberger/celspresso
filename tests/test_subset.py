@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import pytest
 from pydantic import BaseModel, Field
@@ -176,3 +176,57 @@ def test_pattern_errors_point_at_the_pattern() -> None:
     with pytest.raises(CelTypeError) as exc:
         Env(s=Name).compile("s.matches('[')")
     assert "\n  |           ^^^" in str(exc.value)
+
+
+class Reading(BaseModel):
+    ratio: float
+    name: str
+    age: int
+    nick: str | None = None
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "has(p.name)",
+        "p.?nick.orValue('') == ''",
+        "ps.exists(q, q.name == 'x')",
+        "ps[0].age > 1",
+        "p.name == q.name",
+    ],
+)
+def test_structs_with_an_unused_double_field_stay_usable(src: str) -> None:
+    Env(p=Reading, q=Reading, ps=Annotated[list[Reading], Field(max_length=3)]).compile(src)
+
+
+def test_comparing_whole_structs_with_a_double_field_is_rejected_once() -> None:
+    with pytest.raises(CelTypeError, match="compare the fields you need") as exc:
+        Env(p=Reading, q=Reading).compile("p == q")
+    assert "1 error" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("src", "hint"),
+    [
+        ("[1, 'a'][0] == 1", "unknown type"),
+        ("{'a': 1, 'b': 'x'}['a'] == 1", "unknown type"),
+        ("dm['k'] == 1", "unknown type"),
+        ("anyf(n) == 1", "unknown type"),
+        ("half(n) == half(m)", "fixed-point"),
+        ("int(half(n)) == n", "fixed-point"),
+        ("double(n) > 1.0", "fixed-point"),
+    ],
+)
+def test_dyn_and_double_values_from_any_source_are_rejected(src: str, hint: str) -> None:
+    @function
+    def half(n: int) -> float:
+        return n / 2
+
+    @function
+    def anyf(n: int) -> Any:
+        return n
+
+    env = Env(n=int, m=int, dm=dict[str, Any]).extend(functions=[half, anyf])
+    with pytest.raises(CelTypeError, match=hint):
+        env.compile(src)
+    assert env.predicate("'k' in dm && size(dm) > 0").evaluate({"n": 0, "m": 0, "dm": {"k": 1}}) is True

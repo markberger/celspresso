@@ -745,7 +745,7 @@ def _cons_text(cons: Mapping[str, Any] | None) -> list[str]:
 _CEL_REFERENCE = """CEL quick reference:
   logic: a && b, a || b, !a, cond ? x : y        (no 'and', 'or', 'not', 'if')
   compare: == != < <= > >=, x in [1, 2], k in map  (no '=' or '===')
-  literals: true, false, null, 42, 4.2, 'text', [1, 2], {'k': 1}
+  literals: true, false, null, 42, 'text', [1, 2], {'k': 1}    (no doubles like 4.2)
   strings: size(s), s.contains(t), s.startsWith(t), s.endsWith(t), s.matches(regex), s.lowerAscii()
   lists: size(l), l.all(x, p), l.exists(x, p), l.exists_one(x, p), l.filter(x, p), l.map(x, f)
   fields: m.f; has(m.f) tests presence; ints are 64-bit and overflow is an error"""

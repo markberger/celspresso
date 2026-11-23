@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 
 __all__ = ["main"]
 
-_TYPES: dict[str, Any] = {"int": int, "float": float, "str": str, "bool": bool, "bytes": bytes}
+_TYPES: dict[str, Any] = {"int": int, "str": str, "bool": bool}
 _SECTIONS = ("rules", "invariants", "require")
 _SINGULAR = {"rules": "rule", "invariants": "invariant", "require": "require", "assumptions": "assumption"}
 
@@ -221,9 +221,7 @@ def _import(ref: str, what: str) -> Any:
         return _TYPES[ref]
     module, sep, attr = ref.partition(":")
     if not sep or not module or not attr:
-        raise UsageError(
-            f"{what}: expected 'module:attribute' (or int, float, str, bool, bytes), got {ref!r}"
-        )
+        raise UsageError(f"{what}: expected 'module:attribute' (or int, str, bool), got {ref!r}")
     try:
         obj: Any = importlib.import_module(module)
     except ImportError as e:

@@ -4,7 +4,7 @@
 //! Builtins are allowed by overload id, so a builtin added later is outside the profile
 //! until it is measured and listed here. Host functions are always allowed (they are
 //! opaque or tabulated, which the user chose). The tiers come from probing every builtin:
-//! see `benchmarks/bench_strings.py` and TECH_DEBT.md ("Strict profile").
+//! see `benchmarks/bench_strings.py` and TECH_DEBT.md ("The subset leaves out ...").
 
 use celspresso_check::{display_fn, is_builtin, CelType, CheckedExpr, Reference, Schema};
 use celspresso_syntax::ast::{ops, Expr, ExprKind, Literal};
@@ -234,22 +234,58 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
     parts.iter().try_for_each(|p| walk(p, 1))
 }
 
-/// The unmodeled type a value of type `t` can hold, if any, looking through containers and
-/// struct fields.
-fn unmodeled(t: &CelType, schema: &Schema, seen: &mut Vec<String>) -> Option<&'static str> {
+const DOUBLES: &str = "doubles are not part of celspresso's CEL subset (their arithmetic is slow to verify and rounds); \
+     use ints or fixed-point numbers (T.fixed, or Decimal with decimal_places)";
+const BYTES: &str = "bytes values are not part of celspresso's CEL subset";
+const DYN: &str = "values of unknown type (dyn, or Any in Python) are not part of celspresso's CEL subset; \
+     give the field, variable or function result a concrete type";
+
+/// The unmodeled type a value of type `t` holds, looking through containers. With a
+/// schema, struct fields count too (for comparing whole structs).
+fn unmodeled(t: &CelType, schema: Option<&Schema>, seen: &mut Vec<String>) -> Option<&'static str> {
     match t {
-        CelType::Bytes => Some("bytes values are not part of celspresso's CEL subset"),
-        CelType::Double => Some(
-            "doubles are not part of celspresso's CEL subset (their arithmetic is slow to verify and rounds); \
-             use ints or fixed-point numbers (T.fixed, or Decimal with decimal_places)",
-        ),
+        CelType::Bytes => Some(BYTES),
+        CelType::Double => Some(DOUBLES),
         CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) | CelType::Type(a) => unmodeled(a, schema, seen),
         CelType::Map(k, v) => unmodeled(k, schema, seen).or_else(|| unmodeled(v, schema, seen)),
         CelType::Struct(n) if !seen.contains(n) => {
             seen.push(n.clone());
-            schema.structs.get(n).and_then(|d| d.fields.iter().find_map(|f| unmodeled(&f.ty, schema, seen)))
+            schema?.structs.get(n).and_then(|d| d.fields.iter().find_map(|f| unmodeled(&f.ty, schema, seen)))
         }
         _ => None,
+    }
+}
+
+/// Why the value of `e` is outside the subset, if it is. A container of `dyn` only counts
+/// when written as a literal (`[1, 'a']`); a `dict[str, Any]` may be tested with `in`, and
+/// its values are caught where they are read out.
+fn bad(c: &CheckedExpr, e: &Expr) -> Option<&'static str> {
+    let t = c.type_of(e.id);
+    if let Some(why) = unmodeled(t, None, &mut Vec::new()) {
+        return Some(why);
+    }
+    let dyn_items = |t: &CelType| match t {
+        CelType::List(a) => matches!(**a, CelType::Dyn),
+        CelType::Map(k, v) => matches!(**k, CelType::Dyn) || matches!(**v, CelType::Dyn),
+        _ => false,
+    };
+    match &e.kind {
+        _ if matches!(t, CelType::Dyn) => Some(DYN),
+        ExprKind::List(items) if !items.is_empty() && dyn_items(t) => Some(DYN),
+        ExprKind::Map(entries) if !entries.is_empty() && dyn_items(t) => Some(DYN),
+        _ => None,
+    }
+}
+
+fn children(e: &Expr) -> Vec<&Expr> {
+    match &e.kind {
+        ExprKind::Literal(_) | ExprKind::Ident(_) => Vec::new(),
+        ExprKind::Select { operand, .. } => vec![&**operand],
+        ExprKind::Call { target, args, .. } => target.iter().map(|t| &**t).chain(args).collect(),
+        ExprKind::List(items) => items.iter().collect(),
+        ExprKind::Map(entries) => entries.iter().flat_map(|(k, v)| [k, v]).collect(),
+        ExprKind::Struct { fields, .. } => fields.iter().map(|(_, v)| v).collect(),
+        ExprKind::Comprehension(c) => vec![&c.iter_range, &c.accu_init, &c.loop_condition, &c.loop_step, &c.result],
     }
 }
 
@@ -260,75 +296,62 @@ fn literal(e: &Expr) -> Option<&Literal> {
     }
 }
 
-const DYN: &str = "values of unknown type (dyn, or Any in Python) are not part of celspresso's CEL subset; \
-     give the field or variable a concrete type";
-
 /// Uses of CEL outside the subset, as (message, span), in source order.
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
-    // a struct only read through (`p.name`) is fine even if another field is unmodeled
-    let mut read_through = std::collections::HashSet::new();
-    c.expr.walk(&mut |e: &Expr| {
-        if let ExprKind::Select { operand, test_only: false, .. } = &e.kind {
-            read_through.insert(operand.id);
-        }
-    });
     let mut out = Vec::new();
-    c.expr.walk(&mut |e: &Expr| match &e.kind {
-        // values enter through literals, variables and fields; flagging those covers every use
-        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Select { .. } if !read_through.contains(&e.id) => {
-            let t = c.type_of(e.id);
-            if let Some(why) = unmodeled(t, &c.schema, &mut Vec::new()) {
+    c.expr.walk(&mut |e: &Expr| {
+        // report an unmodeled value where it originates, not at every expression it flows into
+        if let Some(why) = bad(c, e) {
+            if !children(e).iter().any(|k| bad(c, k).is_some()) {
                 out.push((why.to_string(), e.span));
-            } else if matches!(t, CelType::Dyn) {
-                out.push((DYN.to_string(), e.span));
             }
+            return;
         }
-        ExprKind::Call { function, .. } if function == "dyn" && matches!(c.type_of(e.id), CelType::Dyn) => {
-            out.push((DYN.to_string(), e.span));
+        let ExprKind::Call { target, function, args } = &e.kind else { return };
+        let all: Vec<&Expr> = target.iter().map(|t| &**t).chain(args).collect();
+        // an unmodeled operand is reported where it originates; one error is enough
+        if all.iter().any(|a| bad(c, a).is_some()) {
+            return;
         }
-        ExprKind::Call { target, function, args } => {
-            let ids = match c.refs.get(&e.id) {
-                Some(Reference::Function(ids)) => ids.clone(),
-                _ => Vec::new(),
-            };
-            if ids.is_empty() {
-                if builtin(function, "") && !ID_LESS.contains(&function.as_str()) {
-                    out.push((outside(function, "the verifier can't decide it quickly and exactly"), e.span));
-                }
+        // comparing whole structs compares every field, including unread ones
+        if [ops::EQUALS, ops::NOT_EQUALS, ops::IN].contains(&function.as_str()) {
+            if let Some(why) = all.iter().find_map(|a| unmodeled(c.type_of(a.id), Some(&c.schema), &mut Vec::new())) {
+                out.push((format!("{why} (comparing these values compares every field; compare the fields you need)"), e.span));
                 return;
             }
-            let all: Vec<&Expr> = target.iter().map(|t| &**t).chain(args).collect();
-            // an operand of an unmodeled type is reported where it appears; one error is enough
-            if all.iter().any(|a| {
-                let t = c.type_of(a.id);
-                matches!(t, CelType::Dyn) || unmodeled(t, &c.schema, &mut Vec::new()).is_some()
-            }) {
-                return;
+        }
+        let ids = match c.refs.get(&e.id) {
+            Some(Reference::Function(ids)) => ids.clone(),
+            _ => Vec::new(),
+        };
+        if ids.is_empty() {
+            if builtin(function, "") && !ID_LESS.contains(&function.as_str()) {
+                out.push((outside(function, "the verifier can't decide it quickly and exactly"), e.span));
             }
-            for id in ids.iter().filter(|id| builtin(function, id)) {
-                if ALLOWED.contains(&id.as_str()) || is_comparison(id) {
-                    continue;
-                }
-                if let Some((_, at, need)) = LITERAL_ARG.iter().find(|(o, ..)| o == id) {
-                    let ok = all.get(*at).and_then(|a| literal(a)).is_some_and(|l| match l {
-                        Literal::String(s) => !(s.is_empty() && *id == "string_split_string"),
-                        _ => false,
-                    });
-                    // point at the argument that has to change
-                    let span = all.get(*at).map_or(e.span, |a| a.span);
-                    if !ok {
-                        out.push((format!("'{}' needs {need} in celspresso's CEL subset", display_fn(function)), span));
-                    } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
-                        if let Err(why) = pattern_in_profile(p) {
-                            out.push((format!("this pattern is outside celspresso's CEL subset: {why}"), span));
-                        }
+            return;
+        }
+        for id in ids.iter().filter(|id| builtin(function, id)) {
+            if ALLOWED.contains(&id.as_str()) || is_comparison(id) {
+                continue;
+            }
+            if let Some((_, at, need)) = LITERAL_ARG.iter().find(|(o, ..)| o == id) {
+                let ok = all.get(*at).and_then(|a| literal(a)).is_some_and(|l| match l {
+                    Literal::String(s) => !(s.is_empty() && *id == "string_split_string"),
+                    _ => false,
+                });
+                // point at the argument that has to change
+                let span = all.get(*at).map_or(e.span, |a| a.span);
+                if !ok {
+                    out.push((format!("'{}' needs {need} in celspresso's CEL subset", display_fn(function)), span));
+                } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
+                    if let Err(why) = pattern_in_profile(p) {
+                        out.push((format!("this pattern is outside celspresso's CEL subset: {why}"), span));
                     }
-                    continue;
                 }
-                out.push((outside(function, why(id)), e.span));
+                continue;
             }
+            out.push((outside(function, why(id)), e.span));
         }
-        _ => {}
     });
     out
 }
@@ -357,6 +380,24 @@ mod tests {
         }
         let checked = check(celspresso_syntax::parse(src).unwrap(), Arc::new(s)).unwrap();
         violations(&checked).into_iter().map(|(m, _)| m).collect()
+    }
+
+    #[test]
+    fn unmodeled_values_are_reported_once_where_they_originate() {
+        for (src, want) in [
+            ("[1, 'a'][0] == 1", "unknown type"),
+            ("{'a': 1, 'b': 'x'}['a'] == 1", "unknown type"),
+            ("dyn(n) + 1 == 2", "unknown type"),
+            ("double(n) > 0.0 || n > 1", "fixed-point"),
+            ("int(d) == n", "fixed-point"),
+            ("size([d, d]) == 2", "fixed-point"),
+        ] {
+            let got = outside(src);
+            assert!(got.iter().all(|m| m.contains(want)) && !got.is_empty(), "{src}: {got:?}");
+        }
+        assert_eq!(outside("double(n) == double(n)").len(), 2);
+        assert_eq!(outside("[1, 'a'][0] == 1").len(), 1);
+        assert!(outside("[] == xs && {} == {'a': n}").is_empty());
     }
 
     #[test]

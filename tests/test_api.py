@@ -436,7 +436,7 @@ def test_dyn_values_get_an_honest_reason() -> None:
         args: dict[str, Any]
 
     env = Env(call=Call)
-    with pytest.raises(CelTypeError, match="give the field or variable a concrete type") as exc:
+    with pytest.raises(CelTypeError, match="concrete type") as exc:
         env.predicate("call.args.amount > 5")
     assert "1 error" in str(exc.value)  # the dyn value, not also the comparison
     assert env.predicate("'amount' in call.args").evaluate({"call": {"args": {"amount": 9}}}) is True
