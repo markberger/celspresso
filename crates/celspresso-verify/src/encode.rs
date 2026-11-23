@@ -1374,6 +1374,12 @@ impl Encoder {
         }
     }
 
+    /// Whether the encoding leaves out something the answer may depend on (an unmodeled
+    /// builtin, or a dyn value): then that, not a timeout, is the reason worth giving.
+    pub fn misses_parts(&self) -> bool {
+        self.reads_dyn || !self.unmodeled_builtins.is_empty()
+    }
+
     /// Why a solver witness didn't replay: something the encoding couldn't see exactly,
     /// a host function's real value or a builtin that isn't modeled yet.
     pub fn unreplayed_reason(&self) -> String {

@@ -244,7 +244,11 @@ fn solve_once(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(d
                 },
             }
         }
-        SatResult::Unknown => Status::Unknown(unknown_reason(solver.get_reason_unknown())),
+        SatResult::Unknown => {
+            let why = unknown_reason(solver.get_reason_unknown());
+            // with parts left out, the solver may be stuck on those: name them either way
+            Status::Unknown(if enc.misses_parts() { format!("{why}; {}", enc.unreplayed_reason()) } else { why })
+        }
     };
     (status, bounded, approximations, split_only)
 }

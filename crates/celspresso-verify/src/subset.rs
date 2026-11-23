@@ -498,6 +498,10 @@ mod tests {
     use std::sync::Arc;
 
     fn outside(src: &str) -> Vec<String> {
+        violations(&checked(src)).into_iter().map(|(m, _)| m).collect()
+    }
+
+    fn checked(src: &str) -> CheckedExpr {
         let mut s = Schema::with_stdlib();
         let max = |m: u64| Constraints { max_length: Some(m), ..Default::default() };
         let tags = FieldDecl { name: "tags".into(), ty: CelType::list(CelType::String), constraints: Default::default() };
@@ -518,11 +522,63 @@ mod tests {
             ("long", CelType::String, max(200)),
             ("at", CelType::Timestamp, Default::default()),
             ("day", CelType::Date, Default::default()),
+            ("ws", CelType::list(CelType::String), Constraints { items: Some(Box::new(max(3))), ..max(4) }),
+            ("mv", CelType::map(CelType::String, CelType::String), Constraints { items: Some(Box::new(max(2))), ..max(4) }),
+            (
+                "code",
+                CelType::String,
+                Constraints { one_of: Some(vec![Literal::String("ab".into()), Literal::String("abcd".into())]), ..Default::default() },
+            ),
         ] {
             s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: c });
         }
-        let checked = check(celspresso_syntax::parse(src).unwrap(), Arc::new(s)).unwrap();
-        violations(&checked).into_iter().map(|(m, _)| m).collect()
+        check(celspresso_syntax::parse(src).unwrap(), Arc::new(s)).unwrap()
+    }
+
+    #[test]
+    fn static_string_lengths() {
+        let len = |src: &str| {
+            let c = checked(src);
+            crate::sizes::Sizes::new(&c).str_len(&c.expr)
+        };
+        for (src, want) in [
+            ("t", Some(20)),
+            ("'abc'", Some(3)),
+            ("t + 'ab'", Some(22)),
+            ("n > 0 ? t : 'x'", Some(20)),
+            ("t.substring(1)", Some(20)),
+            ("t.upperAscii().lowerAscii()", Some(20)),
+            ("t.charAt(0)", Some(1)),
+            ("string(n)", Some(20)),
+            ("[t, 'ab'].join(',')", Some(41)), // each item as long as the longest
+            ("ws.join('--')", Some(18)),
+            ("ws[0]", Some(3)),
+            ("mv['k']", Some(2)),
+            ("code", Some(4)),
+            // the longer of the optional's value and the default
+            ("ws[?0].orValue('abcde')", Some(5)),
+            ("ws[?0].orValue('a')", Some(3)),
+            ("ws[?0].value()", Some(3)),
+            ("s", None),
+            ("s + t", None),
+        ] {
+            assert_eq!(len(src), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn bounds_pass_through_bindings_and_map_values() {
+        for src in [
+            "cel.bind(p, t, p.split(',').size() < 30)",
+            "mv['k'].split(',').size() < 3",
+            "ws.all(w, w.split(',').size() < 5)",
+            "ws[?0].orValue('a,b').split(',').size() < 5",
+            "code.split('b').size() < 5",
+        ] {
+            assert_eq!(outside(src), Vec::<String>::new(), "{src}");
+        }
+        let unbounded = outside("cel.bind(p, s, p.split(',').size() < 3)");
+        assert!(unbounded.iter().any(|m| m.contains("no max_length")), "{unbounded:?}");
     }
 
     #[test]
