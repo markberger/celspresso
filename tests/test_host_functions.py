@@ -208,6 +208,3 @@ def test_user_overload_on_a_builtin_name_gets_host_function_advice():
     assert reason is not None
     assert "ensures=" in reason
     assert "doesn't model" not in reason
-    builtin = Env(a=int, b=float).predicate("math.greatest(1.5, b) > 2.0 || a > 0").always_true(timeout=1.0)
-    assert builtin.reason is not None
-    assert "ensures=" not in builtin.reason

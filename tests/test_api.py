@@ -436,16 +436,10 @@ def test_dyn_values_get_an_honest_reason() -> None:
         args: dict[str, Any]
 
     env = Env(call=Call)
-    p = env.predicate("call.args.amount > 5")
-    assert p.evaluate({"call": {"args": {"amount": 9}}}) is True
-    v = p.satisfiable()
-    assert v.unknown
-    assert v.reason is not None
-    assert "dyn" in v.reason
-    assert "concrete type" in v.reason
-    assert "_>_" not in v.reason
-    assert not v.bounded
-    assert "unroll" not in str(v)
+    with pytest.raises(CelTypeError, match="give the field or variable a concrete type") as exc:
+        env.predicate("call.args.amount > 5")
+    assert "1 error" in str(exc.value)  # the dyn value, not also the comparison
+    assert env.predicate("'amount' in call.args").evaluate({"call": {"args": {"amount": 9}}}) is True
 
 
 def test_check_rule_names_the_runtime_failure() -> None:

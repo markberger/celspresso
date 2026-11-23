@@ -127,14 +127,14 @@ def test_unsatisfiable_or_invalid_constraints_fail_on_declaration(
 
 def test_constraints_that_fit_are_accepted() -> None:
     fields = [
-        Field("a", T.double, Constraints(ge=1, le=1)),
+        Field("a", T.int, Constraints(ge=1, le=1)),
         Field("b", T.uint, Constraints(one_of=(2**64 - 1, 0), le=0)),
         Field("c", T.nullable(T.list(T.string)), Constraints(max_length=2, items=Constraints(pattern="^x"))),
         Field("d", T.map(T.string, T.int), Constraints(min_length=1)),
         Field("e", T.bytes, Constraints(max_length=4)),
     ]
     env = Env(structs=[Struct("S", fields)], s=T.struct("S"))
-    assert env.predicate("s.a == 1.0").always_true().proved
+    assert env.predicate("s.a == 1").always_true().proved
     assert env.predicate("s.c == null || size(s.c) <= 2").always_true().proved
 
 

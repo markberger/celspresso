@@ -237,8 +237,6 @@ def test_expr_identity_includes_the_requested_scale() -> None:
     env = Env(x=T.fixed(8, 2))
     assert env.expr("x", T.fixed(8, 2)) != env.expr("x", T.fixed(8, 4))
     assert env.expr("x", T.fixed(8, 2)) == env.expr("x", T.fixed(8, 2))
-    with pytest.raises(TypeError, match="int count of units"):
-        env.expr("dyn(1.5)", T.fixed(8, 2)).evaluate({"x": Decimal(1)})
 
 
 def test_unused_precision_and_decimal_literals() -> None:

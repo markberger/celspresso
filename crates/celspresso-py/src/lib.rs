@@ -544,9 +544,9 @@ fn compile_err(kind: &str, src: &str, diags: Vec<(String, Span)>) -> PyErr {
     CompileError::new_err((kind.to_string(), items, src.to_string()))
 }
 
-/// With `strict`, reject uses of CEL outside the verifier's strict profile.
-fn in_profile(checked: &CheckedExpr, src: &str, strict: bool) -> PyResult<()> {
-    let outside = if strict { celspresso_verify::strict::violations(checked) } else { Vec::new() };
+/// Reject uses of CEL outside celspresso's subset (what the verifier decides exactly and fast).
+fn in_subset(checked: &CheckedExpr, src: &str) -> PyResult<()> {
+    let outside = celspresso_verify::subset::violations(checked);
     if outside.is_empty() {
         Ok(())
     } else {
@@ -590,14 +590,13 @@ impl Core {
     /// readers: {struct: [fields with a custom reader]}, checked here; the callables
     /// themselves are passed to each evaluate call
     #[new]
-    #[pyo3(signature = (structs, vars, functions, defs, readers=None, strict=false))]
+    #[pyo3(signature = (structs, vars, functions, defs, readers=None))]
     fn new(
         structs: Vec<(String, Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>)>,
         vars: Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>,
         functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>, Option<ContractSpec<'_>>)>,
         defs: Vec<(String, String, Option<Vec<(String, Bound<'_, PyAny>)>>)>,
         readers: Option<HashMap<String, Vec<String>>>,
-        strict: bool,
     ) -> PyResult<Self> {
         let mut s = Schema::with_stdlib();
         for (name, fields) in structs {
@@ -610,15 +609,15 @@ impl Core {
         for (name, t, c) in vars {
             s.vars.insert(name.clone(), VarDecl { name, ty: type_from_py(&t)?, constraints: constraints_from_py(c.as_ref())? });
         }
-        if strict {
+        {
             // schema patterns are standing assumptions on every query, so they must be quick too
             let fields = s.structs.values().flat_map(|d| d.fields.iter().map(move |f| (format!("{}.{}", d.name, f.name), &f.constraints)));
             let vars = s.vars.values().map(|v| (v.name.clone(), &v.constraints));
             for (name, mut c) in fields.chain(vars) {
                 // the field's own pattern, then its items' (list elements), and so on down
                 loop {
-                    if let Some(Err(why)) = c.pattern.as_deref().map(celspresso_verify::strict::pattern_in_profile) {
-                        return Err(PyValueError::new_err(format!("the pattern on '{name}' is outside the strict profile: {why}")));
+                    if let Some(Err(why)) = c.pattern.as_deref().map(celspresso_verify::subset::pattern_in_profile) {
+                        return Err(PyValueError::new_err(format!("the pattern on '{name}' is outside celspresso's CEL subset: {why}")));
                     }
                     match &c.items {
                         Some(items) => c = items,
@@ -673,7 +672,7 @@ impl Core {
                 cs.vars.insert(n.clone(), VarDecl { name: n.clone(), ty: t, constraints: Constraints::default() });
             }
             let ensures = compile_source(&Arc::new(cs), &BTreeMap::new(), &src)?;
-            in_profile(&ensures, &src, strict)?;
+            in_subset(&ensures, &src)?;
             if *ensures.output_type() != CelType::Bool {
                 return Err(PyValueError::new_err(format!("ensures for '{id}' must be a bool expression, not {}", ensures.output_type())));
             }
@@ -689,7 +688,7 @@ impl Core {
             match params {
                 None => {
                     let checked = compile_source(&Arc::new(s.clone()), &defmap, &src)?;
-                    in_profile(&checked, &src, strict)?;
+                    in_subset(&checked, &src)?;
                     defmap.insert(name, Definition::constant(checked.expr));
                 }
                 Some(params) => {
@@ -703,7 +702,7 @@ impl Core {
                         types.push(ty);
                     }
                     let checked = compile_source(&Arc::new(ds), &defmap, &src)?;
-                    in_profile(&checked, &src, strict)?;
+                    in_subset(&checked, &src)?;
                     let result = checked.output_type().clone();
                     s.add_function(FunctionDecl {
                         name: name.clone(),
@@ -729,10 +728,9 @@ impl Core {
         Ok(Core { schema, defs: defmap })
     }
 
-    #[pyo3(signature = (source, strict=false))]
-    fn compile(&self, source: &str, strict: bool) -> PyResult<Program> {
+    fn compile(&self, source: &str) -> PyResult<Program> {
         let checked = compile_source(&self.schema, &self.defs, source)?;
-        in_profile(&checked, source, strict)?;
+        in_subset(&checked, source)?;
         Ok(Program { checked: Arc::new(checked), source: source.to_string() })
     }
 

@@ -5,7 +5,7 @@
 //! (unless the encoding was bounded, in which case it degrades to `Unknown`).
 
 mod encode;
-pub mod strict;
+pub mod subset;
 mod sym;
 mod zutil;
 

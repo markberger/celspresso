@@ -1,4 +1,5 @@
-//! The strict profile: the part of CEL the verifier decides exactly and quickly.
+//! celspresso's CEL subset: the part of CEL the verifier decides exactly and quickly.
+//! Expressions outside it are compile errors; there is no opt-out.
 //!
 //! Builtins are allowed by overload id, so a builtin added later is outside the profile
 //! until it is measured and listed here. Host functions are always allowed (they are
@@ -23,31 +24,24 @@ const ALLOWED: &[&str] = &[
     "map_insert_map",
     "to_dyn",
     "select_optional_field",
-    // int / uint / double arithmetic (CEL truncation; overflow and /0 are errors)
+    // int / uint arithmetic (CEL truncation; overflow and /0 are errors)
     "add_int64",
     "add_uint64",
-    "add_double",
     "subtract_int64",
     "subtract_uint64",
-    "subtract_double",
     "multiply_int64",
     "multiply_uint64",
-    "multiply_double",
     "divide_int64",
     "divide_uint64",
-    "divide_double",
     "modulo_int64",
     "modulo_uint64",
     "negate_int64",
-    "negate_double",
     "math_greatest",
     "math_least",
     "math_abs_int",
     "math_abs_uint",
-    "math_abs_double",
     "math_sign_int",
     "math_sign_uint",
-    "math_sign_double",
     // conversions between ints, uints and strings
     "int64_to_int64",
     "uint64_to_int64",
@@ -55,9 +49,6 @@ const ALLOWED: &[&str] = &[
     "uint64_to_uint64",
     "int64_to_uint64",
     "string_to_uint64",
-    "int64_to_double",
-    "uint64_to_double",
-    "double_to_double",
     "string_to_string",
     "int64_to_string",
     "uint64_to_string",
@@ -93,13 +84,10 @@ const ALLOWED: &[&str] = &[
     "map_size",
     "list_sum_int64",
     "list_sum_uint64",
-    "list_sum_double",
     "list_min_int64",
     "list_min_uint64",
-    "list_min_double",
     "list_max_int64",
     "list_max_uint64",
-    "list_max_double",
     // optionals
     "optional_of",
     "optional_none",
@@ -167,11 +155,10 @@ fn builtin(function: &str, id: &str) -> bool {
 /// Modeled internal calls the checker records without an overload id.
 const ID_LESS: &[&str] = &[ops::OPT_ENTRY, ops::OPT_INDEX, ops::OPT_SELECT];
 
-/// `<`, `<=`, `>`, `>=` on these operand types (`less_int64`, `greater_equals_uint64_double`, ...).
+/// `<`, `<=`, `>`, `>=` on these operand types (`less_int64`, `greater_equals_int64_uint64`, ...).
 #[rustfmt::skip]
 const COMPARED: &[&str] = &[
-    "int64", "uint64", "double", "string", "bool", "date", "timestamp", "duration", "int64_uint64", "int64_double",
-    "uint64_int64", "uint64_double", "double_int64", "double_uint64",
+    "int64", "uint64", "string", "bool", "date", "timestamp", "duration", "int64_uint64", "uint64_int64",
 ];
 
 /// Why a builtin outside the profile is left out, for the error message.
@@ -180,7 +167,7 @@ fn why(id: &str) -> &'static str {
         _ if id.contains("bytes") || id.starts_with("base64") => "bytes are not modeled",
         _ if id.ends_with("_with_tz") => "time zones are not modeled; use the UTC accessor",
         "double_to_string" | "string_to_double" | "double_to_int64" | "double_to_uint64" => {
-            "converting doubles to strings or ints is slow or unmodeled; use fixed-point numbers (T.fixed)"
+            "doubles aren't in the subset; use fixed-point numbers (T.fixed)"
         }
         _ if id.starts_with("math_") => "this math function is not modeled",
         "string_format" | "string_trim" | "string_replace_string_string" | "string_replace_string_string_int" => "not modeled yet",
@@ -247,17 +234,22 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
     parts.iter().try_for_each(|p| walk(p, 1))
 }
 
-/// Whether a value of type `t` can hold bytes, looking through containers and struct fields.
-fn has_bytes(t: &CelType, schema: &Schema, seen: &mut Vec<String>) -> bool {
+/// The unmodeled type a value of type `t` can hold, if any, looking through containers and
+/// struct fields.
+fn unmodeled(t: &CelType, schema: &Schema, seen: &mut Vec<String>) -> Option<&'static str> {
     match t {
-        CelType::Bytes => true,
-        CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) | CelType::Type(a) => has_bytes(a, schema, seen),
-        CelType::Map(k, v) => has_bytes(k, schema, seen) || has_bytes(v, schema, seen),
+        CelType::Bytes => Some("bytes values are not part of celspresso's CEL subset"),
+        CelType::Double => Some(
+            "doubles are not part of celspresso's CEL subset (their arithmetic is slow to verify and rounds); \
+             use ints or fixed-point numbers (T.fixed, or Decimal with decimal_places)",
+        ),
+        CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) | CelType::Type(a) => unmodeled(a, schema, seen),
+        CelType::Map(k, v) => unmodeled(k, schema, seen).or_else(|| unmodeled(v, schema, seen)),
         CelType::Struct(n) if !seen.contains(n) => {
             seen.push(n.clone());
-            schema.structs.get(n).is_some_and(|d| d.fields.iter().any(|f| has_bytes(&f.ty, schema, seen)))
+            schema.structs.get(n).and_then(|d| d.fields.iter().find_map(|f| unmodeled(&f.ty, schema, seen)))
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -268,9 +260,12 @@ fn literal(e: &Expr) -> Option<&Literal> {
     }
 }
 
-/// Uses of CEL outside the strict profile, as (message, span), in source order.
+const DYN: &str = "values of unknown type (dyn, or Any in Python) are not part of celspresso's CEL subset; \
+     give the field or variable a concrete type";
+
+/// Uses of CEL outside the subset, as (message, span), in source order.
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
-    // a struct only read through (`p.name`) is fine even if another field holds bytes
+    // a struct only read through (`p.name`) is fine even if another field is unmodeled
     let mut read_through = std::collections::HashSet::new();
     c.expr.walk(&mut |e: &Expr| {
         if let ExprKind::Select { operand, test_only: false, .. } = &e.kind {
@@ -280,10 +275,16 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
     let mut out = Vec::new();
     c.expr.walk(&mut |e: &Expr| match &e.kind {
         // values enter through literals, variables and fields; flagging those covers every use
-        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Select { .. }
-            if !read_through.contains(&e.id) && has_bytes(c.type_of(e.id), &c.schema, &mut Vec::new()) =>
-        {
-            out.push(("bytes values are outside the strict profile: bytes are not modeled".to_string(), e.span));
+        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Select { .. } if !read_through.contains(&e.id) => {
+            let t = c.type_of(e.id);
+            if let Some(why) = unmodeled(t, &c.schema, &mut Vec::new()) {
+                out.push((why.to_string(), e.span));
+            } else if matches!(t, CelType::Dyn) {
+                out.push((DYN.to_string(), e.span));
+            }
+        }
+        ExprKind::Call { function, .. } if function == "dyn" && matches!(c.type_of(e.id), CelType::Dyn) => {
+            out.push((DYN.to_string(), e.span));
         }
         ExprKind::Call { target, function, args } => {
             let ids = match c.refs.get(&e.id) {
@@ -297,6 +298,13 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
                 return;
             }
             let all: Vec<&Expr> = target.iter().map(|t| &**t).chain(args).collect();
+            // an operand of an unmodeled type is reported where it appears; one error is enough
+            if all.iter().any(|a| {
+                let t = c.type_of(a.id);
+                matches!(t, CelType::Dyn) || unmodeled(t, &c.schema, &mut Vec::new()).is_some()
+            }) {
+                return;
+            }
             for id in ids.iter().filter(|id| builtin(function, id)) {
                 if ALLOWED.contains(&id.as_str()) || is_comparison(id) {
                     continue;
@@ -309,10 +317,10 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
                     // point at the argument that has to change
                     let span = all.get(*at).map_or(e.span, |a| a.span);
                     if !ok {
-                        out.push((format!("'{}' needs {need} in the strict profile", display_fn(function)), span));
+                        out.push((format!("'{}' needs {need} in celspresso's CEL subset", display_fn(function)), span));
                     } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
                         if let Err(why) = pattern_in_profile(p) {
-                            out.push((format!("this pattern is outside the strict profile: {why}"), span));
+                            out.push((format!("this pattern is outside celspresso's CEL subset: {why}"), span));
                         }
                     }
                     continue;
@@ -326,11 +334,7 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
 }
 
 fn outside(function: &str, why: &str) -> String {
-    format!(
-        "'{}' is outside the strict profile ({why}); create the Env with strict=False to use it, \
-         at the cost of UNKNOWN verdicts",
-        display_fn(function)
-    )
+    format!("'{}' is not part of celspresso's CEL subset: {why}", display_fn(function))
 }
 
 #[cfg(test)]
@@ -379,7 +383,7 @@ mod tests {
             r"s.matches(r'(?i)^[a-z]{2}\s*[0-9]{5}(-[0-9]{4})?$') && s.matches('.*') && s.matches('^(x+)?$')",
             "s.split(',').size() > 1 && xs.all(x, x > 0) && xs.sum() < math.greatest(n, 3)",
             "at.getFullYear() == 2024 && at < timestamp('2025-01-01T00:00:00Z') && day.year() > 1900",
-            "d * 2.0 < 10.0 && n < 3u + 1u ? true : 1 < 2.5",
+            "n * 2 < 10 && n < 3 ? 1u < 2u : -n < 7",
             "optional.of(s).orValue('') == s && {'a': n}['a'] == n",
         ] {
             assert_eq!(outside(src), Vec::<String>::new(), "{src}");
@@ -390,11 +394,15 @@ mod tests {
     fn the_profile_rejects_slow_or_unmodeled_builtins_with_a_reason() {
         for (src, want) in [
             ("string(d) == '1.5'", "fixed-point"),
+            ("d < 2.0", "doubles are not part"),
+            ("n < 2.5", "doubles are not part"),
+            ("[1.5].size() == 1", "doubles are not part"),
+            ("dyn(n) > 1", "unknown type"),
             ("at.getHours('UTC') == 1", "time zones"),
             ("b'ab' == b'ab'", "bytes"),
-            ("math.floor(d) == 1.0", "math function"),
+            ("math.bitAnd(n, 3) == 1", "math function"),
             ("[3, 1].sort() == [1, 3]", "list function"),
-            ("type(n) == int", "outside the strict profile"),
+            ("type(n) == int", "not part of celspresso's CEL subset"),
             ("s.split(s).size() == 1", "literal, non-empty separator"),
             ("s.split('').size() == 1", "literal, non-empty separator"),
             ("s.matches(s)", "literal pattern"),

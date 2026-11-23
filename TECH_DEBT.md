@@ -113,28 +113,29 @@ with "comprehension over this range is not yet modeled". The same comprehension 
 non-nullable list works.
 - *Fix:* in the encoder, unwrap a nullable range under the guard that it isn't null.
 
-### The strict profile leaves out some useful formatting builtins
-`Env` is strict by default (`crates/celspresso-verify/src/strict.rs`): builtins are
+### The subset leaves out some useful formatting builtins
+Every `Env` accepts only celspresso's CEL subset (`crates/celspresso-verify/src/subset.rs`): builtins are
 allowed by overload id after probing, and everything else is a compile error. Left out
 for now but worth adding once modeled and measured: `trim`, `replace` and `format` with
 literal arguments, `string()` of dates, timestamps and durations, and `split` with a
 limit. Also:
 - Errors in a definition, `ensures` contract or assumption say "1 error in CEL
   expression" without naming which definition or contract it was.
-- A rule file with a `vars` table is always strict, but the error suggests strict=False,
-  which a rule file can't express (only `env = "module:attr"` can).
 - Host functions returning bytes are accepted; their verdicts are UNKNOWN (opaque).
 - Fixed-offset time zones (`at.getHours('+01:00')`) are modeled exactly but rejected
   with every `*_with_tz` overload; a literal fixed offset could be allowed.
 - `matches('^foo$|^bar$')` (anchors inside a top-level alternation) is rejected by both
   the profile and the translator; translating branch by branch would accept it.
-- Doubles are allowed (arithmetic is exact but slower, ~350 ms for SAT on products);
-  `int(double)` and `string(double)` are not.
+- Doubles are rejected everywhere (use fixed-point). The evaluator and verifier still
+  implement them for the conformance suite; that code is now unreachable from Python.
+- Integer multiplication of two variables stays in (Z3 Int, range-checked). Measured in
+  `benchmarks/bench_mul.py`: 40/42 decided, worst ~400 ms; a 64-bit bit-vector encoding
+  decided 30/42. Only factoring-style questions (`a * b == 1000003` with wide bounds)
+  time out. A static "one side constant" rule would reject 13 of the 14 shapes.
 - `ageOn` is allowed although satisfiability can take seconds; `string(int)` relating two
   differently computed numbers can reach the timeout (see the cents benchmark case).
-- A call with a `dyn` argument is rejected when any candidate overload is outside the
-  profile (`dyn(n) + dyn(n)` lists `add_bytes`), with a bytes message the user never asked
-  for. Conservative, but confusing.
+- Values of type `dyn` (`Any` fields, `dyn(x)`) are rejected. `dict[str, Any]` can still
+  be tested with `in`/`size`, but its values can't be used.
 - `matches` patterns are limited to 16 ranges per character class, so Unicode `\d`, `\w`
   and `\p{..}` are rejected (`^\d{5}$` took 4.5 s to come back UNKNOWN; `\p{L}+` ran far
   past the 5 s timeout, so the solver timeout isn't always honored either).
@@ -143,7 +144,7 @@ limit. Also:
 
 ### Simple in-profile string questions still time out
 The profile promises fast, exact answers, but these come back UNKNOWN at the 5 s timeout
-(second strict-profile review):
+(second subset review):
 - Fixed-count regex repetition with a literal `contains`/`indexOf`/`split`:
   `s.matches('^[a-z]{12}$') && !s.contains('q')`. The same fact as `!s.matches('q')`
   takes 0.1 s, so the encoding of `contains` with a literal needle is at fault.
