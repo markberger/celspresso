@@ -48,7 +48,7 @@ def test_values_are_exact_units_in_cel() -> None:
 def test_pydantic_bounds_become_unit_bounds_and_are_proved() -> None:
     env = Env(order=Order)
     assert env.predicate("order.lines.all(l, l.price <= 99999)").always_true().proved
-    assert env.predicate("order.lines.exists(l, l.price > 99999)").satisfiable().unsat
+    assert env.predicate("order.lines.exists(l, l.price > 99999)").satisfiable().refuted
     # gt=0.005 with cents is ge 1
     assert env.predicate("order.discount == null || order.discount >= 1").always_true().proved
     assert "fixed(8, 2), >= 0, <= 99999" in env.describe()
@@ -57,7 +57,7 @@ def test_pydantic_bounds_become_unit_bounds_and_are_proved() -> None:
 def test_witnesses_decode_to_decimals() -> None:
     env = Env(order=Order)
     v = env.predicate("order.lines.exists(l, l.price == 1234)").satisfiable()
-    assert v.sat
+    assert v.proved
     o = v.witness.to_python()["order"]
     assert Decimal("12.34") in [line.price for line in o.lines]
 

@@ -58,13 +58,13 @@ def test_refuted_with_a_real_counterexample(src: str) -> None:
 
 def test_int_parsing_accepts_signs_and_leading_zeros() -> None:
     v = env.predicate("int(t) == 7 && t != '7'").satisfiable()
-    assert v.sat
+    assert v.proved
     assert v.witness["t"] in ("07", "+7", "007", "+07", "0007")  # whatever the solver picks parses
 
 
 def test_int_parsing_errors_are_found() -> None:
-    v = env.predicate("int(t) > 0").can_error()
-    assert v.sat
+    v = env.predicate("int(t) > 0").never_errors()
+    assert v.refuted
     with pytest.raises(Exception, match="convert"):
         env.predicate("int(t) > 0").evaluate(v.witness)
 

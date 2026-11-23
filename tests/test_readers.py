@@ -189,7 +189,7 @@ def test_witnesses_replay_without_readers() -> None:
     # diff replays each witness through explain; the witness is raw data, not a row
     found = env.predicate("item.qty > 3").diff(env.predicate("item.qty > 5"), limit=3)
     assert found
-    assert all(3 < w["item"]["qty"] <= 5 for w in found)
+    assert all(3 < d.witness["item"]["qty"] <= 5 for d in found)
     # check_rule names the runtime error the witness raises
     check = env.check_rule("10 / (item.qty - 3) > 1")
     assert any("division by zero" in p.message for p in check.problems)

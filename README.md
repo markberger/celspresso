@@ -46,14 +46,16 @@ uv sync --group dev && uv run maturin develop --release
 
 | | Question | Answer |
 |---|---|---|
-| `p.satisfiable()` | Can this ever be true? | `SAT` + example / `UNSAT` |
+| `p.satisfiable()` | Can this ever be true? | `PROVED` + example / `REFUTED` |
 | `p.always_true()` | Is it true for every valid input? | `PROVED` / `REFUTED` + counterexample |
 | `a.implies(b)` | Whenever `a` holds, does `b`? | `PROVED` / `REFUTED` + counterexample |
 | `a.equivalent(b)` | Do they agree on every input, errors included? | `PROVED` / `REFUTED` + counterexample |
-| `a.diff(b)` | Where do they disagree, and why? | one input per distinct reason |
-| `e.can_error()` | Can evaluation fail (÷0, overflow, missing key)? | `SAT` + example / `UNSAT` |
+| `a.diff(b)` | Where do they disagree, and why? | one input per distinct reason, with both answers |
+| `e.never_errors()` | Is evaluation free of failures (÷0, overflow, missing key)? | `PROVED` / `REFUTED` + counterexample |
 | `e.bounds()` | What's the smallest and largest value it can take? | proved `[min, max]` + an input for each |
-| `env.check_rule(src, invariants, require=...)` | Is this rule safe, and useful enough, to accept? | report |
+| `env.check_rule(src, spec)` | Is this rule safe, and useful enough, to accept? | report |
+
+The status always answers the question asked: `PROVED` means the property holds, `REFUTED` that it doesn't, `UNKNOWN` that the solver couldn't decide. `verdict.expect()` passes only on `PROVED`.
 
 **Catch a refactor that changes behavior.** Someone tidies `<= 30` into `< 30`:
 
@@ -68,9 +70,9 @@ auto_refund.equivalent(tidied).counterexample
 looser = env.predicate("order.status != 'delivered' || (order.tier == 'gold' && order.total_cents < 10000)")
 for case in auto_refund.diff(looser):
     print(case)
-# order.days_since_delivery = 31, order.status = 'damaged', order.tier = 'standard', ...
-# order.days_since_delivery = 31, order.status = 'damaged', order.tier = 'gold', order.total_cents = 5000
-# order.days_since_delivery = 0, order.status = 'delivered', order.tier = 'gold', order.total_cents = 5000
+# when order.days_since_delivery = 31, order.status = 'damaged', order.tier = 'standard', ...: false -> true
+# when order.days_since_delivery = 31, order.status = 'damaged', order.tier = 'gold', order.total_cents = 5000: false -> true
+# when order.days_since_delivery = 0, order.status = 'delivered', order.tier = 'gold', order.total_cents = 5000: false -> true
 ```
 
 **Typos fail at compile time**, not in production:
@@ -100,13 +102,16 @@ print(env.check_rule("order.status == 'lost' || (order.tier == 'gold' && order.d
 # - violates 'nothing is refunded after 90 days' when order.days_since_delivery = 91, order.status = 'lost', ...
 ```
 
-Invariants keep a rule *safe*. `require=` and `examples=` keep it *useful*. Without them, a rule that refunds almost nothing passes every safety check:
+Invariants keep a rule *safe*. `require` and `examples` keep it *useful*. Without them, a rule that refunds almost nothing passes every safety check. A `Spec` holds all of them, plus any `assumptions`, as one reusable value:
 
 ```python
+from celspresso import Spec
+
 MUST_REFUND = {"small lost orders": "order.status == 'lost' && order.total_cents <= 10000"}
+spec = Spec(POLICY, require=MUST_REFUND)
 
 rule = "order.status == 'lost' && order.total_cents == 700 && order.days_since_delivery <= 90"
-print(env.check_rule(rule, POLICY, require=MUST_REFUND))
+print(env.check_rule(rule, spec))
 # rejected:
 # - too narrow: doesn't allow 'small lost orders', e.g. when order.days_since_delivery = 91, order.status = 'lost', order.total_cents = 0
 ```
@@ -116,10 +121,11 @@ print(env.check_rule(rule, POLICY, require=MUST_REFUND))
 `env.describe()` gives an LLM everything it needs in one block of text: variables, fields, types and constraints, functions, definitions and a CEL cheat sheet. The report is plain text too, so the two drive a repair loop:
 
 ```python
-spec, feedback = env.describe(), ""
+spec = Spec(POLICY, require=MUST_REFUND, examples=golden_set)  # [(input, expected answer), ...]
+prompt, feedback = env.describe(), ""
 for _ in range(5):
-    src = llm.draft_rule(spec, policy_doc, feedback)   # your LLM call
-    report = env.check_rule(src, POLICY, require=MUST_REFUND, examples=golden_set)
+    src = llm.draft_rule(prompt, policy_doc, feedback)   # your LLM call
+    report = env.check_rule(src, spec)
     if report.ok:
         break
     feedback = str(report)
@@ -193,7 +199,9 @@ A Rust core parses, checks and evaluates CEL, and encodes its exact semantics in
   - **Written in CEL**, so it is fully verified: `env.define("clamp", "v < 0 ? 0 : (v > 100 ? 100 : v)", params={"v": int})`, called as `clamp(x)`.
   - **Tabulated automatically** when every parameter is a `bool`, `Literal`, `Enum` or bounded int (at most 1024 inputs in total). It is called once per input when declared and is then known exactly. Opt out with `tabulate=False`.
   - **Opaque** otherwise. Tell the prover what holds with `@function(ensures="result >= 0 && result <= 100", total=True)`. If an answer depends on what the function returns, the verdict is `UNKNOWN`, and its reason says which of these three ways would fix that.
-- **Rule sets:** `RuleSet({...}).verify_all(invariants)` vets every rule at once; `unreachable()`, `can_error()` and `check_pairwise(...)` find dead, crashing and overlapping rules.
+- **Rule sets:** `RuleSet({...}).verify_all(spec)` vets every rule at once; `unreachable()`, `may_error()` and `check_pairwise(...)` find dead, crashing and overlapping rules.
+- **Contexts and assumptions:** `Env.from_model(Context)` declares every field of a Pydantic model or dataclass as a variable. `env.assume("order.total_cents < 10000000")` adds a standing fact that every proof may rely on.
+- **Errors:** compile errors start with the first problem (`1:7: undefined field ...`) and carry `diagnostics`, each with a `code`: `"syntax"`, `"type"` or `"subset"`. Valid CEL outside the subset raises `CelSubsetError` (a `CelTypeError`), whose message says what to write instead.
 - **Debugging and tests:** `expr.explain(data)` shows the value of every sub-expression; `celspresso.testing` has `assert_equivalent`, `assert_implies`, `assert_never` and more.
 - **Not yet supported:** protobuf messages and JSON values. Values typed `Any` are outside the subset (the error asks for a concrete type). The verifier models ints (including products of two variables), strings (including case mapping, `string(int)`, `int(string)`, `join` and `split`), lists, maps, optionals, dates, timestamps and durations. Proofs over a list or map need a `max_length` (or a larger `unroll_limit`), so the prover can cover every length.
 - **Contributing:** `scripts/check.sh` runs every lint, type-check and test gate. Install the hooks once with `uv run prek install && ln -sf ../../scripts/pre-push .git/hooks/pre-push`. Commits then get file hygiene, ruff and rustfmt fixes on the staged files. Pushes run `scripts/check.sh --fast` on the pushed commit, and refuse while the tree has uncommitted files. Changes reach `main` through pull requests: CI (`.github/workflows/ci.yml`) runs the full `scripts/check.sh`, plus the tests on Python 3.10 and macOS, and must pass before a merge.

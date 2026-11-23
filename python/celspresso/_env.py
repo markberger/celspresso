@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Generic, Literal, TypeVar, overload
 
 from . import _celspresso as _core
-from ._errors import CelError, CelEvaluationError, CelSyntaxError, CelTypeError, Diagnostic
+from ._errors import CelError, CelEvaluationError, CelSubsetError, CelSyntaxError, CelTypeError, Diagnostic
+from ._spec import Spec
 from ._types import (
     SchemaBuilder,
     TypeSpec,
@@ -20,7 +21,7 @@ from ._types import (
     type_name,
     witness_to_host,
 )
-from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness, lookup
+from ._verdict import Bounds, Difference, Extreme, Stats, Status, Verdict, Witness, lookup
 from .schema import Struct, TypeRef, _contains_fixed
 
 if typing.TYPE_CHECKING:
@@ -32,8 +33,6 @@ T = TypeVar("T")
 ErrorMode = Literal["strict", "as_false"]
 Assumption = "str | Predicate"
 
-_OPTION_NAMES = ("timeout", "unroll_limit", "schema_constraints", "functions", "assumptions")
-
 
 def _option_clash(name: str, value: Any) -> TypeError:
     return TypeError(
@@ -42,13 +41,11 @@ def _option_clash(name: str, value: Any) -> TypeError:
     )
 
 
-def _check_options(timeout: Any, unroll_limit: Any, schema_constraints: Any) -> None:
+def _check_options(timeout: Any, unroll_limit: Any) -> None:
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))):
         raise _option_clash("timeout", timeout)
     if unroll_limit is not None and (isinstance(unroll_limit, bool) or not isinstance(unroll_limit, int)):
         raise _option_clash("unroll_limit", unroll_limit)
-    if schema_constraints is not None and not isinstance(schema_constraints, bool):
-        raise _option_clash("schema_constraints", schema_constraints)
 
 
 def _option_list(name: str, value: Any) -> list[Any]:
@@ -73,8 +70,8 @@ def _merge_variables(positional: Mapping[str, Any] | None, keywords: dict[str, A
 
 def _raise_compile(exc: Exception) -> typing.NoReturn:
     kind, items, source = exc.args  # the source that failed (a definition or contract, maybe)
-    diags = [Diagnostic(m, a, b, r) for (m, a, b, r) in items]
-    cls = CelSyntaxError if kind == "syntax" else CelTypeError
+    diags = [Diagnostic(m, a, b, r, kind) for (m, a, b, r) in items]
+    cls = {"syntax": CelSyntaxError, "subset": CelSubsetError}.get(kind, CelTypeError)
     raise cls(source, diags) from None
 
 
@@ -174,6 +171,8 @@ class Env:
     >>> Env({"timeout": int}, timeout=2.0).variables
     {'timeout': 'int'}
 
+    Or declare them all as the fields of one model with `Env.from_model(Context)`.
+
     Expressions are celspresso's subset of CEL: the part the verifier decides exactly and
     quickly (strings, ints, fixed-point numbers, dates, bounded lists and maps, ...).
     Anything else (doubles, bytes, `sort`, time zones, ...) is a compile error that says
@@ -187,28 +186,20 @@ class Env:
         *,
         timeout: float = 5.0,
         unroll_limit: int = 5,
-        schema_constraints: bool = True,
-        debug_sample_proofs: int = 0,
         limits: Limits | None = None,
         structs: Iterable[Struct] = (),
         adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> None:
-        _check_options(timeout, unroll_limit, schema_constraints)
-        if (
-            isinstance(debug_sample_proofs, bool)
-            or not isinstance(debug_sample_proofs, int)
-            or debug_sample_proofs < 0
-        ):
-            raise _option_clash("debug_sample_proofs", debug_sample_proofs)
-        self._sample = debug_sample_proofs
+        _check_options(timeout, unroll_limit)
+        self._sample = 0  # see _debug_options
         if limits is not None and not isinstance(limits, Limits):
             raise _option_clash("limits", limits)
         self._limits = (limits or Limits())._spec()
         variables = _merge_variables(variables, more_variables)
         self._timeout = timeout
         self._unroll = unroll_limit
-        self._schema_constraints = schema_constraints
+        self._schema_constraints = True  # see _debug_options
         self._builder = SchemaBuilder(_option_list("adapters", adapters))
         self._vars: dict[str, tuple[TypeSpec, dict[str, Any] | None]] = {}
         self._fns: dict[str, _Fn] = {}
@@ -218,6 +209,38 @@ class Env:
         for n, tp in variables.items():
             self._vars[n] = self._builder.convert(tp, n)
         self._build()
+
+    @classmethod
+    def from_model(
+        cls,
+        model: type,
+        *,
+        timeout: float = 5.0,
+        unroll_limit: int = 5,
+        limits: Limits | None = None,
+        structs: Iterable[Struct] = (),
+        adapters: Iterable[TypeAdapter] = (),
+    ) -> Env:
+        """An Env whose variables are the fields of a Pydantic model or dataclass, with
+        their types and constraints:
+
+        >>> import dataclasses
+        >>> @dataclasses.dataclass
+        ... class Context:
+        ...     total: int
+        ...     tier: str
+        >>> Env.from_model(Context).variables
+        {'total': 'int', 'tier': 'string'}
+
+        Field names never collide with options, so this suits contexts with many variables."""
+        return cls(
+            _model_variables(model),
+            timeout=timeout,
+            unroll_limit=unroll_limit,
+            limits=limits,
+            structs=structs,
+            adapters=adapters,
+        )
 
     # -- construction -----------------------------------------------------
 
@@ -288,28 +311,27 @@ class Env:
         /,
         *,
         functions: Iterable[Callable[..., Any]] = (),
-        assumptions: Iterable[str | Predicate] = (),
         timeout: float | None = None,
         unroll_limit: int | None = None,
         structs: Iterable[Struct] = (),
         adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> Env:
-        """Return a new Env with more variables, functions, or standing assumptions.
+        """Return a new Env with more variables, functions, structs or adapters, or new options.
 
         As with `Env(...)`, pass a mapping for variables whose names clash with options.
         """
-        _check_options(timeout, unroll_limit, None)
+        _check_options(timeout, unroll_limit)
         if isinstance(functions, (str, type)) or not isinstance(functions, Iterable):
             raise _option_clash("functions", functions)
-        if isinstance(assumptions, (str, Predicate)):
-            assumptions = [assumptions]
-        elif not isinstance(assumptions, Iterable) or isinstance(assumptions, type):
-            raise _option_clash("assumptions", assumptions)
         functions = list(functions)
         for f in functions:
             if not callable(f) or isinstance(f, type):
                 raise TypeError(f"functions=[...] expects plain callables, got {f!r}")
+        if isinstance(more_variables.get("assumptions"), (str, list, tuple, Predicate)):
+            raise TypeError(
+                "extend() takes no assumptions (that would declare a variable): use env.assume(...)"
+            )
         variables = _merge_variables(variables, more_variables)
         e = self._clone()
         e._builder.add_adapters(_option_list("adapters", adapters))
@@ -326,10 +348,27 @@ class Env:
         if unroll_limit is not None:
             e._unroll = unroll_limit
         e._build()
-        new_asm = [a if isinstance(a, str) else a.source for a in assumptions]
-        for a in new_asm:
-            e.predicate(a)  # validate now
-        e._assumptions = self._assumptions + tuple(new_asm)
+        return e
+
+    def assume(self, *conditions: str | Predicate) -> Env:
+        """Return a new Env where every condition is a standing assumption: a fact every
+        proof may rely on, which `describe()` tells rule authors about.
+
+        >>> env = Env(x=int).assume("x > 0")
+        >>> env.predicate("x != 0").always_true().proved
+        True
+        """
+        for c in conditions:
+            if not isinstance(c, (str, Predicate)):
+                raise TypeError(f"assume() takes CEL conditions (str or Predicate), got {c!r}")
+            if isinstance(c, Predicate) and c.env._fingerprint != self._fingerprint:
+                raise ValueError("assume() was given a Predicate from a different Env")
+        new = tuple(c if isinstance(c, str) else c.source for c in conditions)
+        for c in new:
+            self.predicate(c)  # validate now
+        e = self._clone()
+        e._assumptions = self._assumptions + new
+        e._build()
         return e
 
     def define(self, name: str, source: str, *, params: Mapping[str, Any] | None = None) -> Env:
@@ -473,8 +512,8 @@ class Env:
         assuming: Iterable[str | Predicate] | str | Predicate,
         timeout: float | None,
         errors: ErrorMode = "strict",
-        found: Status = Status.SAT,
-        not_found: Status = Status.UNSAT,
+        found: Status = Status.PROVED,
+        not_found: Status = Status.REFUTED,
     ) -> Verdict:
         for x in (a, b):
             if x is not None and x._env._fingerprint != self._fingerprint:
@@ -593,15 +632,13 @@ class Env:
     def check_rule(
         self,
         rule: str | Predicate,
-        invariants: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
+        spec: Spec | Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
         *,
-        require: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
-        examples: Iterable[tuple[Mapping[str, Any], bool]] = (),
-        assuming: Iterable[str | Predicate] | str | Predicate = (),
         timeout: float | None = None,
     ) -> RuleCheck:
         """Vet a rule you didn't write (from a customer, an admin UI or an LLM) before accepting it.
 
+        `spec` is a `Spec`, or just the invariants (a mapping or list of conditions).
         Checks, in order: it compiles to a predicate; nothing in it is a likely mistake
         (see `Expr.warnings`); it gives the expected answer on every labelled example;
         it can fire at all; it can't fail at runtime; it implies every invariant (what it
@@ -610,15 +647,16 @@ class Env:
         a rule that allows almost nothing passes. A check that comes back UNKNOWN is a
         problem too, so `.ok` means *proved*.
         """
+        if not isinstance(spec, Spec):
+            spec = Spec(spec)
+        assuming = spec.assumptions
         src = rule if isinstance(rule, str) else rule.source
         try:
             pred = self.predicate(rule) if isinstance(rule, str) else rule
         except CelError as e:
             return RuleCheck(src, None, (Problem("invalid", str(e)),))
-        named = _named(invariants)
-        required = _named(require)
         problems: list[Problem] = [Problem("suspicious", w.rendered) for w in pred.warnings]
-        for i, (data, expected) in enumerate(examples):
+        for i, (data, expected) in enumerate(spec.examples):
             try:
                 got: Any = pred.evaluate(data)
             except CelEvaluationError as e:
@@ -633,10 +671,10 @@ class Env:
             problems.append(Problem("unverified", f"could not verify {what}: {v.reason}", invariant, v))
 
         v = pred.satisfiable(assuming=assuming, timeout=timeout)
-        if v.unsat:
+        if v.refuted:
             # never true: often because it fails instead (division by zero, overflow, ...)
-            err = pred.can_error(assuming=assuming, timeout=timeout)
-            if err.sat:
+            err = pred.never_errors(assuming=assuming, timeout=timeout)
+            if err.refuted:
                 msg = f"the rule is never true for any valid input: evaluation {_failure(pred, err)}"
                 problems.append(Problem("never_fires", msg, None, err))
             else:
@@ -646,18 +684,18 @@ class Env:
             return RuleCheck(src, pred, tuple(problems))
         if v.unknown:
             undecided("that the rule can fire", v)
-        v = pred.can_error(assuming=assuming, timeout=timeout)
-        if v.sat:
+        v = pred.never_errors(assuming=assuming, timeout=timeout)
+        if v.refuted:
             problems.append(Problem("can_error", f"evaluation {_failure(pred, v)}", None, v))
         elif v.unknown:
             undecided("that the rule never errors", v)
-        for name, inv in named.items():
+        for name, inv in spec.invariants.items():
             v = pred.implies(inv, assuming=assuming, timeout=timeout)
             if v.refuted:
                 problems.append(Problem("violates", f"violates '{name}' when {v.counterexample}", name, v))
             elif v.unknown:
                 undecided(f"'{name}'", v, name)
-        for name, req in required.items():
+        for name, req in spec.require.items():
             v = self._as_predicate(req).implies(pred, assuming=assuming, timeout=timeout)
             if v.refuted:
                 msg = f"too narrow: doesn't allow '{name}', e.g. when {v.counterexample}"
@@ -705,11 +743,49 @@ def _failure(pred: Predicate, v: Verdict) -> str:
     return f"fails{cause} when {v.witness}"
 
 
-def _named(items: Mapping[str, str | Predicate] | Iterable[str | Predicate]) -> dict[str, str | Predicate]:
-    """Name each condition: by its key, or by its source."""
-    if isinstance(items, Mapping):
-        return dict(typing.cast("Mapping[str, str | Predicate]", items))
-    return {i if isinstance(i, str) else i.source: i for i in items}
+def _value_or_error(e: Expr[Any], data: Mapping[str, Any]) -> Any:
+    """What `e` gives for `data`: its value, or the CelEvaluationError it raises."""
+    try:
+        return e.evaluate(data)
+    except CelEvaluationError as exc:
+        return exc
+
+
+def _model_variables(model: Any) -> dict[str, Any]:
+    """The fields of a Pydantic model or a dataclass, as `Env` variables."""
+    import dataclasses
+
+    fields = getattr(model, "model_fields", None)
+    if isinstance(model, type) and isinstance(fields, Mapping):  # Pydantic v2
+        out: dict[str, Any] = {}
+        for name, info in fields.items():
+            meta = tuple(getattr(info, "metadata", ()))
+            out[name] = typing.Annotated[(info.annotation, *meta)] if meta else info.annotation
+        return out
+    if isinstance(model, type) and dataclasses.is_dataclass(model):
+        try:
+            hints = typing.get_type_hints(model, include_extras=True)
+        except NameError as exc:
+            raise TypeError(f"{model.__name__}: cannot resolve annotation {exc.name!r}") from None
+        return {f.name: hints[f.name] for f in dataclasses.fields(model)}
+    raise TypeError(f"Env.from_model expects a Pydantic model or dataclass class, got {model!r}")
+
+
+def _debug_options(
+    env: Env, *, sample_proofs: int | None = None, schema_constraints: bool | None = None
+) -> Env:
+    """Internal: a copy of `env` with testing-only verifier options. `sample_proofs` checks
+    each proof against that many random inputs; `schema_constraints=False` stops the prover
+    from relying on the schema's constraints (to test that they matter)."""
+    e = env._clone()
+    if sample_proofs is not None:
+        if isinstance(sample_proofs, bool) or not isinstance(sample_proofs, int) or sample_proofs < 0:
+            raise TypeError(f"sample_proofs must be a non-negative int, got {sample_proofs!r}")
+        e._sample = sample_proofs
+    if schema_constraints is not None:
+        e._schema_constraints = schema_constraints
+    e._build()
+    return e
 
 
 def _spec_text(spec: TypeSpec, cons: Mapping[str, Any] | None) -> str:
@@ -785,7 +861,7 @@ class RuleCheck:
 
 def _type_mismatch(source: str, e: Expr[Any], want: str) -> typing.NoReturn:
     msg = f"expression has type {e.output_type}, expected {want}"
-    raise CelTypeError(source, [Diagnostic(msg, 0, len(source), f"{msg}\n  | {source}")])
+    raise CelTypeError(source, [Diagnostic(msg, 0, len(source), f"{msg}\n  | {source}", "type")])
 
 
 #: Most inputs a host function is called on to tabulate it.
@@ -913,7 +989,7 @@ class Expr(Generic[T]):
         For example `order.tier == 'Gold'` when the schema says the tier is 'standard'
         or 'gold': the comparison can never be true.
         """
-        return [Diagnostic(m, a, b, r) for (m, a, b, r) in self._prog.lint()]
+        return [Diagnostic(m, a, b, r, "lint") for (m, a, b, r) in self._prog.lint()]
 
     @property
     def env(self) -> Env:
@@ -1036,11 +1112,21 @@ class Expr(Generic[T]):
             not_found=Status.PROVED,
         )
 
-    def can_error(
+    def never_errors(
         self, *, assuming: Iterable[str | Predicate] | str | Predicate = (), timeout: float | None = None
     ) -> Verdict:
-        """SAT (with a witness) if some valid input makes evaluation fail."""
-        return self._env._verify("can_error", f"can error: {self.source}", self, None, assuming, timeout)
+        """PROVED if evaluation can't fail (division by zero, overflow, a missing key, ...)
+        on any valid input; REFUTED with an input that makes it fail otherwise."""
+        return self._env._verify(
+            "can_error",
+            f"never errors: {self.source}",
+            self,
+            None,
+            assuming,
+            timeout,
+            found=Status.REFUTED,
+            not_found=Status.PROVED,
+        )
 
     def can_equal(
         self,
@@ -1049,7 +1135,7 @@ class Expr(Generic[T]):
         assuming: Iterable[str | Predicate] | str | Predicate = (),
         timeout: float | None = None,
     ) -> Verdict:
-        """SAT if some valid input makes the expression equal `value`."""
+        """PROVED, with an example, if some valid input makes the expression equal `value`."""
         return self.eq(value).satisfiable(assuming=assuming, timeout=timeout)
 
     def bounds(
@@ -1067,20 +1153,23 @@ class Expr(Generic[T]):
         limit: int = 5,
         assuming: Iterable[str | Predicate] | str | Predicate = (),
         timeout: float | None = None,
-    ) -> list[Witness]:
-        """Up to `limit` distinct inputs on which the two expressions disagree (and that
-        satisfy every assumption)."""
+    ) -> list[Difference]:
+        """Up to `limit` inputs on which the two expressions disagree (and that satisfy
+        every assumption), each with what both give for it. Each shows a different
+        reason: no two set every condition in the expressions the same way."""
         if isinstance(assuming, (str, Predicate)):
             assuming = [assuming]
         base: list[str | Predicate] = list(assuming)
-        found: list[Witness] = []
+        found: list[Difference] = []
         blockers: list[str] = []
         paths = sorted(set(self.references) | set(other.references))
         while len(found) < limit:
             v = self.equivalent(other, assuming=[*base, *blockers], timeout=timeout)
             if not v.refuted or v.witness is None:
                 break
-            found.append(v.witness)
+            found.append(
+                Difference(v.witness, _value_or_error(self, v.witness), _value_or_error(other, v.witness))
+            )
             # block the witness's whole behaviour class (same truth value for every
             # condition), so each result shows a different reason; fall back to its values
             clause = self._env._class_clause(v.witness, (self, other)) or _blocking_clause(v.witness, paths)
@@ -1098,7 +1187,7 @@ class Predicate(Expr[bool]):
     def satisfiable(
         self, *, assuming: Iterable[str | Predicate] | str | Predicate = (), timeout: float | None = None
     ) -> Verdict:
-        """SAT with a witness if some valid input makes this true; UNSAT if none can."""
+        """PROVED, with an example, if some valid input makes this true; REFUTED if none can."""
         return self._env._verify("satisfiable", f"satisfiable: {self.source}", self, None, assuming, timeout)
 
     def always_true(
@@ -1125,7 +1214,8 @@ class Predicate(Expr[bool]):
         assuming: Iterable[str | Predicate] | str | Predicate = (),
         timeout: float | None = None,
     ) -> Verdict:
-        """PROVED if every input that makes this true also makes `other` true."""
+        """PROVED if every input that makes this true also makes `other` true; REFUTED
+        with a counterexample otherwise."""
         o = self._env.predicate(other) if isinstance(other, str) else other
         return self._env._verify(
             "implies",

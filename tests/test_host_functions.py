@@ -72,11 +72,11 @@ def test_small_int_domains_are_tabulated_once() -> None:
     assert sorted(calls) == [0, 1, 2, 3]  # every input, once, when declared
     calls.clear()
     v = env.predicate("twice(n) > 5").satisfiable()
-    assert v.sat
+    assert v.proved
     assert v.witness is not None
     assert v.witness["n"] == 3
     assert env.predicate("twice(n) == 2 * n").always_true().proved
-    assert env.predicate("twice(n) == 7").satisfiable().unsat
+    assert env.predicate("twice(n) == 7").satisfiable().refuted
     assert calls == [3]  # only the witness replay
 
 
@@ -102,8 +102,8 @@ def test_raising_inputs_become_errors() -> None:
         return 100 // n
 
     env = Env(n=Annotated[int, Field(ge=-2, le=2)]).extend(functions=[inverse])
-    v = env.expr("inverse(n)", int).can_error()
-    assert v.sat
+    v = env.expr("inverse(n)", int).never_errors()
+    assert v.refuted
     assert v.witness == {"n": 0}
     assert env.predicate("n == 0 || inverse(n) != 0").always_true().proved
 
@@ -164,7 +164,7 @@ def test_parameterized_definitions_are_fully_verified() -> None:
     assert v.counterexample is not None
     assert not 0 <= v.counterexample["score"] <= 100
     # arguments evaluate errors as CEL does: clamp(x) of an overflowing x errors
-    assert env.expr("clamp(score * 4611686018427387904)", int).can_error().sat
+    assert env.expr("clamp(score * 4611686018427387904)", int).never_errors().refuted
 
 
 def test_parameterized_definitions_are_hygienic_and_composable() -> None:
@@ -218,8 +218,8 @@ def _first_pos(s: str) -> int:
 def test_contracts_bind_only_calls_that_happen() -> None:
     # the contract can't hold for '', and no call below is ever made on ''
     env = Env(s=str).extend(functions=[_first_pos])
-    assert env.predicate("s == '' && (s.size() > 0 ? _first_pos(s) == 0 : true)").satisfiable().sat
-    assert env.predicate("s == '' && !(s != '' && _first_pos(s) < 0)").satisfiable().sat
+    assert env.predicate("s == '' && (s.size() > 0 ? _first_pos(s) == 0 : true)").satisfiable().proved
+    assert env.predicate("s == '' && !(s != '' && _first_pos(s) < 0)").satisfiable().proved
     assert env.predicate("s != ''").always_true(assuming="s.size() == 0 ? true : _first_pos(s) >= 0").refuted
     # where the call does happen, the contract is used
     assert env.predicate("s.size() > 0 ? _first_pos(s) >= 0 : true").always_true().proved

@@ -4,12 +4,13 @@ from itertools import combinations
 from typing import TYPE_CHECKING, Any
 
 from ._env import Expr, Predicate
+from ._spec import Spec
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
 
     from ._env import RuleCheck
-    from ._verdict import Verdict, Witness
+    from ._verdict import Difference, Verdict
 
 __all__ = ["RuleSet"]
 
@@ -39,37 +40,39 @@ class RuleSet:
         return {n: r.evaluate(data) for n, r in self.rules.items()}
 
     def unreachable(self, *, timeout: float | None = None) -> dict[str, Verdict]:
-        """Predicates that can never be true (UNSAT) or could not be decided (UNKNOWN)."""
+        """Predicates that can never be true (REFUTED) or could not be decided (UNKNOWN)."""
         out = {}
         for n, r in self.rules.items():
             if isinstance(r, Predicate):
                 v = r.satisfiable(assuming=self.assumptions, timeout=timeout)
-                if not v.sat:
+                if not v.proved:
                     out[n] = v
         return out
 
-    def can_error(self, *, timeout: float | None = None) -> dict[str, Verdict]:
-        """Rules for which some valid input makes evaluation fail (or undecided)."""
+    def may_error(self, *, timeout: float | None = None) -> dict[str, Verdict]:
+        """Rules that some valid input makes fail (REFUTED `never_errors()`), or for which
+        that could not be decided (UNKNOWN)."""
         out = {}
         for n, r in self.rules.items():
-            v = r.can_error(assuming=self.assumptions, timeout=timeout)
-            if not v.unsat:
+            v = r.never_errors(assuming=self.assumptions, timeout=timeout)
+            if not v.proved:
                 out[n] = v
         return out
 
     def verify_all(
         self,
-        invariants: Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
+        spec: Spec | Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
         *,
         timeout: float | None = None,
     ) -> dict[str, RuleCheck]:
-        """`Env.check_rule` on every predicate: each can fire, can't fail, and implies every
-        invariant (under the set's assumptions). `all(c.ok for c in rs.verify_all(inv).values())`
-        means the whole set is proved safe."""
+        """`Env.check_rule` on every predicate, against a `Spec` (or just invariants), under
+        the set's assumptions too. `all(c.ok for c in rs.verify_all(spec).values())` means
+        the whole set is proved to meet it."""
+        spec = (spec if isinstance(spec, Spec) else Spec(spec)).assuming(*self.assumptions)
         out = {}
         for n, r in self.rules.items():
             if isinstance(r, Predicate):
-                out[n] = r.env.check_rule(r, invariants, assuming=self.assumptions, timeout=timeout)
+                out[n] = r.env.check_rule(r, spec, timeout=timeout)
         return out
 
     def check_pairwise(
@@ -88,7 +91,7 @@ class RuleSet:
 
     def diff(
         self, other: RuleSet, *, limit: int = 5, timeout: float | None = None
-    ) -> dict[str, list[Witness]]:
+    ) -> dict[str, list[Difference]]:
         """For each rule name in both sets, inputs on which old and new disagree (under
         this set's assumptions)."""
         out = {}

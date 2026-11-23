@@ -7,7 +7,7 @@ from typing import Annotated, Any
 import pytest
 from pydantic import BaseModel, Field
 
-from celspresso import CelTypeError, Env, function
+from celspresso import CelSubsetError, CelTypeError, Env, function
 
 Name = Annotated[str, Field(max_length=20)]
 
@@ -23,9 +23,11 @@ def test_outside_the_subset_is_a_compile_error_with_a_reason() -> None:
 
 
 def test_every_error_is_reported() -> None:
-    with pytest.raises(CelTypeError) as exc:
+    with pytest.raises(CelSubsetError) as exc:
         Env(s=Name).compile("s.split(s).size() + size(b'ab')")
-    assert "2 errors" in str(exc.value)
+    assert [d.code for d in exc.value.diagnostics] == ["subset", "subset"]
+    # the first line of the message is the first problem, not a count
+    assert str(exc.value).splitlines()[0] == exc.value.diagnostics[0].rendered.splitlines()[0]
     assert "literal, non-empty separator" in str(exc.value)
 
 
@@ -44,7 +46,7 @@ def test_formatting_logic_is_inside_the_subset(src: str) -> None:
 
 
 def test_derived_envs_keep_the_subset() -> None:
-    env = Env(s=Name).define("t", "s + '!'").extend(assumptions=["size(s) > 0"])
+    env = Env(s=Name).define("t", "s + '!'").assume("size(s) > 0")
     with pytest.raises(CelTypeError):
         env.compile("t.reverse()")
     with pytest.raises(CelTypeError, match="not part of celspresso's CEL subset"):
@@ -202,7 +204,7 @@ def test_structs_with_an_unused_double_field_stay_usable(src: str) -> None:
 def test_comparing_whole_structs_with_a_double_field_is_rejected_once() -> None:
     with pytest.raises(CelTypeError, match="compare the fields you need") as exc:
         Env(p=Reading, q=Reading).compile("p == q")
-    assert "1 error" in str(exc.value)
+    assert len(exc.value.diagnostics) == 1
 
 
 @pytest.mark.parametrize(
@@ -264,7 +266,7 @@ def test_comparisons_that_reach_dyn_values_are_rejected(src: str) -> None:
 def test_macros_report_each_bad_value_once(src: str, errors: int) -> None:
     with pytest.raises(CelTypeError) as exc:
         Env(ds=list[float], ns=list[int]).compile(src)
-    assert f"{errors} error" in str(exc.value)
+    assert len(exc.value.diagnostics) == errors
 
 
 def test_macros_over_dyn_lists_still_catch_the_element() -> None:

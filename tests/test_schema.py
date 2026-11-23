@@ -158,7 +158,7 @@ def test_declared_structs_check_evaluate_and_verify() -> None:
     env = Env(structs=[ITEM, ORDER], order=T.struct("shop.Order"))
     assert env.variables == {"order": "shop.Order"}
     # constraints are facts for the prover...
-    assert env.predicate("order.total < 0 || order.status == 'gold'").satisfiable().unsat
+    assert env.predicate("order.total < 0 || order.status == 'gold'").satisfiable().refuted
     assert env.predicate("size(order.items) <= 3").always_true().proved
     v = env.predicate("order.items.all(i, i.qty <= 5)").always_true()
     assert v.refuted
@@ -228,7 +228,7 @@ def test_declared_structs_and_classes_share_one_namespace() -> None:
     env = Env(structs=[Struct("Item", [Field("sku", T.string)])], declared=T.struct("Item"), cls=Item)
     assert env.variables["declared"] == "Item"
     assert env.variables["cls"] != "Item"
-    assert env.predicate("declared.sku == cls.name").satisfiable().sat
+    assert env.predicate("declared.sku == cls.name").satisfiable().proved
     # ...and a declared struct can't take a name a class holds
     with pytest.raises(ValueError, match="already used by"):
         Env(x=Item).extend(structs=[Struct("Item", [Field("name", T.string)])])

@@ -8,6 +8,7 @@ from ._env import Env, Explanation, Expr, Limits, Predicate, Problem, RuleCheck,
 from ._errors import (
     CelError,
     CelEvaluationError,
+    CelSubsetError,
     CelSyntaxError,
     CelTypeError,
     Diagnostic,
@@ -15,7 +16,8 @@ from ._errors import (
     VerificationTimeout,
 )
 from ._ruleset import RuleSet
-from ._verdict import Bounds, Extreme, Stats, Status, Verdict, Witness
+from ._spec import Spec
+from ._verdict import Bounds, Difference, Extreme, Stats, Status, Verdict, Witness
 
 try:
     __version__ = version("celspresso")
@@ -26,9 +28,11 @@ __all__ = [
     "Bounds",
     "CelError",
     "CelEvaluationError",
+    "CelSubsetError",
     "CelSyntaxError",
     "CelTypeError",
     "Diagnostic",
+    "Difference",
     "Env",
     "Explanation",
     "Expr",
@@ -38,6 +42,7 @@ __all__ = [
     "Problem",
     "RuleCheck",
     "RuleSet",
+    "Spec",
     "Stats",
     "Status",
     "Verdict",

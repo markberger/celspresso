@@ -550,7 +550,7 @@ fn in_subset(checked: &CheckedExpr, src: &str) -> PyResult<()> {
     if outside.is_empty() {
         Ok(())
     } else {
-        Err(compile_err("type", src, outside))
+        Err(compile_err("subset", src, outside))
     }
 }
 
