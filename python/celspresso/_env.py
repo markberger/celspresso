@@ -48,6 +48,11 @@ def _check_options(timeout: Any, unroll_limit: Any) -> None:
         raise _option_clash("unroll_limit", unroll_limit)
 
 
+def _is_type_like(v: Any) -> bool:
+    """Could `v` declare a variable's type (a class, a generic alias, Annotated, a Struct)?"""
+    return isinstance(v, (type, Struct, TypeRef, str)) or hasattr(v, "__origin__")
+
+
 def _option_list(name: str, value: Any) -> list[Any]:
     """A list-valued option (`structs=`, `adapters=`), which a variable of that name
     would collide with."""
@@ -192,6 +197,13 @@ class Env:
         **more_variables: Any,
     ) -> None:
         _check_options(timeout, unroll_limit)
+        for gone in ("schema_constraints", "debug_sample_proofs"):
+            if gone in more_variables and not _is_type_like(more_variables[gone]):
+                raise TypeError(
+                    f"{gone}={more_variables[gone]!r}: '{gone}' is no longer an Env option "
+                    f"(it was for testing the verifier). To declare a variable named '{gone}', "
+                    f"pass variables as a mapping: Env({{'{gone}': ...}})"
+                )
         self._sample = 0  # see _debug_options
         if limits is not None and not isinstance(limits, Limits):
             raise _option_clash("limits", limits)
@@ -232,7 +244,9 @@ class Env:
         >>> Env.from_model(Context).variables
         {'total': 'int', 'tier': 'string'}
 
-        Field names never collide with options, so this suits contexts with many variables."""
+        Field names never collide with options, so this suits contexts with many variables.
+        Variables are named by field name, not alias: bind data from `model_dump()`, not
+        `model_dump(by_alias=True)`."""
         return cls(
             _model_variables(model),
             timeout=timeout,
@@ -328,7 +342,7 @@ class Env:
         for f in functions:
             if not callable(f) or isinstance(f, type):
                 raise TypeError(f"functions=[...] expects plain callables, got {f!r}")
-        if isinstance(more_variables.get("assumptions"), (str, list, tuple, Predicate)):
+        if isinstance(more_variables.get("assumptions"), (str, list, tuple, set, frozenset, Predicate)):
             raise TypeError(
                 "extend() takes no assumptions (that would declare a variable): use env.assume(...)"
             )
@@ -518,7 +532,7 @@ class Env:
         for x in (a, b):
             if x is not None and x._env._fingerprint != self._fingerprint:
                 raise ValueError("expressions come from different environments")
-        asm_src, asm = self._assumption_progs(assuming)
+        asm_src, asm = self._assumption_progs(assuming, a, b)
         out = _core.verify(
             kind,
             a._prog,
@@ -556,11 +570,15 @@ class Env:
         return Verdict(Status.UNKNOWN, reason=out["reason"], **common)  # type: ignore[arg-type]
 
     def _assumption_progs(
-        self, assuming: Iterable[str | Predicate] | str | Predicate
+        self, assuming: Iterable[str | Predicate] | str | Predicate, *exprs: Expr[Any] | None
     ) -> tuple[list[str], list[Any]]:
+        """This env's assumptions, those of every Env the expressions were compiled in
+        (`env.assume(...)` keeps the schema, so they may differ), then `assuming`."""
         if isinstance(assuming, (str, Predicate)):
             assuming = [assuming]
-        asm_src = list(self._assumptions) + [x if isinstance(x, str) else x.source for x in assuming]
+        envs = [self, *(e._env for e in exprs if e is not None)]
+        given = [x if isinstance(x, str) else x.source for x in assuming]
+        asm_src = list(dict.fromkeys([*(a for env in envs for a in env._assumptions), *given]))
         return asm_src, [self.predicate(s)._prog for s in asm_src]
 
     def _bounds(
@@ -568,7 +586,7 @@ class Env:
     ) -> Bounds:
         if e._env._fingerprint != self._fingerprint:
             raise ValueError("expressions come from different environments")
-        asm_src, asm = self._assumption_progs(assuming)
+        asm_src, asm = self._assumption_progs(assuming, e)
         out = _core.bounds(
             e._prog,
             asm,
@@ -649,7 +667,8 @@ class Env:
         """
         if not isinstance(spec, Spec):
             spec = Spec(spec)
-        assuming = spec.assumptions
+        # this env's own assumptions apply even to a Predicate compiled in a sibling Env
+        assuming = (*self._assumptions, *spec.assumptions)
         src = rule if isinstance(rule, str) else rule.source
         try:
             pred = self.predicate(rule) if isinstance(rule, str) else rule
@@ -686,7 +705,7 @@ class Env:
             undecided("that the rule can fire", v)
         v = pred.never_errors(assuming=assuming, timeout=timeout)
         if v.refuted:
-            problems.append(Problem("can_error", f"evaluation {_failure(pred, v)}", None, v))
+            problems.append(Problem("may_error", f"evaluation {_failure(pred, v)}", None, v))
         elif v.unknown:
             undecided("that the rule never errors", v)
         for name, inv in spec.invariants.items():
@@ -713,7 +732,7 @@ ProblemKind = Literal[
     "suspicious",
     "wrong_example",
     "never_fires",
-    "can_error",
+    "may_error",
     "violates",
     "too_narrow",
     "unverified",

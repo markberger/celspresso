@@ -576,3 +576,39 @@ def test_diagnostic_codes() -> None:
     assert {d.code for d in sub.value.diagnostics} == {"subset"}
     assert str(sub.value).startswith("1:")  # the headline is the problem itself
     assert all(w.code == "lint" for w in env.predicate("x > 1 && x > 1").warnings)
+
+
+def test_assumptions_follow_every_env_involved() -> None:
+    env = Env(x=int)
+    positive = env.assume("x > 0")
+    base = env.predicate("100 / x > 0")
+    # the env check_rule is called on brings its assumptions, whatever env compiled the rule
+    assert positive.check_rule(base).ok
+    assert not env.check_rule(base).ok
+    # and an operand compiled under assumptions keeps them
+    assert env.predicate("x > 5").implies(positive.predicate("x > 0")).proved
+    assert positive.compile("100 / x").never_errors().proved
+
+
+def test_spec_is_a_read_only_value() -> None:
+    from celspresso import Spec
+
+    spec = Spec(["x < 10"], examples=[[{"x": 1}, True]])  # lists, as loaded from JSON
+    assert spec.examples == (({"x": 1}, True),)
+    with pytest.raises(TypeError):
+        spec.invariants["y"] = "x > 0"  # type: ignore[index]
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(spec)
+    assert spec == Spec(["x < 10"], examples=[({"x": 1}, True)])
+    with pytest.raises(TypeError, match="compiled Predicate"):
+        spec.check("x < 5")  # type: ignore[arg-type]
+
+
+def test_removed_env_options_say_so() -> None:
+    with pytest.raises(TypeError, match="no longer an Env option"):
+        Env(x=int, schema_constraints=False)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="no longer an Env option"):
+        Env(x=int, debug_sample_proofs=3)  # type: ignore[arg-type]
+    assert Env(schema_constraints=bool).variables == {"schema_constraints": "bool"}
+    with pytest.raises(TypeError, match=r"env\.assume"):
+        Env(x=int).extend(assumptions={"x > 0"})

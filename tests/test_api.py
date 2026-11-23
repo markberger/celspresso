@@ -453,5 +453,5 @@ def test_check_rule_names_the_runtime_failure() -> None:
     assert [p.kind for p in r.problems] == ["never_fires"]
     assert "evaluation fails (division by zero)" in str(r)
     r = env.check_rule("100 / n > 1")
-    assert [p.kind for p in r.problems] == ["can_error"]
+    assert [p.kind for p in r.problems] == ["may_error"]
     assert "evaluation fails (division by zero) when n = 0" in str(r)

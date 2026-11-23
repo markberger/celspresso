@@ -74,7 +74,7 @@ def test_invariants_may_be_unnamed_predicates() -> None:
 def test_dead_and_crashing_rules() -> None:
     assert kinds(env.check_rule("p.work_gap_months > 200")) == ["never_fires"]
     r = env.check_rule("100 / p.work_gap_months > 1")
-    assert kinds(r) == ["can_error"]
+    assert kinds(r) == ["may_error"]
     assert "p.work_gap_months = 0" in str(r)
 
 

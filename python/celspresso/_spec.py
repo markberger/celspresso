@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import typing
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from ._env import Predicate, RuleCheck
@@ -35,6 +36,8 @@ class Spec:
     ["order.status == 'lost' && order.total_cents <= 10000"]
     """
 
+    __hash__: ClassVar[None] = None  # type: ignore[assignment]  # examples hold dicts
+
     invariants: Mapping[str, str | Predicate] = field(default_factory=dict)
     require: Mapping[str, str | Predicate] = field(default_factory=dict)
     examples: tuple[tuple[Mapping[str, Any], bool], ...] = ()
@@ -50,11 +53,14 @@ class Spec:
     ) -> None:
         object.__setattr__(self, "invariants", _named("invariants", invariants))
         object.__setattr__(self, "require", _named("require", require))
-        ex = tuple(examples)
-        for i, item in enumerate(ex):
-            if not (isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bool)):
-                raise TypeError(f"examples[{i}] must be an (input, expected bool) pair, got {item!r}")
-        object.__setattr__(self, "examples", ex)
+        ex = []
+        for i, item in enumerate(examples):
+            # any 2-item sequence, so examples loaded from JSON (lists) work too
+            ok = isinstance(item, Sequence) and not isinstance(item, str) and len(item) == 2
+            if not (ok and isinstance(item[0], Mapping) and isinstance(item[1], bool)):
+                raise TypeError(f"examples[{i}] must be an (input mapping, expected bool) pair, got {item!r}")
+            ex.append((item[0], item[1]))
+        object.__setattr__(self, "examples", tuple(ex))
         if isinstance(assumptions, str) or not isinstance(assumptions, Iterable):
             assumptions = (assumptions,)
         asm = tuple(assumptions)
@@ -64,6 +70,13 @@ class Spec:
 
     def check(self, rule: Predicate, *, timeout: float | None = None) -> RuleCheck:
         """`rule.env.check_rule(rule, self)`: vet a compiled rule against this spec."""
+        from ._env import Predicate
+
+        if not isinstance(rule, Predicate):
+            raise TypeError(
+                f"Spec.check needs a compiled Predicate (env.predicate(...)), got {rule!r}; "
+                "or call env.check_rule(source, spec)"
+            )
         return rule.env.check_rule(rule, self, timeout=timeout)
 
     def assuming(self, *conditions: str | Predicate) -> Spec:
@@ -83,7 +96,7 @@ def _check_condition(where: str, c: Any) -> None:
         raise TypeError(f"Spec {where}: expected a CEL condition (str or Predicate), got {c!r}")
 
 
-def _named(where: str, items: Conditions) -> dict[str, str | Predicate]:
+def _named(where: str, items: Conditions) -> Mapping[str, str | Predicate]:
     """Name each condition: by its key, or by its source."""
     if isinstance(items, (str, bytes)):
         raise TypeError(f"Spec {where}: pass a list or a mapping of conditions, not a single string")
@@ -93,4 +106,4 @@ def _named(where: str, items: Conditions) -> dict[str, str | Predicate]:
         out = {i if isinstance(i, str) else getattr(i, "source", repr(i)): i for i in items}
     for c in out.values():
         _check_condition(where, c)
-    return out
+    return MappingProxyType(out)  # read-only: a Spec is a value

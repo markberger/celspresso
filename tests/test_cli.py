@@ -118,13 +118,13 @@ def test_check_formats(project: tuple[Path, str], capsys: pytest.CaptureFixture[
 
     _, out, _ = run(capsys, "check", f, "--format", "markdown")
     assert "**2 of 3 rules rejected.**" in out
-    assert "- **can_error**: evaluation fails (division by zero)" in out
+    assert "- **may_error**: evaluation fails (division by zero)" in out
 
     _, out, _ = run(capsys, "check", f, "--format", "sarif")
     sarif = json.loads(out)
     assert sarif["version"] == "2.1.0"
     results = sarif["runs"][0]["results"]
-    assert {r["ruleId"] for r in results} == {"violates", "can_error", "too_narrow"}
+    assert {r["ruleId"] for r in results} == {"violates", "may_error", "too_narrow"}
     lost = next(r for r in results if r["ruleId"] == "violates")
     assert lost["level"] == "error"
     assert lost["locations"][0]["physicalLocation"]["region"]["startLine"] == 7

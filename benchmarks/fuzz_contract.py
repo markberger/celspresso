@@ -1,6 +1,6 @@
 """Contract fuzzer: random in-subset expressions must be decided, quickly and correctly.
 
-The contract: if an expression compiles, the verifier answers PROVED/REFUTED (SAT/UNSAT)
+The contract: if an expression compiles, the verifier answers PROVED/REFUTED
 quickly. This generates type-directed expressions from the subset over a bounded schema,
 asks every question about them, and reports
 
