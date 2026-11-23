@@ -97,10 +97,31 @@ def test_a_split_of_each_piece_is_proved_for_bounded_strings() -> None:
     assert v.proved, v
 
 
-def test_host_functions_cannot_shadow_builtins_in_another_call_style() -> None:
+def test_host_overloads_on_builtin_names_run_only_for_their_own_calls() -> None:
     @function(name="upperAscii", tabulate=False)
-    def ua(x: str) -> str:
+    def shout(x: str) -> str:
         return x + "!"
 
-    with pytest.raises(Exception, match="clashes"):
-        Env(s=str).extend(functions=[ua])
+    @function(name="size", tabulate=False)
+    def size_of_int(n: int) -> int:
+        return n
+
+    env = Env(s=str, n=int).extend(functions=[shout, size_of_int])
+    for src in ["size(s.upperAscii()) == size(s)", "[1, 2].size() == 2", "size(s) >= 0"]:
+        p = env.predicate(src)
+        assert p.always_true().proved
+        assert p.evaluate({"s": "ab", "n": 0})
+    # the host overloads themselves still run, and are opaque to the verifier
+    assert env.expr("upperAscii(s)", str).evaluate({"s": "a", "n": 0}) == "a!"
+    assert env.expr("size(n)", int).evaluate({"s": "", "n": 4}) == 4
+    assert env.predicate("upperAscii(s) == s.upperAscii()").always_true().refuted
+
+
+def test_assumptions_about_split_pieces_cannot_hide_an_overflow() -> None:
+    # true of every t, but false of the encoding's truncated last piece
+    env = Env(t=str)
+    v = env.predicate("t != 'a,b,c,d,e,f'").always_true(assuming="t.split(',').all(p, !p.contains(','))")
+    assert not v.proved
+    b = env.expr("t.split(',').map(p, p.contains(',') ? 1 / 0 : 1).size()", int).bounds()
+    assert b.bounded
+    assert not (b.max and b.max.sound)

@@ -117,14 +117,7 @@ impl Schema {
     pub fn add_function(&mut self, f: FunctionDecl) -> Result<(), String> {
         if let Some(existing) = self.functions.get(&f.name) {
             for new in &f.overloads {
-                // The evaluator dispatches host functions by name and runtime values, before
-                // builtins and whatever the call style, so any overlap (a global `upperAscii(s)`
-                // next to `s.upperAscii()`) would run one implementation and verify the other.
-                if let Some(old) = existing
-                    .overloads
-                    .iter()
-                    .find(|o| o.params.len() == new.params.len() && o.params.iter().zip(&new.params).all(|(a, b)| overlaps(a, b)))
-                {
+                if let Some(old) = existing.overloads.iter().find(|o| o.receiver == new.receiver && o.params == new.params) {
                     let params = new.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
                     return Err(format!(
                         "function '{}({params})' clashes with existing overload '{}'; choose another name",
@@ -140,18 +133,6 @@ impl Schema {
             }
         }
         Ok(())
-    }
-}
-
-/// Whether some value has both types (conservatively: `dyn` and type parameters overlap all).
-fn overlaps(a: &CelType, b: &CelType) -> bool {
-    use CelType::*;
-    match (a, b) {
-        (Dyn | Param(_) | Error, _) | (_, Dyn | Param(_) | Error) => true,
-        (Nullable(x), y) | (y, Nullable(x)) => matches!(y, Null) || overlaps(x, y),
-        (List(x), List(y)) | (Optional(x), Optional(y)) | (Type(x), Type(y)) => overlaps(x, y),
-        (Map(k1, v1), Map(k2, v2)) => overlaps(k1, k2) && overlaps(v1, v2),
-        _ => a == b,
     }
 }
 

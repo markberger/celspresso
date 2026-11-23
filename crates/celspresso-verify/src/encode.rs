@@ -712,7 +712,9 @@ impl Encoder {
         }
         let err_in = or(&vals.iter().map(|v| &v.err).collect::<Vec<_>>());
         let syms: Vec<Sym> = vals.into_iter().map(|v| v.v).collect();
-        match self.builtin(c, e, function, &syms) {
+        let host = c.may_call_host(e.id, function) && c.overload(e.id).is_some_and(|o| !celspresso_check::is_builtin(function, o));
+        let modeled = if host { None } else { self.builtin(c, e, function, &syms) };
+        match modeled {
             Some(Ok((v, err))) => SV { v, err: or(&[&err_in, &err]) },
             Some(Err(why)) => {
                 let why = self.unmodeled(function, &syms).unwrap_or(why);

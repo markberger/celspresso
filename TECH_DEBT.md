@@ -127,6 +127,9 @@ Remaining limits of those:
   any number of pieces (`size(t.split(',')) >= 1`).
 - `split` always uses `unroll_limit` slots, even when `max_length` bounds the string;
   sizing the slots from the bound (as list inputs do) would avoid raising the limit by hand.
+- Overflow conditions are not guarded by whether a split is reached (an inactive
+  comprehension step, a filtered-out piece), and assumptions that read a split are left
+  out of the overflow check. Both only turn provable results into UNKNOWN.
 - Proofs and UNSATs about `int(t)` on an unbounded `t` often run to the timeout (Z3's
   `str.to_int` is weak); asserting `t ∈ [0-9]+` on success may help, unmeasured.
 - A review fuzz run saw one nested-split query run far past its timeout; not reproduced.

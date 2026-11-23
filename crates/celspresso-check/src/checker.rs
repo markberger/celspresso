@@ -56,6 +56,15 @@ impl CheckedExpr {
             _ => None,
         }
     }
+    /// Whether call `id` may resolve to a host function rather than a builtin. Host
+    /// functions run only for these calls, so a host overload sharing a builtin's name
+    /// (`size(MyType)`) never takes over the builtin's calls.
+    pub fn may_call_host(&self, id: ExprId, function: &str) -> bool {
+        match self.refs.get(&id) {
+            Some(Reference::Function(ids)) => ids.iter().any(|o| !crate::is_builtin(function, o)),
+            _ => true,
+        }
+    }
     /// Environment variables referenced (sorted, deduplicated), with field paths.
     pub fn references(&self) -> Vec<String> {
         let mut out = std::collections::BTreeSet::new();

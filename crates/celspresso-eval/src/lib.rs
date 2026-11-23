@@ -320,8 +320,10 @@ impl<'a> Evaluator<'a> {
         for a in args {
             vals.push(self.eval(a)?);
         }
-        if let Some(r) = self.funcs.call(function, &vals) {
-            return r.map_err(|m| err(e, m));
+        if self.checked.may_call_host(e.id, function) {
+            if let Some(r) = self.funcs.call(function, &vals) {
+                return r.map_err(|m| err(e, m));
+            }
         }
         self.builtin(e, function, &vals)
     }

@@ -106,17 +106,36 @@ fn goal(enc: &mut Encoder, q: &Query) -> Result<Bool, String> {
 }
 
 /// Whether the assumptions allow a value the encoding cut off at the unroll bound.
-/// Whether the assumptions (already asserted in `s`) allow a split with more pieces than
-/// its slots. Anything but a proof that they don't counts as yes.
-fn overflows(enc: &Encoder, s: &Solver) -> bool {
+/// Encode the user assumptions. Returns them all, plus the ones that don't read a split:
+/// in a model where a split overflows, its last piece is the unsplit remainder, so facts
+/// about its pieces are false there and must not be used to rule the overflow out.
+fn encode_user(enc: &mut Encoder, assumptions: &[&CheckedExpr]) -> (Vec<Bool>, Vec<Bool>) {
+    let (mut all, mut real) = (Vec::new(), Vec::new());
+    for a in assumptions {
+        let before = enc.overflow.len();
+        let b = holds(&enc.encode(a));
+        if enc.overflow.len() == before {
+            real.push(b.clone());
+        }
+        all.push(b);
+    }
+    (all, real)
+}
+
+/// Whether some real input may make a split produce more pieces than its slots, judged by
+/// the encoding facts (true of any value, truncated pieces included) and `real`, the user
+/// assumptions that don't read a split. Anything but a proof that none can counts as yes.
+fn overflows(enc: &Encoder, real: &[Bool], params: &Params) -> bool {
     if enc.overflow.is_empty() {
         return false;
     }
-    s.push();
+    let s = Solver::new();
+    let _ = s.set_params(params);
+    for a in enc.assumptions.iter().chain(real) {
+        s.assert(a);
+    }
     s.assert(or(&enc.overflow.iter().collect::<Vec<_>>()));
-    let r = s.check();
-    let _ = s.pop(1);
-    r != SatResult::Unsat
+    s.check() != SatResult::Unsat
 }
 
 fn unknown_reason(r: Option<String>) -> String {
@@ -138,7 +157,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
         Ok(g) => g,
         Err(why) => return (Status::Unknown(why), false, vec![]),
     };
-    let user: Vec<Bool> = assumptions.iter().map(|a| holds(&enc.encode(a))).collect();
+    let (user, real) = encode_user(&mut enc, assumptions);
     let approximations: Vec<String> = enc.approximations.iter().cloned().collect();
     // whether the encoding was cut off at the unroll limit; reported only if the result relied on it
     let truncated = enc.bounded;
@@ -177,7 +196,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
             }
             match s2.check() {
                 SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
-                _ if truncated || overflows(&enc, &s2) => {
+                _ if truncated || overflows(&enc, &real, &params) => {
                     bounded = true;
                     Status::Unknown(format!(
                         "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
@@ -435,7 +454,7 @@ pub fn bounds(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, func
 fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> BoundsOutcome {
     let mut enc = Encoder::new(e.schema.clone(), opts.unroll_limit, opts.schema_constraints);
     let sv = enc.encode(e);
-    let user: Vec<Bool> = assumptions.iter().map(|a| holds(&enc.encode(a))).collect();
+    let (user, real) = encode_user(&mut enc, assumptions);
     let mut out = BoundsOutcome {
         min: None,
         max: None,
@@ -457,14 +476,8 @@ fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, fu
     let mut reasons = Vec::new();
     let readable = ReadablePass::new(&enc.soft);
     // a split with more pieces than slots makes every bound below a guess
-    let truncated = enc.bounded || {
-        let s = Solver::new();
-        let _ = s.set_params(&params);
-        for b in &base {
-            s.assert(b);
-        }
-        overflows(&enc, &s)
-    };
+    // (not under "no error": an error term may read a truncated piece, like the claim)
+    let truncated = enc.bounded || overflows(&enc, &real, &params);
     out.bounded = truncated;
     for maximize in [false, true] {
         let opt = Optimize::new();
