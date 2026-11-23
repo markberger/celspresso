@@ -5,8 +5,8 @@
 //! opaque or tabulated, which the user chose). The tiers come from probing every builtin:
 //! see `benchmarks/bench_strings.py` and TECH_DEBT.md ("Strict profile").
 
-use celspresso_check::{display_fn, is_builtin, CheckedExpr, Reference};
-use celspresso_syntax::ast::{Expr, ExprKind, Literal};
+use celspresso_check::{display_fn, is_builtin, CelType, CheckedExpr, Reference};
+use celspresso_syntax::ast::{ops, Expr, ExprKind, Literal};
 use celspresso_syntax::Span;
 
 /// Overload ids inside the profile, unconditionally.
@@ -22,6 +22,7 @@ const ALLOWED: &[&str] = &[
     "map_insert_entry",
     "map_insert_map",
     "to_dyn",
+    "select_optional_field",
     // int / uint / double arithmetic (CEL truncation; overflow and /0 are errors)
     "add_int64",
     "add_uint64",
@@ -152,8 +153,24 @@ const LITERAL_ARG: &[(&str, usize, &str)] = &[
 
 fn is_comparison(id: &str) -> bool {
     let rest = ["less_equals_", "greater_equals_", "less_", "greater_"].iter().find_map(|p| id.strip_prefix(p));
-    rest.is_some_and(|t| t != "bytes")
+    rest.is_some_and(|t| COMPARED.contains(&t))
 }
+
+/// A builtin overload, as opposed to a host function. Users can't declare operator or
+/// internal names, so overloads the checker synthesizes for those count as builtins too.
+fn builtin(function: &str, id: &str) -> bool {
+    is_builtin(function, id) || function.starts_with('_') || function.starts_with('@')
+}
+
+/// Modeled internal calls the checker records without an overload id.
+const ID_LESS: &[&str] = &[ops::OPT_ENTRY, ops::OPT_INDEX, ops::OPT_SELECT];
+
+/// `<`, `<=`, `>`, `>=` on these operand types (`less_int64`, `greater_equals_uint64_double`, ...).
+#[rustfmt::skip]
+const COMPARED: &[&str] = &[
+    "int64", "uint64", "double", "string", "bool", "date", "timestamp", "duration", "int64_uint64", "int64_double",
+    "uint64_int64", "uint64_double", "double_int64", "double_uint64",
+];
 
 /// Why a builtin outside the profile is left out, for the error message.
 fn why(id: &str) -> &'static str {
@@ -172,6 +189,59 @@ fn why(id: &str) -> &'static str {
     }
 }
 
+/// Most ranges a character class may have: Unicode classes (`\d`, `\w`, `\p{L}`) have
+/// dozens to hundreds and make Z3 crawl (`^\d{5}$` alone takes seconds).
+const MAX_CLASS_RANGES: usize = 16;
+
+/// Whether the verifier translates a `matches` pattern exactly and solves it quickly; mirrors
+/// `zutil::translate_search`, which accepts only top-level `^` and `$` anchors.
+pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
+    use regex_syntax::hir::{Class, Hir, HirKind, Look};
+    let hir = regex_syntax::ParserBuilder::new().build().parse(pattern).map_err(|e| format!("invalid pattern: {e}"))?;
+    fn walk(h: &Hir) -> Result<(), String> {
+        match h.kind() {
+            HirKind::Class(c) => {
+                let n = match c {
+                    Class::Unicode(u) => u.ranges().len(),
+                    Class::Bytes(b) => b.ranges().len(),
+                };
+                if n > MAX_CLASS_RANGES {
+                    return Err("a large Unicode class (\\d, \\w, \\p{..}) is slow to \
+                                solve; spell out ASCII ranges such as [0-9] or [A-Za-z0-9_]"
+                        .into());
+                }
+                Ok(())
+            }
+            HirKind::Look(_) => Err("anchors and word boundaries are allowed only at the start and end".into()),
+            HirKind::Repetition(r) if r.max.unwrap_or(r.min) > 1000 => Err("a repetition bound above 1000".into()),
+            HirKind::Repetition(r) => walk(&r.sub),
+            HirKind::Capture(c) => walk(&c.sub),
+            HirKind::Concat(xs) | HirKind::Alternation(xs) => xs.iter().try_for_each(walk),
+            HirKind::Empty | HirKind::Literal(_) => Ok(()),
+        }
+    }
+    let mut parts: Vec<Hir> = match hir.kind() {
+        HirKind::Concat(xs) => xs.clone(),
+        _ => vec![hir.clone()],
+    };
+    if matches!(parts.first().map(|h| h.kind()), Some(HirKind::Look(Look::Start))) {
+        parts.remove(0);
+    }
+    if matches!(parts.last().map(|h| h.kind()), Some(HirKind::Look(Look::End))) {
+        parts.pop();
+    }
+    parts.iter().try_for_each(walk)
+}
+
+fn has_bytes(t: &CelType) -> bool {
+    match t {
+        CelType::Bytes => true,
+        CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) | CelType::Type(a) => has_bytes(a),
+        CelType::Map(k, v) => has_bytes(k) || has_bytes(v),
+        _ => false,
+    }
+}
+
 fn literal(e: &Expr) -> Option<&Literal> {
     match &e.kind {
         ExprKind::Literal(l) => Some(l),
@@ -183,8 +253,9 @@ fn literal(e: &Expr) -> Option<&Literal> {
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
     let mut out = Vec::new();
     c.expr.walk(&mut |e: &Expr| match &e.kind {
-        ExprKind::Literal(Literal::Bytes(_)) => {
-            out.push(("bytes literals are outside the strict profile: bytes are not modeled".to_string(), e.span));
+        // values enter through literals, variables and fields; flagging those covers every use
+        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Select { .. } if has_bytes(c.type_of(e.id)) => {
+            out.push(("bytes values are outside the strict profile: bytes are not modeled".to_string(), e.span));
         }
         ExprKind::Call { target, function, args } => {
             let ids = match c.refs.get(&e.id) {
@@ -192,13 +263,13 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
                 _ => Vec::new(),
             };
             if ids.is_empty() {
-                if is_builtin(function, "") {
+                if builtin(function, "") && !ID_LESS.contains(&function.as_str()) {
                     out.push((outside(function, "the verifier can't decide it quickly and exactly"), e.span));
                 }
                 return;
             }
             let all: Vec<&Expr> = target.iter().map(|t| &**t).chain(args).collect();
-            for id in ids.iter().filter(|id| is_builtin(function, id)) {
+            for id in ids.iter().filter(|id| builtin(function, id)) {
                 if ALLOWED.contains(&id.as_str()) || is_comparison(id) {
                     continue;
                 }
@@ -209,6 +280,10 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
                     });
                     if !ok {
                         out.push((format!("'{}' needs {need} in the strict profile", display_fn(function)), e.span));
+                    } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
+                        if let Err(why) = pattern_in_profile(p) {
+                            out.push((format!("this pattern is outside the strict profile: {why}"), e.span));
+                        }
                     }
                     continue;
                 }
@@ -254,7 +329,12 @@ mod tests {
     fn every_listed_overload_exists() {
         let s = Schema::with_stdlib();
         let ids: Vec<&str> = s.functions.values().flat_map(|f| f.overloads.iter().map(|o| o.id.as_str())).collect();
-        let special = ["math_greatest", "math_least"];
+        let special = ["math_greatest", "math_least", "select_optional_field"];
+        for t in COMPARED {
+            for p in ["less_", "less_equals_", "greater_", "greater_equals_"] {
+                assert!(ids.contains(&format!("{p}{t}").as_str()), "unknown comparison {p}{t}");
+            }
+        }
         for id in ALLOWED.iter().chain(LITERAL_ARG.iter().map(|(o, ..)| o)) {
             assert!(ids.contains(id) || special.contains(id), "unknown overload id {id}");
         }
@@ -266,6 +346,7 @@ mod tests {
             "s.startsWith('A') && size(s) <= 30 ? s.upperAscii() : s.substring(0, 3)",
             "(n < 10 ? '0' : '') + string(n) + '.' + string(n % 100)",
             "[s, 'x'].join(' ') == s + ' x' && int('12') == 12 && s.matches('^[0-9]+$')",
+            r"s.matches(r'(?i)^[a-z]{2}\s*[0-9]{5}(-[0-9]{4})?$') && s.matches('.*') && s.matches('^(x+)?$')",
             "s.split(',').size() > 1 && xs.all(x, x > 0) && xs.sum() < math.greatest(n, 3)",
             "at.getFullYear() == 2024 && at < timestamp('2025-01-01T00:00:00Z') && day.year() > 1900",
             "d * 2.0 < 10.0 && n < 3u + 1u ? true : 1 < 2.5",
@@ -287,6 +368,11 @@ mod tests {
             ("s.split(s).size() == 1", "literal, non-empty separator"),
             ("s.split('').size() == 1", "literal, non-empty separator"),
             ("s.matches(s)", "literal pattern"),
+            ("s.matches(r'^\\d{5}$')", "[0-9]"),
+            ("s.matches('a(?=b)')", "invalid pattern"),
+            ("s.matches('[')", "invalid pattern"),
+            ("s.matches('a\\\\bb')", "start and end"),
+            ("s.matches('a{2000}')", "repetition"),
             ("timestamp(s) < at", "literal timestamp"),
         ] {
             let errs = outside(src);

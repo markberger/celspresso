@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import Annotated
 
 import pytest
-from pydantic import Field
+from pydantic import BaseModel, Field
 
-from celspresso import CelTypeError, Env
+from celspresso import CelTypeError, Env, function
 
 Name = Annotated[str, Field(max_length=20)]
 
@@ -70,3 +70,72 @@ def test_strict_is_an_option_not_a_variable() -> None:
     with pytest.raises(TypeError, match="'strict' is an Env option"):
         Env(strict=int)  # type: ignore[arg-type]
     assert Env({"strict": int}).variables == {"strict": "int"}
+
+
+class Blob(BaseModel):
+    data: bytes
+
+
+@pytest.mark.parametrize("src", ["b == c", "b in [c]", "[b] == [c]", "p.data == b", "size([b]) == 1"])
+def test_bytes_values_are_outside_the_profile(src: str) -> None:
+    with pytest.raises(CelTypeError, match="bytes values are outside the strict profile"):
+        Env(b=bytes, c=bytes, p=Blob).compile(src)
+
+
+def test_contracts_and_parameterized_definitions_are_checked() -> None:
+    @function(ensures="result == s.reverse()")
+    def g(s: str) -> str:
+        return s[::-1]
+
+    with pytest.raises(CelTypeError, match="outside the strict profile"):
+        Env(s=Name).extend(functions=[g])
+    with pytest.raises(CelTypeError, match="outside the strict profile"):
+        Env(s=Name).define("f", "v.reverse()", params={"v": str})
+    loose = Env(s=Name, strict=False).extend(functions=[g]).define("f", "v.reverse()", params={"v": str})
+    assert loose.compile("f(s) + g(s)").evaluate({"s": "ab"}) == "baba"
+
+
+def test_a_strict_env_refuses_expressions_from_a_loose_one() -> None:
+    loose = Env(s=Name, strict=False).predicate("s.reverse() == s")
+    with pytest.raises(ValueError, match="different environments"):
+        Env(s=Name).predicate("s == s").equivalent(loose)
+
+
+def test_host_functions_stay_allowed_even_on_builtin_names() -> None:
+    @function(name="contains")
+    def contains_n(s: str, n: int) -> bool:
+        return str(n) in s
+
+    @function
+    def reverse(s: str) -> str:
+        return s[::-1]
+
+    env = Env(s=Name, n=int).extend(functions=[contains_n, reverse])
+    assert env.predicate("contains(s, n) && reverse(s) == s").evaluate({"s": "1", "n": 1}) is True
+    with pytest.raises(CelTypeError, match="outside the strict profile"):
+        env.compile("s.reverse()")  # the builtin receiver form is still the builtin
+
+
+class Person(BaseModel):
+    nick: str | None = None
+
+
+def test_optionals_and_presence_are_inside_the_profile() -> None:
+    env = Env(p=Person, m=dict[str, int], xs=list[int])
+    env.compile("p.?nick.orValue('') + string(m[?'k'].orValue(0)) + string(xs[?0].orValue(1))")
+    env.compile("has(p.nick) && 'k' in m")
+    env.compile("[?m[?'a'], 3] == [3] && {?'k': m[?'a']} == {}")
+
+
+@pytest.mark.parametrize(
+    ("src", "hint"),
+    [
+        (r"s.matches(r'^\d{5}$')", "[0-9]"),
+        ("s.matches('a(?=b)')", "invalid pattern"),
+        ("s.matches('[')", "invalid"),
+    ],
+)
+def test_patterns_must_be_ones_the_verifier_solves_quickly(src: str, hint: str) -> None:
+    with pytest.raises(CelTypeError, match="pattern") as exc:
+        Env(s=Name).compile(src)
+    assert hint in str(exc.value)

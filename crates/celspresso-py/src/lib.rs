@@ -544,6 +544,16 @@ fn compile_err(kind: &str, src: &str, diags: Vec<(String, Span)>) -> PyErr {
     CompileError::new_err((kind.to_string(), items, src.to_string()))
 }
 
+/// With `strict`, reject uses of CEL outside the verifier's strict profile.
+fn in_profile(checked: &CheckedExpr, src: &str, strict: bool) -> PyResult<()> {
+    let outside = if strict { celspresso_verify::strict::violations(checked) } else { Vec::new() };
+    if outside.is_empty() {
+        Ok(())
+    } else {
+        Err(compile_err("type", src, outside))
+    }
+}
+
 fn compile_source(schema: &Arc<Schema>, defs: &BTreeMap<String, Definition>, src: &str) -> PyResult<CheckedExpr> {
     let parsed = parse(src).map_err(|e| compile_err("syntax", src, vec![(e.message, e.span)]))?;
     let expanded = if defs.is_empty() { parsed } else { expand_definitions(parsed, defs) };
@@ -580,13 +590,14 @@ impl Core {
     /// readers: {struct: [fields with a custom reader]}, checked here; the callables
     /// themselves are passed to each evaluate call
     #[new]
-    #[pyo3(signature = (structs, vars, functions, defs, readers=None))]
+    #[pyo3(signature = (structs, vars, functions, defs, readers=None, strict=false))]
     fn new(
         structs: Vec<(String, Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>)>,
         vars: Vec<(String, Bound<'_, PyAny>, Option<Bound<'_, PyAny>>)>,
         functions: Vec<(String, String, bool, Vec<Bound<'_, PyAny>>, Bound<'_, PyAny>, Option<ContractSpec<'_>>)>,
         defs: Vec<(String, String, Option<Vec<(String, Bound<'_, PyAny>)>>)>,
         readers: Option<HashMap<String, Vec<String>>>,
+        strict: bool,
     ) -> PyResult<Self> {
         let mut s = Schema::with_stdlib();
         for (name, fields) in structs {
@@ -645,6 +656,7 @@ impl Core {
                 cs.vars.insert(n.clone(), VarDecl { name: n.clone(), ty: t, constraints: Constraints::default() });
             }
             let ensures = compile_source(&Arc::new(cs), &BTreeMap::new(), &src)?;
+            in_profile(&ensures, &src, strict)?;
             if *ensures.output_type() != CelType::Bool {
                 return Err(PyValueError::new_err(format!("ensures for '{id}' must be a bool expression, not {}", ensures.output_type())));
             }
@@ -660,6 +672,7 @@ impl Core {
             match params {
                 None => {
                     let checked = compile_source(&Arc::new(s.clone()), &defmap, &src)?;
+                    in_profile(&checked, &src, strict)?;
                     defmap.insert(name, Definition::constant(checked.expr));
                 }
                 Some(params) => {
@@ -673,6 +686,7 @@ impl Core {
                         types.push(ty);
                     }
                     let checked = compile_source(&Arc::new(ds), &defmap, &src)?;
+                    in_profile(&checked, &src, strict)?;
                     let result = checked.output_type().clone();
                     s.add_function(FunctionDecl {
                         name: name.clone(),
@@ -701,12 +715,7 @@ impl Core {
     #[pyo3(signature = (source, strict=false))]
     fn compile(&self, source: &str, strict: bool) -> PyResult<Program> {
         let checked = compile_source(&self.schema, &self.defs, source)?;
-        if strict {
-            let outside = celspresso_verify::strict::violations(&checked);
-            if !outside.is_empty() {
-                return Err(compile_err("type", source, outside));
-            }
-        }
+        in_profile(&checked, source, strict)?;
         Ok(Program { checked: Arc::new(checked), source: source.to_string() })
     }
 

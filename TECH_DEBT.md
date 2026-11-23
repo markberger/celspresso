@@ -125,8 +125,22 @@ limit. Also:
   `int(double)` and `string(double)` are not.
 - `ageOn` is allowed although satisfiability can take seconds; `string(int)` relating two
   differently computed numbers can reach the timeout (see the cents benchmark case).
+- A call with a `dyn` argument is rejected when any candidate overload is outside the
+  profile (`dyn(n) + dyn(n)` lists `add_bytes`), with a bytes message the user never asked
+  for. Conservative, but confusing.
+- `matches` patterns are limited to 16 ranges per character class, so Unicode `\d`, `\w`
+  and `\p{..}` are rejected (`^\d{5}$` took 4.5 s to come back UNKNOWN; `\p{L}+` ran far
+  past the 5 s timeout, so the solver timeout isn't always honored either).
 - *Fix:* model the builtins above, measure with `benchmarks/bench_strings.py`, add their
   ids to `ALLOWED` or `LITERAL_ARG`.
+
+### `\d`, `\w`, `\s` and `\b` are Unicode-aware, unlike RE2
+CEL regexes are RE2, where the Perl classes are ASCII-only. The evaluator (`regex` crate)
+and the verifier (`regex-syntax`) both use Unicode classes, so they agree with each other
+but not with cel-go on non-ASCII input (`'٣'.matches('\\d')` is true here, false in cel-go).
+Fixing it would also make `\d` fast to verify (one range).
+- *Fix:* rewrite Perl classes to their ASCII forms in the regex AST before both the
+  evaluator and the verifier see them; add conformance-style tests.
 
 ### Some string functions are still not modeled
 `trim`, `replace`, `format`, `substring`-free `charAt` loops, `split` with a limit or an

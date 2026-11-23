@@ -974,7 +974,9 @@ impl Encoder {
                 let zero = b.eq(ZInt::from_i64(0));
                 let is_uint = matches!(v[0], Uint(_));
                 let res = if function == ops::DIVIDE { q } else { r };
-                let over = if is_uint { uint_range(&res).not() } else { int_range(&res, I64_MIN, I64_MAX).not() };
+                // CEL (cel-go) errors on MIN / -1 and MIN % -1 alike, though the remainder fits
+                let min_by_neg1 = a.eq(ZInt::from_i64(I64_MIN)) & b.eq(ZInt::from_i64(-1));
+                let over = if is_uint { uint_range(&res).not() } else { int_range(&res, I64_MIN, I64_MAX).not() | min_by_neg1 };
                 let s = if is_uint { Uint(res) } else { Int(res) };
                 Some(Ok((s, or(&[&zero, &over]))))
             }

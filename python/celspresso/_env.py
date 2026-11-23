@@ -262,7 +262,7 @@ class Env:
         try:
             defs = [(n, src, None if ps is None else list(ps)) for n, src, ps in self._defs]
             readers = {n: list(fs) for n, fs in self._builder.readers.items()}
-            self._core = _core.Core(structs, variables, fns, defs, readers)
+            self._core = _core.Core(structs, variables, fns, defs, readers, self._strict)
         except _core.CompileError as exc:
             # a definition (or a function's ensures contract) failed to compile
             _raise_compile(exc)
@@ -286,6 +286,8 @@ class Env:
             ),
             tuple(sorted((n, f.ensures or "", f.total, f.table is not None) for n, f in self._fns.items())),
             tuple((n, src, repr(ps)) for n, src, ps in self._defs),
+            # a strict Env must not verify expressions compiled outside the profile
+            self._strict,
         )
 
     def extend(

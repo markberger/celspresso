@@ -161,6 +161,14 @@ fn integer_semantics() {
     proved("-7 / 2 == -3 && -7 % 2 == -1");
     let w = refuted("x / y == x / y");
     assert_eq!(w["y"], Value::Int(0));
+    // truncating division by negative and extreme constant divisors
+    proved("x / -3 == -(x / 3) && x % -3 == x % 3");
+    proved("(x / -7) * -7 + x % -7 == x");
+    proved("x / (-9223372036854775807 - 1) == (x == -9223372036854775807 - 1 ? 1 : 0)");
+    proved("y == 0 || (x / y) * y + x % y == x || x == -9223372036854775807 - 1");
+    // CEL errors on MIN % -1 as on MIN / -1, though the remainder would fit
+    let w = refuted("x % -1 == 0");
+    assert_eq!(w["x"], Value::Int(i64::MIN));
 }
 
 #[test]
@@ -208,6 +216,9 @@ fn strings_and_regex() {
     unsat("s.matches('^[0-9]+$') && s.contains('a')");
     sat("s.matches('^[a-c]{3}$') && s != 'abc'");
     proved("!s.matches('^x$') || s == 'x'");
+    // case mapping distributes over concatenation; non-ASCII letters are left alone
+    proved("(s + 'aB' + s).lowerAscii() == s.lowerAscii() + 'ab' + s.lowerAscii()");
+    refuted("(s + 'É').lowerAscii() == s.lowerAscii() + 'é'");
 }
 
 #[test]
