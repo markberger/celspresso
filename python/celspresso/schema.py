@@ -88,6 +88,11 @@ class TypeRef:
     def __reduce__(self) -> tuple[Any, ...]:
         return (TypeRef._unchecked, (self._spec,))
 
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # Python 3.10's typing accepts only callables in Annotated[t, ...]; being callable
+        # lets `Annotated[T.list(...), Constraints(max_length=8)]` work there too
+        raise TypeError(f"{self!r} describes a CEL type; it can't be called")
+
     @classmethod
     def _unchecked(cls, spec: TypeSpec) -> TypeRef:
         # for specs celspresso built itself (adapter struct names may be any string)
