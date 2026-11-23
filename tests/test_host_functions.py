@@ -208,3 +208,27 @@ def test_user_overload_on_a_builtin_name_gets_host_function_advice():
     assert reason is not None
     assert "ensures=" in reason
     assert "doesn't model" not in reason
+
+
+@function(ensures="result >= 0 && result < s.size()", total=True)
+def _first_pos(s: str) -> int:
+    return 0
+
+
+def test_contracts_bind_only_calls_that_happen() -> None:
+    # the contract can't hold for '', and no call below is ever made on ''
+    env = Env(s=str).extend(functions=[_first_pos])
+    assert env.predicate("s == '' && (s.size() > 0 ? _first_pos(s) == 0 : true)").satisfiable().sat
+    assert env.predicate("s == '' && !(s != '' && _first_pos(s) < 0)").satisfiable().sat
+    assert env.predicate("s != ''").always_true(assuming="s.size() == 0 ? true : _first_pos(s) >= 0").refuted
+    # where the call does happen, the contract is used
+    assert env.predicate("s.size() > 0 ? _first_pos(s) >= 0 : true").always_true().proved
+
+
+def test_contracts_inside_a_comprehension_skip_slots_that_dont_exist() -> None:
+    word = Annotated[str, Field(min_length=1, max_length=4)]
+    env = Env(ws=Annotated[list[word], Field(max_length=3)]).extend(functions=[_first_pos])
+    p = env.predicate("ws.all(w, _first_pos(w) >= 0) && ws.size() == 3")
+    v = p.always_true()
+    assert v.refuted
+    assert not p.evaluate(v.counterexample)

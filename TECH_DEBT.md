@@ -179,6 +179,11 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   `unroll_limit` slots on bounded strings (now grown up to 32 slots until no overflow is
   possible) and that overflowing split models gave witnesses that never replayed (now
   excluded from the solve).
+- Contract (`ensures`, `total=True`) facts were asserted for every encoded call, even
+  ones that never run (untaken ternary branch, short-circuited operand, dead list slot),
+  giving false UNSAT/PROVED when a contract can't hold on such an argument. They are now
+  guarded by the path condition (review round 2). Other lazily evaluated constructs, if
+  any are added, must push a path condition too.
 - `bounds()` has neither the split retry nor the no-overflow assertion, so bounds of a
   split are never marked sound: `s.split(',').size()` with max_length 8 gives an unproven
   `[1, 5]` where the true max is 9 (review of the fuzzer milestone).

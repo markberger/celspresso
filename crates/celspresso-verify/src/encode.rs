@@ -49,6 +49,10 @@ pub struct Encoder {
     /// Conditions under which some value was cut off at the unroll bound (a split with
     /// more pieces than slots). A proof holds only if the assumptions rule them all out.
     pub overflow: Vec<Bool>,
+    /// Conditions under which the expression being encoded actually runs (a taken ternary
+    /// branch, a right operand that isn't short-circuited, a live comprehension step).
+    /// Facts that hold only for calls that happen (host function contracts) are guarded by it.
+    path: Vec<Bool>,
 }
 
 /// Characters of a lowerAscii/upperAscii result that are pinned exactly, per call (each
@@ -98,6 +102,7 @@ impl Encoder {
             index_terms: Vec::new(),
             case_funcs: None,
             overflow: Vec::new(),
+            path: Vec::new(),
         }
     }
 
@@ -123,6 +128,23 @@ impl Encoder {
         for a in &mut self.assumptions[from..] {
             *a = guard.implies(&*a);
         }
+    }
+
+    /// `b`, required only where the current path runs.
+    fn on_path(&self, b: Bool) -> Bool {
+        if self.path.is_empty() {
+            b
+        } else {
+            and(&self.path.iter().collect::<Vec<_>>()).implies(&b)
+        }
+    }
+
+    /// Encode `x` under the extra path condition `g`.
+    fn enc_under(&mut self, c: &CheckedExpr, x: &Expr, g: Bool) -> SV {
+        self.path.push(g);
+        let r = self.enc(c, x);
+        self.path.pop();
+        r
     }
 
     /// A dead slot's value is never observed, and its schema constraints are guarded off, so
@@ -619,14 +641,14 @@ impl Encoder {
                     let cond = self.enc(c, &comp.loop_condition);
                     let cv = cond.v.as_bool().cloned().unwrap_or_else(tt);
                     let active = and(&[&live, &stopped.not()]);
+                    let proceed = and(&[&active, &cv, &cond.err.not()]);
                     let pushed = self.locals.len();
                     self.locals.push((comp.iter_var.clone(), SV::ok(first)));
                     if let (Some(name), Some(v)) = (&comp.iter_var2, second) {
                         self.locals.push((name.clone(), SV::ok(v)));
                     }
-                    let step = self.enc(c, &comp.loop_step);
+                    let step = self.enc_under(c, &comp.loop_step, proceed.clone());
                     self.locals.truncate(pushed);
-                    let proceed = and(&[&active, &cv, &cond.err.not()]);
                     let Some(mut next) = ite_sv(&proceed, &step, &accu) else {
                         self.locals.truncate(accu_idx);
                         return self.approx(c, e, "comprehension accumulator shape is not supported");
@@ -665,7 +687,10 @@ impl Encoder {
         match function {
             ops::LOGICAL_AND | ops::LOGICAL_OR => {
                 let l = self.enc(c, &args[0]);
-                let r = self.enc(c, &args[1]);
+                // the right operand may be skipped once the left decides
+                let lb = l.v.as_bool().cloned().unwrap_or_else(tt);
+                let left_decides = and(&[&l.err.not(), &if function == ops::LOGICAL_AND { lb.not() } else { lb }]);
+                let r = self.enc_under(c, &args[1], left_decides.not());
                 let (Some(lv), Some(rv)) = (l.v.as_bool(), r.v.as_bool()) else {
                     return self.approx(c, e, "non-bool logical operand");
                 };
@@ -683,8 +708,9 @@ impl Encoder {
             }
             ops::CONDITIONAL => {
                 let cond = self.enc(c, &args[0]);
-                let a = self.enc(c, &args[1]);
-                let b = self.enc(c, &args[2]);
+                let cb = cond.v.as_bool().cloned().unwrap_or_else(tt);
+                let a = self.enc_under(c, &args[1], and(&[&cond.err.not(), &cb]));
+                let b = self.enc_under(c, &args[2], and(&[&cond.err.not(), &cb.not()]));
                 let Some(cv) = cond.v.as_bool() else {
                     return self.approx(c, e, "non-bool condition");
                 };
@@ -1477,7 +1503,8 @@ impl Encoder {
         };
         let contract = self.schema.contracts.get(&overload).cloned();
         if contract.as_ref().is_some_and(|k| k.total) {
-            self.assumptions.push(err.not());
+            let fact = self.on_path(err.not());
+            self.assumptions.push(fact);
             self.approximations.insert(format!("relies on '{function}' never failing (total=True)"));
         }
         if let Some((k, ensures)) = contract.as_ref().and_then(|k| Some((k, k.ensures.as_ref()?))) {
@@ -1489,7 +1516,8 @@ impl Encoder {
             let r = self.encode(ensures);
             self.locals.truncate(depth);
             if let Some(b) = r.v.as_bool() {
-                self.assumptions.push(err.not().implies(and(&[b, &r.err.not()])));
+                let fact = self.on_path(err.not().implies(and(&[b, &r.err.not()])));
+                self.assumptions.push(fact);
                 self.approximations.insert(format!("relies on the ensures contract of '{function}'"));
             }
         }
