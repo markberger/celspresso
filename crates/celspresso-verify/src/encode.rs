@@ -1671,6 +1671,9 @@ impl Encoder {
             }
             // unobservable, and pinning it keeps a split of a dead piece from "overflowing"
             facts.push(live.not().implies(p.eq(zutil::str_lit(""))));
+            // true of any piece (it is part of the string), and it rules out a piece that
+            // breaks its static length bound without reasoning through the join
+            facts.push(p.length().le(s.length()));
             slots.push((live, Sym::Str(p)));
         }
         facts.push(Self::join(&slots, sep).expect("string slots").eq(s));
