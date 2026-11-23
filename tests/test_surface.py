@@ -41,10 +41,10 @@ class Level(enum.IntEnum):
 def test_enum_and_literal_membership() -> None:
     env = Env(c=Color, lv=Level, n=Literal[1, 2], flag=Literal[True])
     assert env.variables == {"c": "string", "lv": "int", "n": "int", "flag": "bool"}
-    assert env.predicate("c == 'green'").satisfiable().unsat
-    assert env.predicate("lv == 2").satisfiable().unsat
-    assert env.predicate("n == 2").satisfiable().sat
-    assert env.predicate("n == 3").satisfiable().unsat
+    assert env.predicate("c == 'green'").satisfiable().refuted
+    assert env.predicate("lv == 2").satisfiable().refuted
+    assert env.predicate("n == 2").satisfiable().proved
+    assert env.predicate("n == 3").satisfiable().refuted
 
 
 @pytest.mark.parametrize(
@@ -106,8 +106,8 @@ def test_nested_models_and_name_collisions() -> None:
 
     env = Env(p=Person, other=make())
     assert env.variables["other"] != "Addr"
-    assert env.predicate("p.addr.zip == '1234'").satisfiable().unsat
-    assert env.predicate("p.addr.zip.startsWith('9')").satisfiable().sat
+    assert env.predicate("p.addr.zip == '1234'").satisfiable().refuted
+    assert env.predicate("p.addr.zip.startsWith('9')").satisfiable().proved
     out = env.expr("p", Person).evaluate(
         {"p": Person(addr=Addr(zip="12345"), tags={"a": 1}), "other": {"line": "x"}}
     )
@@ -148,7 +148,7 @@ def test_string_annotations_resolve_in_their_own_module(tmp_path, monkeypatch) -
     import shop_b  # type: ignore[import-not-found]
 
     env = Env(x=shop_a.Order, h=shop_b.Holder)  # shop_a.Order must not hide shop_b's
-    assert env.predicate("h.o.b > 0 && x.a > 0").satisfiable().sat
+    assert env.predicate("h.o.b > 0 && x.a > 0").satisfiable().proved
 
 
 def test_envs_over_different_same_named_structs_are_different() -> None:
@@ -211,7 +211,7 @@ def test_env_construction_errors() -> None:
     with pytest.raises(CelTypeError):
         env.define("bad", "x + 'a'")
     with pytest.raises(CelTypeError):
-        env.extend(assumptions=["x + 1"])
+        env.assume("x + 1")
 
     def nohint(a):  # type: ignore[no-untyped-def]
         return a
@@ -284,12 +284,12 @@ def test_option_names_as_variables() -> None:
     assert env.predicate("timeout > 3 && flag").evaluate({"timeout": 5, "unroll_limit": "", "flag": True})
     env2 = Env(x=int).extend({"functions": list[int], "assumptions": str}, unroll_limit=3)
     assert env2.variables["functions"] == "list(int)"
-    assert env2.predicate("size(functions) > 0").satisfiable().sat
+    assert env2.predicate("size(functions) > 0").satisfiable().proved
 
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"timeout": int}, {"timeout": True}, {"unroll_limit": 2.5}, {"schema_constraints": str}],
+    [{"timeout": int}, {"timeout": True}, {"unroll_limit": 2.5}],
 )
 def test_option_clash_gives_clear_error(kwargs: dict[str, object]) -> None:
     with pytest.raises(TypeError, match="is an Env option"):
@@ -300,15 +300,19 @@ def test_extend_option_clashes() -> None:
     env = Env(x=int)
     with pytest.raises(TypeError, match="is an Env option"):
         env.extend(functions=int)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="is an Env option"):
-        env.extend(assumptions=str)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match=r"env\.assume"):
+        env.extend(assumptions=["x > 0"])
     with pytest.raises(TypeError, match="plain callables"):
         env.extend(functions=[int])
     with pytest.raises(ValueError, match="both in the mapping"):
         Env({"x": int}, x=str)
     with pytest.raises(ValueError, match="invalid variable name"):
         Env({"not valid": int})
-    assert env.extend(assumptions="x > 0").assumptions == ("x > 0",)
+    assert env.assume("x > 0").assume(env.predicate("x < 9")).assumptions == ("x > 0", "x < 9")
+    with pytest.raises(TypeError, match="CEL conditions"):
+        env.assume(5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="different Env"):
+        env.assume(Env(y=int).predicate("y > 0"))
 
 
 def test_expr_identity_and_repr() -> None:
@@ -342,20 +346,24 @@ def test_as_false_requires_predicates() -> None:
 def test_diff_with_no_differences_and_flat_vars() -> None:
     env = Env(x=int)
     assert env.predicate("x > 1").diff(env.predicate("1 < x")) == []
-    ws = env.predicate("x > 1").diff(env.predicate("x > 3"), limit=5)
+    ds = env.predicate("x > 1").diff(env.predicate("x > 3"), limit=5)
     # x=2 and x=3 differ for the same reason (x > 1 holds, x > 3 doesn't): one class
-    assert [w["x"] in (2, 3) for w in ws] == [True]
+    assert [d.witness["x"] in (2, 3) for d in ds] == [True]
+    assert str(ds[0]) == f"when x = {ds[0].witness['x']}: true -> false"
+    errs = env.compile("10 / x").diff(env.compile("10"), limit=1, assuming="x == 0")
+    assert isinstance(errs[0].before, CelEvaluationError)
+    assert str(errs[0]).endswith(": error (division by zero) -> 10")
 
 
 def test_diff_witnesses_respect_assumptions() -> None:
     env = Env(x=int, y=int)
     old, new = env.predicate("x > 1"), env.predicate("x > 1 || y > 5")
-    ws = old.diff(new, limit=5, assuming="y == 777")
-    assert ws
-    assert all(w["y"] == 777 for w in ws)
+    ds = old.diff(new, limit=5, assuming="y == 777")
+    assert ds
+    assert all(d.witness["y"] == 777 for d in ds)
     assert old.diff(new, assuming=[env.predicate("y <= 5")]) == []
     rs_old = RuleSet({"r": old}, assumptions=["y == 9"])
-    assert [w["y"] for w in rs_old.diff(RuleSet({"r": new}))["r"]] == [9]
+    assert [d.witness["y"] for d in rs_old.diff(RuleSet({"r": new}))["r"]] == [9]
 
 
 def test_explain_error_and_nesting() -> None:
@@ -381,12 +389,24 @@ def test_verdict_rendering() -> None:
     assert "counterexample" in repr(v)
     assert "assuming: (x > -5)" in str(v)
     assert v._repr_markdown_().startswith("```")
-    assert repr(Status.SAT) == "Status.SAT"
+    assert repr(Status.PROVED) == "Status.PROVED"
     sat = env.predicate("x > 1").satisfiable()
     assert sat.expect() is sat
     assert sat.counterexample is None
-    assert "witness" in str(sat)
+    assert sat.example == sat.witness
+    assert "example" in str(sat)
     assert len(sat.witness or {}) == 1
+    # every question's PROVED means the property asked holds, so expect() is never inverted
+    errs = Env(x=int).compile("10 / x").never_errors()
+    assert errs.refuted
+    assert errs.counterexample == {"x": 0}
+    with pytest.raises(VerificationFailed):
+        errs.expect()
+    unsat = env.predicate("x > 1 && x < 0").satisfiable()
+    assert unsat.refuted
+    assert unsat.example is None
+    with pytest.raises(VerificationFailed):
+        unsat.expect()
 
 
 def test_verdict_unknown_and_timeout() -> None:
@@ -396,8 +416,8 @@ def test_verdict_unknown_and_timeout() -> None:
     assert "bounded=True" in repr(timed_out)
     assert "unroll limit" in str(timed_out)
     with pytest.raises(VerificationFailed) as ei:
-        Verdict(Status.UNSAT, "q").expect()
-    assert ei.value.verdict.unsat
+        Verdict(Status.REFUTED, "q").expect()
+    assert ei.value.verdict.refuted
 
 
 def test_evaluation_error_attributes() -> None:
@@ -417,7 +437,8 @@ def test_compile_error_attributes() -> None:
     e = ei.value
     assert e.message
     assert len(e.diagnostics) == 2
-    assert "2 errors" in str(e)
+    assert [d.code for d in e.diagnostics] == ["type", "type"]
+    assert str(e).startswith(e.diagnostics[0].rendered)
     assert str(e.diagnostics[0]) == e.diagnostics[0].rendered
 
 
@@ -433,10 +454,10 @@ def test_ruleset_surface() -> None:
     assert len(old) == 3
     assert list(old) == ["r", "q", "same"]
     assert old["r"].source == "x > 1"
-    assert set(old.can_error()) == {"q"}
+    assert set(old.may_error()) == {"q"}
     d = old.diff(new)
     assert set(d) == {"r"}
-    assert d["r"][0]["x"] == 2
+    assert d["r"][0].witness["x"] == 2
     ordered = old.check_pairwise(lambda a, b: a.implies(b), symmetric=False)
     assert ("r", "same") in ordered
     assert ("same", "r") in ordered
@@ -473,7 +494,7 @@ class Outer:
 def test_dataclass_with_nested_struct_roundtrip() -> None:
     env = Env(o=Outer)
     v = env.predicate("o.inner.v > 3 && size(o.items) == 1 && o.items[0].v == 2").satisfiable()
-    assert v.sat
+    assert v.proved
     assert v.witness is not None
     py = v.witness.to_python()["o"]
     assert isinstance(py, Outer)
@@ -496,3 +517,111 @@ def test_local_dataclass_forward_refs() -> None:
     # declaring the dependency first makes it resolvable
     env = Env(leaf=Leaf, t=Tree)
     assert env.predicate("t.leaf.v == leaf.v").evaluate({"leaf": Leaf(1), "t": Tree(Leaf(1))}) is True
+
+
+# -- M0 surface: from_model, Spec, diagnostic codes ---------------------------
+
+
+def test_env_from_model() -> None:
+    from pydantic import BaseModel
+
+    class Ctx(BaseModel):
+        total: Annotated[int, Field(ge=0, le=100)]
+        tier: str
+        timeout: int  # a field name never clashes with an option
+
+    env = Env.from_model(Ctx, timeout=2.0)
+    assert env.variables == {"total": "int", "tier": "string", "timeout": "int"}
+    # the field's constraints survive (Pydantic moves Annotated metadata to FieldInfo)
+    assert env.predicate("total > 100").satisfiable().refuted
+
+    @dataclasses.dataclass
+    class DCtx:
+        total: Annotated[int, Field(ge=0, le=100)]
+
+    assert Env.from_model(DCtx).predicate("total > 100").satisfiable().refuted
+    with pytest.raises(TypeError, match="Pydantic model or dataclass"):
+        Env.from_model(int)
+
+
+def test_spec_validation_and_reuse() -> None:
+    from celspresso import Spec
+
+    env = Env(x=int)
+    spec = Spec({"small": "x < 10"}, require=["x == 1"], examples=[({"x": 3}, True)], assumptions="x >= 0")
+    assert spec.assumptions == ("x >= 0",)
+    assert spec.check(env.predicate("x < 5")).ok
+    assert not spec.check(env.predicate("x < 50")).ok
+    # a list of invariants is still accepted where a Spec is
+    assert env.check_rule("x < 5", ["x < 10"]).ok
+    assert spec.assuming("x < 3").assumptions == ("x >= 0", "x < 3")
+    with pytest.raises(TypeError, match="not a single string"):
+        Spec("x < 10")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="CEL condition"):
+        Spec([5])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="examples"):
+        Spec(examples=[{"x": 1}])  # type: ignore[list-item]
+
+
+def test_diagnostic_codes() -> None:
+    from celspresso import CelSubsetError, CelSyntaxError
+
+    env = Env(x=int)
+    with pytest.raises(CelSyntaxError) as syn:
+        env.compile("x +")
+    assert {d.code for d in syn.value.diagnostics} == {"syntax"}
+    with pytest.raises(CelSubsetError) as sub:
+        env.compile("double(x) > 1.0")
+    assert isinstance(sub.value, CelTypeError)
+    assert {d.code for d in sub.value.diagnostics} == {"subset"}
+    assert str(sub.value).startswith("1:")  # the headline is the problem itself
+    assert all(w.code == "lint" for w in env.predicate("x > 1 && x > 1").warnings)
+
+
+def test_assumptions_follow_every_env_involved() -> None:
+    env = Env(x=int)
+    positive = env.assume("x > 0")
+    base = env.predicate("100 / x > 0")
+    # the env check_rule is called on brings its assumptions, whatever env compiled the rule
+    assert positive.check_rule(base).ok
+    assert not env.check_rule(base).ok
+    # and an operand compiled under assumptions keeps them
+    assert env.predicate("x > 5").implies(positive.predicate("x > 0")).proved
+    assert positive.compile("100 / x").never_errors().proved
+    # combining predicates keeps both sides' assumptions
+    base = Env(x=int, y=int)
+    p, q = base.assume("x > 0").predicate("x > 0"), base.assume("y > 0").predicate("y > 0")
+    assert p.implies(q).proved
+    assert (p & ~q).satisfiable().refuted
+    with pytest.raises(ValueError, match="different Env"):
+        positive.check_rule(Env(z=str).predicate("z == 'a'"))
+
+
+def test_spec_is_a_read_only_value() -> None:
+    from celspresso import Spec
+
+    spec = Spec(["x < 10"], examples=[[{"x": 1}, True]])  # lists, as loaded from JSON
+    assert spec.examples == (({"x": 1}, True),)
+    with pytest.raises(TypeError):
+        spec.invariants["y"] = "x > 0"  # type: ignore[index]
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(spec)
+    assert spec == Spec(["x < 10"], examples=[({"x": 1}, True)])
+    with pytest.raises(TypeError, match="compiled Predicate"):
+        spec.check("x < 5")  # type: ignore[arg-type]
+    import copy
+    import pickle
+
+    assert copy.deepcopy(spec) == spec
+    assert pickle.loads(pickle.dumps(spec)) == spec
+
+
+def test_removed_env_options_say_so() -> None:
+    with pytest.raises(TypeError, match="no longer an Env option"):
+        Env(x=int, schema_constraints=False)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="no longer an Env option"):
+        Env(x=int, debug_sample_proofs=3)  # type: ignore[arg-type]
+    assert Env(schema_constraints=bool).variables == {"schema_constraints": "bool"}
+    assert Env(schema_constraints=int | None).variables == {"schema_constraints": "int?"}
+    with pytest.raises(TypeError, match=r"env\.assume"):
+        Env(x=int).extend(assumptions={"x > 0"})

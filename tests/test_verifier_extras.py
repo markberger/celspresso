@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from celspresso import Bounds, CelTypeError, Env, RuleSet, VerificationFailed, function
+from celspresso._env import _debug_options
 
 
 class Order(BaseModel):
@@ -66,8 +67,8 @@ def test_ensures_contracts_and_total_functions() -> None:
     e = Env(x=int).extend(functions=[risk, fee])
     assert e.predicate("risk(x) * 2 <= 200").always_true().proved
     # the contract allows it, but only the real function could say which x: not UNSAT
-    assert not e.predicate("risk(x) > 50").satisfiable().unsat
-    assert e.predicate("risk(x) > 100").satisfiable().unsat
+    assert not e.predicate("risk(x) > 50").satisfiable().refuted
+    assert e.predicate("risk(x) > 100").satisfiable().refuted
     # fee's contract is wrong (fee(-100) == -1). Contracts are trusted, so the prover
     # can't catch that; here fee may also fail (no total=True), so this isn't PROVED,
     # and any counterexample it reports has been replayed with the real function
@@ -106,10 +107,10 @@ def test_bad_contracts_are_rejected() -> None:
 
 
 def test_proof_sampling() -> None:
-    sampled = Env(x=int, y=int, debug_sample_proofs=10)
+    sampled = _debug_options(Env(x=int, y=int), sample_proofs=10)
     assert sampled.predicate("x < y || x >= y").always_true().proved
-    with pytest.raises(TypeError, match="debug_sample_proofs"):
-        Env(x=int, debug_sample_proofs=-1)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(TypeError, match="sample_proofs"):
+        _debug_options(Env(x=int), sample_proofs=-1)
 
 
 def test_ruleset_verify_all() -> None:

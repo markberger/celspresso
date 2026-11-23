@@ -41,13 +41,13 @@ def assert_always(p: Predicate, **kw: Any) -> Verdict:
 
 def assert_never(p: Predicate, **kw: Any) -> Verdict:
     v = p.satisfiable(**kw)
-    if not v.unsat:
+    if not v.refuted:
         raise VerificationFailed(v, f"expected never true, got:\n{v}")
     return v
 
 
 def assert_no_errors(e: Expr[Any], **kw: Any) -> Verdict:
-    v = e.can_error(**kw)
-    if not v.unsat:
+    v = e.never_errors(**kw)
+    if not v.proved:
         raise VerificationFailed(v, f"expected no evaluation errors, got:\n{v}")
     return v

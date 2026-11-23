@@ -77,8 +77,8 @@ def review_a_change() -> None:
     new = env.predicate("p.malpractice_claims <= 1 && p.work_gap_months < 12 && p.oig_cleared")
     print("equivalent:", old.equivalent(new).status.name)
     print("files that now skip committee review, one per distinct reason:")
-    for w in old.diff(new):
-        print("  ", w)
+    for d in old.diff(new):
+        print("  ", d)
 
 
 if __name__ == "__main__":

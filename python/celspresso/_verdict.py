@@ -9,12 +9,14 @@ from typing import Any, NoReturn
 from ._errors import VerificationFailed, VerificationTimeout
 from ._types import SchemaBuilder, TypeSpec, from_cel
 
-__all__ = ["Bounds", "Extreme", "Stats", "Status", "Verdict", "Witness"]
+__all__ = ["Bounds", "Difference", "Extreme", "Stats", "Status", "Verdict", "Witness"]
 
 
 class Status(enum.Enum):
-    SAT = "sat"
-    UNSAT = "unsat"
+    """The answer to a verification question, always about the property that was asked:
+    PROVED means it holds (for `satisfiable()`: some input makes it true), REFUTED means
+    it doesn't, UNKNOWN means the solver couldn't decide."""
+
     PROVED = "proved"
     REFUTED = "refuted"
     UNKNOWN = "unknown"
@@ -113,7 +115,7 @@ class Extreme:
     witness: Witness
     #: the witness replays through the evaluator to exactly `value`
     attained: bool
-    #: no valid input gives a value beyond this one (an UNSAT check)
+    #: no valid input gives a value beyond this one (proved by an unsatisfiable check)
     sound: bool
 
 
@@ -155,11 +157,39 @@ class Bounds:
 
 
 @dataclass(frozen=True)
+class Difference:
+    """One input on which two expressions disagree, and what each gives for it.
+
+    `before` and `after` are the values of the first and second expression, or a
+    `CelEvaluationError` when that one fails on this input."""
+
+    witness: Witness
+    before: Any
+    after: Any
+
+    def __str__(self) -> str:
+        return f"when {self.witness}: {_outcome(self.before)} -> {_outcome(self.after)}"
+
+
+def _outcome(v: Any) -> str:
+    from ._errors import CelEvaluationError
+
+    if isinstance(v, CelEvaluationError):
+        return f"error ({v.message})"
+    return _show(v)
+
+
+@dataclass(frozen=True)
 class Verdict:
-    """The outcome of a verification query.
+    """The outcome of a verification question.
+
+    The status is always about the property asked: `x.never_errors().proved` means x
+    can't fail, `p.satisfiable().proved` means some input makes p true. `witness` is the
+    evidence: an example input when a `satisfiable()` question is PROVED, a
+    counterexample when any other question is REFUTED.
 
     Verdicts deliberately refuse `bool()`: an UNKNOWN must never be mistaken for a
-    yes or a no. Use `.proved`, `.refuted`, `.sat`, `.unsat`, `.unknown` or `.expect()`.
+    yes or a no. Use `.proved`, `.refuted`, `.unknown` or `.expect()`.
     """
 
     status: Status
@@ -180,30 +210,29 @@ class Verdict:
         return self.status is Status.REFUTED
 
     @property
-    def sat(self) -> bool:
-        return self.status is Status.SAT
-
-    @property
-    def unsat(self) -> bool:
-        return self.status is Status.UNSAT
-
-    @property
     def unknown(self) -> bool:
         return self.status is Status.UNKNOWN
 
     @property
     def counterexample(self) -> Witness | None:
+        """The input that refutes the property, when it is REFUTED."""
         return self.witness if self.status is Status.REFUTED else None
+
+    @property
+    def example(self) -> Witness | None:
+        """An input for which the property holds, when a PROVED answer comes with one
+        (`satisfiable()`)."""
+        return self.witness if self.status is Status.PROVED else None
 
     def __bool__(self) -> NoReturn:
         raise TypeError(
             "a Verdict has no truth value (it may be UNKNOWN); "
-            "use .proved / .refuted / .sat / .unsat / .unknown, or .expect()"
+            "use .proved / .refuted / .unknown, or .expect()"
         )
 
     def expect(self) -> Verdict:
-        """Return self if the property holds (PROVED or SAT); raise otherwise."""
-        if self.status in (Status.PROVED, Status.SAT):
+        """Return self if the property is PROVED; raise otherwise."""
+        if self.status is Status.PROVED:
             return self
         if self.status is Status.UNKNOWN and self.reason and "timeout" in self.reason:
             raise VerificationTimeout(self, self._explain())
@@ -212,7 +241,7 @@ class Verdict:
     def _explain(self) -> str:
         lines = [f"{self.question}: {self.status.name}"]
         if self.witness is not None:
-            label = "counterexample" if self.status is Status.REFUTED else "witness"
+            label = "counterexample" if self.status is Status.REFUTED else "example"
             lines.append(f"  {label}:")
             for k, v in self.witness.relevant.items():
                 lines.append(f"    {k} = {_show(v)}")
@@ -230,7 +259,7 @@ class Verdict:
     def __repr__(self) -> str:
         parts = [self.status.name]
         if self.witness is not None:
-            parts.append(f"{'counterexample' if self.refuted else 'witness'}={dict(self.witness)!r}")
+            parts.append(f"{'counterexample' if self.refuted else 'example'}={dict(self.witness)!r}")
         if self.reason:
             parts.append(f"reason={self.reason!r}")
         if self.bounded:

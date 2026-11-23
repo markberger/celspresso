@@ -33,7 +33,7 @@ A `SchemaContext` is only valid during the `schema_for` call it was passed to.
 >>> env = Env(row=Row, adapters=[RowAdapter()])
 >>> env.variables
 {'row': 'Row'}
->>> env.predicate("row.id > 0 && row.email.endsWith('@example.com')").satisfiable().sat
+>>> env.predicate("row.id > 0 && row.email.endsWith('@example.com')").satisfiable().proved
 True
 
 Values are read from attributes or mapping keys named like the fields, unless a field

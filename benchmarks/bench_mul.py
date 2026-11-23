@@ -36,7 +36,7 @@ CASES = [
     ("always", "a * b % 7 == (a % 7) * (b % 7) % 7 || a < 0 || b < 0", None),
     ("sat", "a * b == 391 && a > 1 && b > 1", None),
     ("sat", "a * b == 1000003 && a > 1 && b > 1", None),
-    ("can_error", "a * b * c * d", None),
+    ("never_errors", "a * b * c * d", None),
 ]
 
 
@@ -54,7 +54,7 @@ def main() -> None:
             elif kind == "sat":
                 v = env.predicate(x).satisfiable(timeout=5.0)
             else:
-                v = env.expr(x, int).can_error(timeout=5.0)
+                v = env.expr(x, int).never_errors(timeout=5.0)
             ms = (time.perf_counter() - t0) * 1000
             times.append(ms)
             total += 1

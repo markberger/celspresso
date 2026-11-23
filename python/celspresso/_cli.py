@@ -38,11 +38,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import __version__
-from ._env import Env, Predicate, Problem, RuleCheck
-from ._errors import CelError, CelEvaluationError
+from ._env import Env, Predicate, Problem, RuleCheck, _value_or_error
+from ._errors import CelError
+from ._spec import Spec
+from ._verdict import Difference, _outcome
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Sequence
 
     from ._verdict import Witness
 
@@ -69,6 +71,11 @@ class RuleFile:
     invariants: dict[str, str] = field(default_factory=dict)
     require: dict[str, str] = field(default_factory=dict)
     assumptions: list[str] = field(default_factory=list)
+
+    @property
+    def spec(self) -> Spec:
+        """The file's invariants, require entries and assumptions, as one Spec."""
+        return Spec(self.invariants, require=self.require, assumptions=self.assumptions)
 
     def line_of(self, name: str, section: str = "rules") -> int:
         """The 1-based line that defines `name` in `section` ("rules", "invariants",
@@ -337,15 +344,9 @@ def run_check(
     """`Env.check_rule` on each rule (or just `names`), with the file's invariants,
     requirements and assumptions."""
     return {
-        n: rf.env.check_rule(
-            rf.rules[n], rf.invariants, require=rf.require, assuming=_assumptions(rf), timeout=timeout
-        )
+        n: rf.env.check_rule(rf.rules[n], rf.spec, timeout=timeout)
         for n in (rf.rules if names is None else names)
     }
-
-
-def _assumptions(rf: RuleFile) -> list[str | Predicate]:
-    return list(rf.assumptions)
 
 
 # -- diff -------------------------------------------------------------------
@@ -382,13 +383,6 @@ class Change:
         if self.section == "assumptions":
             return "assumption"
         return f"{_SINGULAR[self.section]} {self.name}"
-
-
-def _outcome(p: Predicate, data: Mapping[str, Any]) -> str:
-    try:
-        return "true" if p.evaluate(data) else "false"
-    except CelEvaluationError as e:
-        return f"error ({e.message})"
 
 
 def _compile(env: Env, source: str | None) -> tuple[Predicate | None, str | None]:
@@ -448,10 +442,10 @@ def _rule_change(
         return Change(name, "unchanged", a, b, reason="rewritten, but proved equivalent")
     if v.unknown:
         return Change(name, "undecided", a, b, reason=v.reason)
-    witnesses = pa.diff(pb, limit=limit, assuming=assuming, timeout=timeout)
-    examples = [
-        Example(w, _outcome(pa, w), _outcome(pb, w)) for w in witnesses or ([v.witness] if v.witness else [])
-    ]
+    diffs = pa.diff(pb, limit=limit, assuming=assuming, timeout=timeout)
+    if not diffs and v.witness is not None:
+        diffs = [Difference(v.witness, _value_or_error(pa, v.witness), _value_or_error(pb, v.witness))]
+    examples = [Example(d.witness, _outcome(d.before), _outcome(d.after)) for d in diffs]
     return Change(name, "changed", a, b, examples)
 
 

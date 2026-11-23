@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CelError",
     "CelEvaluationError",
+    "CelSubsetError",
     "CelSyntaxError",
     "CelTypeError",
     "Diagnostic",
@@ -19,12 +20,18 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Diagnostic:
-    """One problem in a CEL source, with a character span."""
+    """One problem in a CEL source, with a character span.
+
+    `code` says what kind of problem it is: "syntax" (doesn't parse), "type" (doesn't
+    type-check: an unknown field, a wrong argument), "subset" (valid CEL, but outside
+    celspresso's subset; the message says what to write instead) or "lint" (a warning
+    from `Expr.warnings`)."""
 
     message: str
     start: int
     end: int
     rendered: str
+    code: str = "type"
 
     def __str__(self) -> str:
         return self.rendered
@@ -50,9 +57,9 @@ class _CompileFailure(CelError):
         return self.diagnostics[0].message
 
     def _format(self) -> str:
-        n = len(self.diagnostics)
-        head = f"{n} error{'s' if n != 1 else ''} in CEL expression"
-        return head + "\n" + "\n".join(d.rendered for d in self.diagnostics)
+        # each rendered diagnostic starts with "line:col: message", so the first line of
+        # the error is the first problem itself
+        return "\n".join(d.rendered for d in self.diagnostics)
 
 
 class CelSyntaxError(_CompileFailure):
@@ -61,6 +68,12 @@ class CelSyntaxError(_CompileFailure):
 
 class CelTypeError(_CompileFailure):
     """The expression parses but does not type-check against the environment."""
+
+
+class CelSubsetError(CelTypeError):
+    """The expression is valid CEL but uses something outside celspresso's subset (the
+    part the verifier decides exactly and quickly). Each message says what to write
+    instead. A subclass of CelTypeError, so code catching that still catches this."""
 
 
 class CelEvaluationError(CelError):

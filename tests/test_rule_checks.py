@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import BaseModel, Field
 
-from celspresso import Env, Problem, RuleCheck
+from celspresso import Env, Problem, RuleCheck, Spec
 
 
 class Provider(BaseModel):
@@ -74,12 +74,12 @@ def test_invariants_may_be_unnamed_predicates() -> None:
 def test_dead_and_crashing_rules() -> None:
     assert kinds(env.check_rule("p.work_gap_months > 200")) == ["never_fires"]
     r = env.check_rule("100 / p.work_gap_months > 1")
-    assert kinds(r) == ["can_error"]
+    assert kinds(r) == ["may_error"]
     assert "p.work_gap_months = 0" in str(r)
 
 
 def test_assumptions_apply_to_every_check() -> None:
-    r = env.check_rule("p.status == 'credentialed'", INVARIANTS, assuming=["p.oig_cleared", SAFE])
+    r = env.check_rule("p.status == 'credentialed'", Spec(INVARIANTS, assumptions=["p.oig_cleared", SAFE]))
     assert r.ok
 
 
@@ -99,9 +99,9 @@ def test_diff_returns_one_witness_per_behaviour() -> None:
     new = env.predicate("p.malpractice_claims <= 1 && p.work_gap_months < 12 && p.oig_cleared")
     found = old.diff(new, limit=10)
     reasons = set()
-    for w in found:
-        p = w["p"]
-        assert old.evaluate(dict(w)) != new.evaluate(dict(w))
+    for d in found:
+        p = d.witness["p"]
+        assert d.before == old.evaluate(dict(d.witness)) != new.evaluate(dict(d.witness)) == d.after
         reasons.add(
             "claim" if p["malpractice_claims"] == 1 else "gap" if p["work_gap_months"] > 6 else "board"
         )
@@ -161,28 +161,28 @@ EXAMPLES = [
 def test_require_catches_rules_too_narrow_to_be_useful() -> None:
     # safe, so the invariants alone accept it, but it allows almost nobody
     assert env.check_rule(NARROW, INVARIANTS).ok
-    r = env.check_rule(NARROW, INVARIANTS, require=MUST_ALLOW)
+    r = env.check_rule(NARROW, Spec(INVARIANTS, require=MUST_ALLOW))
     assert kinds(r) == ["too_narrow"]
     assert r.problems[0].invariant == "clean credentialed MDs"
     assert "too narrow: doesn't allow 'clean credentialed MDs', e.g. when" in str(r)
-    assert env.check_rule(SAFE, INVARIANTS, require=MUST_ALLOW).ok
+    assert Spec(INVARIANTS, require=MUST_ALLOW).check(env.predicate(SAFE)).ok
     # unnamed requirements are keyed by their source
-    r = env.check_rule("p.oig_cleared && p.board_certified", require=["p.oig_cleared"])
+    r = env.check_rule("p.oig_cleared && p.board_certified", Spec(require=["p.oig_cleared"]))
     assert r.problems[0].invariant == "p.oig_cleared"
 
 
 def test_examples_are_replayed() -> None:
-    assert env.check_rule(SAFE, INVARIANTS, examples=EXAMPLES).ok
-    r = env.check_rule(NARROW, examples=EXAMPLES)
+    assert env.check_rule(SAFE, Spec(INVARIANTS, examples=EXAMPLES)).ok
+    r = env.check_rule(NARROW, Spec(examples=EXAMPLES))
     assert kinds(r) == ["wrong_example"]
     assert "example 0 should give True, but the rule gives False" in str(r)
-    r = env.check_rule("100 / p.work_gap_months > 1", examples=EXAMPLES)
+    r = env.check_rule("100 / p.work_gap_months > 1", Spec(examples=EXAMPLES))
     assert kinds(r)[0] == "wrong_example"
     assert "evaluation fails" in str(r)
     # examples that break the schema are the caller's bug, not the rule's
     with pytest.raises(ValueError, match="malpractice_claims"):
         env.check_rule(
-            SAFE, examples=[({"p": provider(malpractice_claims=99), "today": TODAY, "m": {}}, True)]
+            SAFE, Spec(examples=[({"p": provider(malpractice_claims=99), "today": TODAY, "m": {}}, True)])
         )
 
 
@@ -200,11 +200,7 @@ def test_impossible_literals_are_flagged() -> None:
 
 
 def test_describe_is_a_prompt_ready_spec() -> None:
-    d = (
-        env.extend(assumptions=["p.malpractice_claims < 10"])
-        .define("clean", "p.malpractice_claims == 0")
-        .describe()
-    )
+    d = env.assume("p.malpractice_claims < 10").define("clean", "p.malpractice_claims == 0").describe()
     for line in [
         "  p: Provider",
         '    type: string, one of "MD", "NP"',

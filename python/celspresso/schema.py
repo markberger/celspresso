@@ -15,7 +15,7 @@ all. Everything here is a frozen value, and accepted anywhere an annotation is:
 ...     ],
 ... )
 >>> env = Env(structs=[order], order=T.struct("shop.Order"))
->>> env.predicate("order.total < 0").satisfiable().unsat
+>>> env.predicate("order.total < 0").satisfiable().refuted
 True
 
 Values of a declared struct are read from mappings or attributes (or by a field's

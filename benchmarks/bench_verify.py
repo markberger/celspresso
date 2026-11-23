@@ -109,7 +109,7 @@ def single_queries(runs: int) -> None:
         ("int: sat  p.age > 200 (schema)", pred("p.age > 200").satisfiable),
         ("int: always_true  age>=18 => age>=10", lambda: adult.implies("p.age >= 10")),
         ("int: refuted  age >= 18 always", adult.always_true),
-        ("int: division can_error", ENV.compile("1000 / (p.age - 40)").can_error),
+        ("int: division never_errors", ENV.compile("1000 / (p.age - 40)").never_errors),
         ("enum: tier == 'platinum'", pred("p.tier == 'platinum'").satisfiable),
         (
             "string: startsWith/endsWith/size",

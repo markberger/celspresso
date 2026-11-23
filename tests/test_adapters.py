@@ -79,7 +79,7 @@ def test_a_custom_adapter_maps_structs_with_recursion_and_nesting() -> None:
     assert "crm.Customer\n    name: string\n    credit: int, >= 0" in env.describe()
     assert "parent: crm.Account or null" in env.describe()
     # constraints from the adapter's fields are facts for the prover
-    assert env.predicate("acct.owner.credit < 0").satisfiable().unsat
+    assert env.predicate("acct.owner.credit < 0").satisfiable().refuted
     p = env.predicate("acct.parent == null || acct.parent.balance >= acct.balance")
     v = p.always_true()
     assert v.refuted
@@ -137,7 +137,7 @@ def test_user_adapters_come_before_the_builtin_ones() -> None:
     w = env.predicate("s.public == 4").satisfiable().witness
     assert w is not None
     assert w.to_python()["s"] == Secret(4, "")
-    assert Env(s=Secret).predicate("s.password == 'x'").satisfiable().sat
+    assert Env(s=Secret).predicate("s.password == 'x'").satisfiable().proved
 
 
 Cents = NewType("Cents", int)
@@ -164,9 +164,9 @@ def test_scalar_mappings_with_implied_constraints() -> None:
     assert env.variables == {"line": "Line", "total": "int"}
     assert "price: int, >= 0, <= 1000000000000" in env.describe()
     assert "refund: int, >= 0, <= 500" in env.describe()  # the annotation's own bound wins
-    assert env.predicate("line.price < 0 || line.refund > 500").satisfiable().unsat
-    assert env.predicate("total < 0").satisfiable().unsat  # variables carry them too
-    assert env.predicate("line.prices.exists(p, p < 0)").satisfiable().unsat
+    assert env.predicate("line.price < 0 || line.refund > 500").satisfiable().refuted
+    assert env.predicate("total < 0").satisfiable().refuted  # variables carry them too
+    assert env.predicate("line.prices.exists(p, p < 0)").satisfiable().refuted
     with pytest.raises(ValueError, match="violates the schema"):
         env.predicate("true").evaluate({"line": {"price": -1, "refund": 0, "prices": []}, "total": 0})
 
@@ -296,7 +296,7 @@ def test_compiled_patterns_in_metadata() -> None:
     class M(pydantic.BaseModel):
         code: Annotated[str, pydantic.StringConstraints(pattern=re.compile(r"^[A-Z]{3}$"))]
 
-    assert Env(m=M).predicate("m.code == 'abc'").satisfiable().unsat
+    assert Env(m=M).predicate("m.code == 'abc'").satisfiable().refuted
 
 
 def test_local_class_names_survive_pickling() -> None:
@@ -338,7 +338,7 @@ def test_context_refs_can_be_wrapped_and_passed_back() -> None:
 
     env = Env(a=old, b=new, adapters=[Versions()])
     assert env.variables == {"a": "app.Order@0003", "b": "app.Order@0003#2"}
-    assert env.predicate("a.lines.all(l, l.qty > 0) && b.first.qty < 0").satisfiable().sat
+    assert env.predicate("a.lines.all(l, l.qty > 0) && b.first.qty < 0").satisfiable().proved
 
 
 def test_equal_keys_share_one_struct() -> None:
@@ -368,7 +368,7 @@ def test_equal_keys_share_one_struct() -> None:
 
     env = Env(n=Message("pkg.Node"), adapters=[Proto()])
     assert env.variables == {"n": "pkg.Node"}
-    assert env.predicate("n.next.next.value == 3").satisfiable().sat
+    assert env.predicate("n.next.next.value == 3").satisfiable().proved
 
 
 def test_a_failed_build_leaves_nothing_behind() -> None:
@@ -412,7 +412,7 @@ def test_a_failed_build_leaves_nothing_behind() -> None:
     env = Env(s=Shelf, adapters=[Lenient()])
     # Author failed to build inside Book; it must not linger as an empty struct
     assert "Author" not in env.describe()
-    assert env.predicate("s.book.author == 'x' && s.favourite == 'y'").satisfiable().sat
+    assert env.predicate("s.book.author == 'x' && s.favourite == 'y'").satisfiable().proved
 
 
 def test_a_stored_context_is_dead_after_schema_for() -> None:

@@ -1,6 +1,6 @@
 """Contract fuzzer: random in-subset expressions must be decided, quickly and correctly.
 
-The contract: if an expression compiles, the verifier answers PROVED/REFUTED (SAT/UNSAT)
+The contract: if an expression compiles, the verifier answers PROVED/REFUTED
 quickly. This generates type-directed expressions from the subset over a bounded schema,
 asks every question about them, and reports
 
@@ -241,7 +241,7 @@ class Gen:
 class Outcome:
     question: str
     source: str
-    status: str  # PROVED/REFUTED/SAT/UNSAT, UNKNOWN, WRONG, REJECTED
+    status: str  # PROVED/REFUTED, UNKNOWN, WRONG, REJECTED
     ms: float
     detail: str = ""
 
@@ -267,14 +267,14 @@ def ask(env: Env, question: str, node: Node, other: Node | None, timeout: float)
             v = env.predicate(src).always_true(timeout=timeout)
         elif question == "satisfiable":
             v = env.predicate(src).satisfiable(timeout=timeout)
-        elif question == "can_error":
-            v = env.compile(src).can_error(timeout=timeout)
+        elif question == "never_errors":
+            v = env.compile(src).never_errors(timeout=timeout)
         else:
             assert other is not None
             py = {"I": int, "S": str, "B": bool, "LI": list[int], "LS": list[str]}[node.ty]
             v = env.expr(src, py).equivalent(env.expr(other.text(), py), timeout=timeout)
     except (CelSyntaxError, CelTypeError) as e:  # anything else raised while verifying fails the run
-        return Outcome(question, shown, "REJECTED", 0.0, str(e).splitlines()[1] if "\n" in str(e) else str(e))
+        return Outcome(question, shown, "REJECTED", 0.0, str(e).splitlines()[0])
     ms = (time.perf_counter() - t0) * 1000
     status = v.status.name
     return Outcome(question, shown, status, ms, (v.reason or "") if v.status is Status.UNKNOWN else "")
@@ -290,9 +290,9 @@ def contradicted(
         ok, val = run_value(env, src, data)
         if out.question == "always_true" and out.status == "PROVED" and not (ok and val is True):
             return f"PROVED but {data} gives {'an error' if not ok else val!r}"
-        if out.question == "satisfiable" and out.status == "UNSAT" and ok and val is True:
-            return f"UNSAT but {data} satisfies it"
-        if out.question == "can_error" and out.status == "UNSAT" and not ok:
+        if out.question == "satisfiable" and out.status == "REFUTED" and ok and val is True:
+            return f"unsatisfiable, but {data} satisfies it"
+        if out.question == "never_errors" and out.status == "PROVED" and not ok:
             return f"can't error, but {data} errors"
         if out.question == "equivalent" and out.status == "PROVED":
             assert other is not None
@@ -302,7 +302,7 @@ def contradicted(
     return ""
 
 
-QUESTIONS = {"B": ["always_true", "satisfiable", "can_error"], "*": ["can_error", "equivalent"]}
+QUESTIONS = {"B": ["always_true", "satisfiable", "never_errors"], "*": ["never_errors", "equivalent"]}
 
 
 def mutate(g: Gen, node: Node, depth: int) -> Node:
@@ -406,7 +406,7 @@ def fuzz(
                 out = ask(env, q, node, other, timeout * 4)
                 if out.status != "UNKNOWN":
                     out.detail = "SLOW"  # decided, but only with the longer limit
-            if out.status in ("PROVED", "REFUTED", "SAT", "UNSAT"):
+            if out.status in ("PROVED", "REFUTED"):
                 bad = contradicted(env, out, node, other, side, samples)
                 if bad:
                     out.status, out.detail = "WRONG", bad
@@ -427,7 +427,7 @@ def fuzz(
 
 
 def report(outs: list[Outcome]) -> None:
-    decided = [o for o in outs if o.status in ("PROVED", "REFUTED", "SAT", "UNSAT")]
+    decided = [o for o in outs if o.status in ("PROVED", "REFUTED")]
     times = sorted(o.ms for o in decided) or [0.0]
     by = lambda s: [o for o in outs if o.status == s]  # noqa: E731
     slow = [o for o in decided if o.detail == "SLOW"]

@@ -20,6 +20,7 @@ from celspresso import (
     function,
 )
 from celspresso import testing as ct
+from celspresso._env import _debug_options
 
 
 class User(BaseModel):
@@ -117,14 +118,14 @@ def test_explain(env: Env) -> None:
 
 def test_schema_constraints_make_unsat(env: Env) -> None:
     v = env.compile("user.age > 200").satisfiable()
-    assert v.status is Status.UNSAT
-    assert v.unsat
+    assert v.status is Status.REFUTED
+    assert v.refuted
     with pytest.raises(TypeError):
         bool(v)
 
 
 def test_schema_constraints_can_be_disabled() -> None:
-    env = Env(user=User, schema_constraints=False)
+    env = _debug_options(Env(user=User), schema_constraints=False)
     v = env.predicate("user.age > 200").satisfiable()
     # the solver finds age=201, which Pydantic then rejects: never claim SAT on an invalid model
     assert v.unknown
@@ -134,18 +135,20 @@ def test_schema_constraints_can_be_disabled() -> None:
     class Plain:
         age: Annotated[int, Field(ge=0, le=150)]
 
-    assert Env(p=Plain, schema_constraints=False).predicate("p.age > 200").satisfiable().sat
-    assert Env(p=Plain).predicate("p.age > 200").satisfiable().unsat
+    assert (
+        _debug_options(Env(p=Plain), schema_constraints=False).predicate("p.age > 200").satisfiable().proved
+    )
+    assert Env(p=Plain).predicate("p.age > 200").satisfiable().refuted
 
 
 def test_literal_membership(env: Env) -> None:
-    assert env.predicate("user.tier == 'enterprise'").satisfiable().unsat
+    assert env.predicate("user.tier == 'enterprise'").satisfiable().refuted
 
 
 def test_witness_is_real_and_validates(env: Env) -> None:
     p = env.predicate("user.age >= 18 && 'admin' in user.roles")
     v = p.satisfiable()
-    assert v.sat
+    assert v.proved
     assert v.witness is not None
     py = v.witness.to_python()
     assert isinstance(py["user"], User)
@@ -182,16 +185,16 @@ def test_equivalence_strict_vs_as_false() -> None:
 def test_int_semantics() -> None:
     env = Env(x=int)
     # CEL truncates toward zero: -7 / 2 == -3
-    assert env.predicate("x == -7 && x / 2 == -3").satisfiable().sat
-    assert env.predicate("x == -7 && x / 2 == -4").satisfiable().unsat
-    assert env.compile("x + 1").can_error().sat  # overflow at int64 max
+    assert env.predicate("x == -7 && x / 2 == -3").satisfiable().proved
+    assert env.predicate("x == -7 && x / 2 == -4").satisfiable().refuted
+    assert env.compile("x + 1").never_errors().refuted  # overflow at int64 max
 
 
 def test_can_error_and_assumptions() -> None:
     env = Env(x=int, y=int)
     e = env.compile("x / y")
-    assert e.can_error().sat
-    assert e.can_error(assuming="y != 0 && y != -1").unsat
+    assert e.never_errors().refuted
+    assert e.never_errors(assuming="y != 0 && y != -1").proved
 
 
 def test_vacuous_assumptions_unknown(env: Env) -> None:
@@ -202,7 +205,7 @@ def test_vacuous_assumptions_unknown(env: Env) -> None:
 
 
 def test_env_level_assumptions(env: Env) -> None:
-    adults = env.extend(assumptions=["user.age >= 18"])
+    adults = env.assume("user.age >= 18")
     assert adults.predicate("user.age >= 18").always_true().proved
     assert adults.assumptions == ("user.age >= 18",)
 
@@ -213,11 +216,11 @@ def test_combinators(env: Env) -> None:
     c = a & ~b | "user.age > 100"
     assert isinstance(c, Predicate)
     assert c.evaluate({"user": U(age=20, tier="free")}) is True
-    assert (a & ~a).satisfiable().unsat
+    assert (a & ~a).satisfiable().refuted
     limit = env.expr("user.tier == 'pro' ? 1000 : 10", int)
     assert limit.gt(500).equivalent(b).proved
-    assert limit.can_equal(10).sat
-    assert limit.can_equal(11).unsat
+    assert limit.can_equal(10).proved
+    assert limit.can_equal(11).refuted
     assert a != b  # == is syntactic identity, never a CEL comparison
     with pytest.raises(TypeError):
         bool(a)
@@ -251,14 +254,14 @@ def test_model_validation_downgrades_to_unknown() -> None:
 
 def test_strings_and_regex() -> None:
     env = Env(s=Annotated[str, Field(max_length=8)])
-    assert env.predicate("s.startsWith('ab') && s.endsWith('yz') && size(s) == 4").satisfiable().sat
-    assert env.predicate("s.matches('^[0-9]+$') && s.contains('x')").satisfiable().unsat
-    assert env.predicate("size(s) > 8").satisfiable().unsat
+    assert env.predicate("s.startsWith('ab') && s.endsWith('yz') && size(s) == 4").satisfiable().proved
+    assert env.predicate("s.matches('^[0-9]+$') && s.contains('x')").satisfiable().refuted
+    assert env.predicate("size(s) > 8").satisfiable().refuted
 
 
 def test_lists_bounded_by_max_length(env: Env) -> None:
     v = env.predicate("user.roles.all(r, r == 'a') && size(user.roles) > 10").satisfiable()
-    assert v.unsat
+    assert v.refuted
     assert not v.bounded
     unbounded = Env(xs=list[int])
     w = unbounded.predicate("xs.all(x, x > 0)").implies("xs.exists(x, x > 0) || size(xs) == 0")
@@ -266,7 +269,7 @@ def test_lists_bounded_by_max_length(env: Env) -> None:
     assert w.bounded
     assert "max_length" in (w.reason or "")
     # SAT witnesses are always real, even for unbounded lists
-    assert unbounded.predicate("xs.exists(x, x > 5)").satisfiable().sat
+    assert unbounded.predicate("xs.exists(x, x > 5)").satisfiable().proved
     bounded = Env(xs=Annotated[list[int], Field(max_length=4)])
     assert bounded.predicate("xs.all(x, x > 0)").implies("xs.exists(x, x > 0) || size(xs) == 0").proved
 
@@ -276,8 +279,8 @@ def test_nullable() -> None:
         nick: str | None = None
 
     env = Env(p=P)
-    assert env.predicate("p.nick == null").satisfiable().sat
-    assert env.predicate("p.nick != null && p.nick == 'bo'").satisfiable().sat
+    assert env.predicate("p.nick == null").satisfiable().proved
+    assert env.predicate("p.nick != null && p.nick == 'bo'").satisfiable().proved
     assert env.predicate("p.nick == null").evaluate({"p": P()}) is True
 
 
@@ -287,7 +290,7 @@ def test_dates() -> None:
     assert p.evaluate({"dob": dt.date(2000, 1, 1), "today": dt.date(2020, 1, 1)}) is True
     assert p.evaluate({"dob": dt.date(2002, 6, 1), "today": dt.date(2020, 1, 1)}) is False
     v = (p & env.predicate("today == date('2026-01-01')")).satisfiable()
-    assert v.sat
+    assert v.proved
     w = v.witness.to_python()
     assert isinstance(w["dob"], dt.date)
     assert w["dob"] <= dt.date(2008, 1, 1)
@@ -329,15 +332,17 @@ def test_ruleset(env: Env) -> None:
     )
     assert set(rs.unreachable()) == {"dead"}
     overlaps = rs.check_pairwise(lambda a, b: (a & b).satisfiable())
-    assert overlaps[("minor", "adult")].unsat
+    assert overlaps[("minor", "adult")].refuted
     assert rs.evaluate({"user": U(age=3)}) == {"minor": True, "adult": False, "dead": False}
 
 
 def test_diff(env: Env) -> None:
     old = env.predicate("user.age >= 18")
     new = env.predicate("user.age >= 21")
-    ws = old.diff(new, limit=3)
-    assert 1 <= len(ws) <= 3
+    ds = old.diff(new, limit=3)
+    assert 1 <= len(ds) <= 3
+    assert all(d.before is True and d.after is False for d in ds)
+    ws = [d.witness for d in ds]
     ages = {w["user"]["age"] for w in ws}
     assert all(18 <= a < 21 for a in ages)
     assert len(ages) == len(ws)
@@ -402,7 +407,7 @@ def test_limits_cap_evaluation_cost() -> None:
     with pytest.raises(CelEvaluationError, match="iteration limit"):
         p.evaluate({"xs": list(range(1, 100))})
     # limits survive extending the env
-    wider = env.extend(assumptions=["size(xs) >= 0"])
+    wider = env.assume("size(xs) >= 0")
     with pytest.raises(CelEvaluationError, match="iteration limit"):
         wider.predicate("xs.all(x, x > 0)").evaluate({"xs": list(range(1, 100))})
     with pytest.raises(ValueError, match="positive int"):
@@ -424,9 +429,9 @@ def test_has_is_false_for_null_fields() -> None:
     assert guarded.evaluate({"o": {"note": None}}) is False
     assert guarded.evaluate({"o": {"note": "xy"}}) is True
     # the prover agrees with the evaluator: the guard really guards
-    assert guarded.can_error().unsat
+    assert guarded.never_errors().proved
     assert env.predicate("has(o.note) == (o.note != null)").always_true().proved
-    assert env.predicate("o.note.startsWith('x')").can_error().sat
+    assert env.predicate("o.note.startsWith('x')").never_errors().refuted
 
 
 def test_dyn_values_get_an_honest_reason() -> None:
@@ -438,7 +443,7 @@ def test_dyn_values_get_an_honest_reason() -> None:
     env = Env(call=Call)
     with pytest.raises(CelTypeError, match="concrete type") as exc:
         env.predicate("call.args.amount > 5")
-    assert "1 error" in str(exc.value)  # the dyn value, not also the comparison
+    assert len(exc.value.diagnostics) == 1  # the dyn value, not also the comparison
     assert env.predicate("'amount' in call.args").evaluate({"call": {"args": {"amount": 9}}}) is True
 
 
@@ -448,5 +453,5 @@ def test_check_rule_names_the_runtime_failure() -> None:
     assert [p.kind for p in r.problems] == ["never_fires"]
     assert "evaluation fails (division by zero)" in str(r)
     r = env.check_rule("100 / n > 1")
-    assert [p.kind for p in r.problems] == ["can_error"]
+    assert [p.kind for p in r.problems] == ["may_error"]
     assert "evaluation fails (division by zero) when n = 0" in str(r)
