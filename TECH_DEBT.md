@@ -185,7 +185,12 @@ Remaining limits of those:
   (each extra character costs solver time). Facts about longer strings that depend on
   later characters may be UNKNOWN; counterexamples are always replayed, so never wrong.
 - A split inside a contract (`ensures`) reads a parameter with no declared length, so it
-  still uses `unroll_limit` slots and may overflow (UNKNOWN, never wrong).
+  still uses `unroll_limit` slots and may overflow (UNKNOWN, never wrong). Contract bodies
+  skip the size check (each use passes bounded arguments), but contracts aren't expanded at
+  the use, so nothing checks the split: `ensures="p.split(',').size() <= 40"` with an
+  argument of max_length 60 takes 10-20 s to come back UNKNOWN (review of M1).
+  *Fix:* carry the signature's constraints into the contract's variables and size-check the
+  body, or encode the contract's split with the argument's bound at the call.
 - Proofs and UNSATs about `int(t)` on an unbounded `t` often run to the timeout (Z3's
   `str.to_int` is weak); asserting `t ∈ [0-9]+` on success may help, unmeasured.
 - A review fuzz run saw one nested-split query run far past its timeout; not reproduced.

@@ -62,6 +62,16 @@ fn missing(cons: Option<&Constraints>) -> Option<String> {
     }
 }
 
+/// Constraints that hold of a value meeting either `a` or `b`: the larger length, and the
+/// join of the items. Everything else is dropped (no claim is safer than a wrong one).
+fn join(a: &Constraints, b: &Constraints) -> Constraints {
+    let items = match (&a.items, &b.items) {
+        (Some(x), Some(y)) => Some(Box::new(join(x, y))),
+        _ => None,
+    };
+    Constraints { max_length: a.max_length.zip(b.max_length).map(|(x, y)| x.max(y)), items, ..Default::default() }
+}
+
 impl<'a> Sizes<'a> {
     pub fn new(c: &'a CheckedExpr) -> Self {
         let mut s = Sizes { c, cons: HashMap::new(), accus: HashSet::new() };
@@ -91,7 +101,11 @@ impl<'a> Sizes<'a> {
             if let Some(v2) = &k.iter_var2 {
                 scope.push((v2.clone(), second, false));
             }
-            scope.push((k.accu_var.clone(), None, true));
+            // `cel.bind` (and an expanded definition) is a comprehension that never loops: its
+            // variable is its initial value
+            let binds = matches!(k.loop_condition.kind, ExprKind::Literal(Literal::Bool(false)));
+            let init = if binds { self.cons.get(&k.accu_init.id).cloned() } else { None };
+            scope.push((k.accu_var.clone(), init, true));
             for x in [&k.loop_condition, &k.loop_step, &k.result] {
                 self.visit(x, scope);
             }
@@ -145,8 +159,20 @@ impl<'a> Sizes<'a> {
                 Some(Constraints { max_length: Some(n), items: Some(Box::new(piece)), ..Default::default() })
             }
             // an optional's value is the value it wraps
-            ExprKind::Call { target: Some(t), function, .. } if matches!(function.as_str(), "value" | "orValue") => {
+            ExprKind::Call { target: Some(t), function, args } if function == "value" && args.is_empty() => {
                 matches!(self.c.type_of(t.id), CelType::Optional(_)).then(|| self.cons.get(&t.id).cloned()).flatten()
+            }
+            // ... or else the default: bounded by whichever is longer
+            ExprKind::Call { target: Some(t), function, args } if function == "orValue" => {
+                if !matches!(self.c.type_of(t.id), CelType::Optional(_)) {
+                    return None;
+                }
+                let [d] = args.as_slice() else { return None };
+                let default = match strip(self.c.type_of(d.id)) {
+                    CelType::String => Constraints { max_length: Some(self.str_len(d)?), ..Default::default() },
+                    _ => self.cons.get(&d.id)?.clone(),
+                };
+                Some(join(self.cons.get(&t.id)?, &default))
             }
             _ => None,
         }

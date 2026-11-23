@@ -292,3 +292,41 @@ def test_perl_classes_are_ascii_as_in_re2() -> None:
     # the verifier sees the same small classes, so these are in the subset and decided
     assert env.predicate(r"!s.matches('^\\d{3}$') || int(s) < 1000").always_true().proved
     assert env.predicate(r"s.matches('^[\\w-]+$') && s.contains('é')").satisfiable().refuted
+
+
+def test_or_value_bounds_its_result_by_the_default_too() -> None:
+    # review of M1: the bound of xs[?0].orValue(d) once ignored d, so a split of it was
+    # treated as shorter than it is and gave a false PROVED
+    one = Annotated[str, Field(max_length=1)]
+    env = Env(xs=Annotated[list[one], Field(max_length=3)])
+    for src in [
+        "xs[?0].orValue('a,b,c').split(',').size() < 3",
+        "[xs[?0].orValue('a,b,c,d')].join(';').split(',').size() < 3",
+    ]:
+        p = env.predicate(src)
+        v = p.always_true()
+        assert v.refuted, (src, v)
+        assert p.evaluate({"xs": []}) is False
+    assert (
+        env.predicate("xs.size() > 0 || xs[?0].orValue('a,b,c').split(',').size() == 3").always_true().proved
+    )
+
+
+def test_bound_and_defined_names_keep_their_bounds() -> None:
+    env = Env(t=Annotated[str, Field(max_length=3)])
+    assert env.predicate("cel.bind(p, t, p.split(',').size() < 5)").always_true().proved
+    f = env.define("f", "p.split(',').size() < 5", params={"p": str})
+    assert f.predicate("f(t)").always_true().proved
+
+
+def test_map_values_take_constraints() -> None:
+    one = Annotated[str, Field(max_length=1)]
+    env = Env(m=Annotated[dict[str, one], Field(max_length=4)])
+    assert env.predicate("!('k' in m) || m['k'].split(',').size() < 3").always_true().proved
+    with pytest.raises(ValueError, match="length"):
+        env.predicate("true").evaluate({"m": {"k": "long"}})
+
+
+def test_verbose_patterns_are_not_re2() -> None:
+    with pytest.raises(CelSubsetError, match="verbose"):
+        Env(s=Name).compile(r"s.matches('(?x)a\\sb')")

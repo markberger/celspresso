@@ -187,6 +187,26 @@ const MAX_CLASS_RANGES: usize = 16;
 /// Most copies nested repetitions may make of a subpattern (`(a{10}){10}` makes 100).
 const MAX_REPEAT: u32 = 1000;
 
+/// Whether `pattern` turns on the `x` flag, which RE2 doesn't have (and under which the
+/// ASCII rewrite of `\s`, a class holding a space, would change meaning).
+fn verbose_mode(pattern: &str) -> bool {
+    use regex_syntax::ast::{Ast, Flag, Flags, FlagsItemKind, GroupKind};
+    fn has_x(f: &Flags) -> bool {
+        f.items.iter().any(|i| matches!(i.kind, FlagsItemKind::Flag(Flag::IgnoreWhitespace)))
+    }
+    fn walk(a: &Ast) -> bool {
+        match a {
+            Ast::Flags(f) => has_x(&f.flags),
+            Ast::Group(g) => matches!(&g.kind, GroupKind::NonCapturing(f) if has_x(f)) || walk(&g.ast),
+            Ast::Repetition(r) => walk(&r.ast),
+            Ast::Alternation(x) => x.asts.iter().any(walk),
+            Ast::Concat(x) => x.asts.iter().any(walk),
+            _ => false,
+        }
+    }
+    regex_syntax::ast::parse::Parser::new().parse(pattern).is_ok_and(|a| walk(&a))
+}
+
 /// Whether the verifier translates a `matches` pattern exactly and solves it quickly; mirrors
 /// `zutil::translate_search`, which accepts only top-level `^` and `$` anchors.
 pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
@@ -194,6 +214,9 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
     let hir = regex_syntax::ParserBuilder::new().build().parse(pattern).map_err(|e| format!("invalid pattern: {e}"))?;
     if let Some(e) = celspresso_eval::validate::pattern_error(pattern) {
         return Err(e);
+    }
+    if verbose_mode(pattern) {
+        return Err("the x (verbose) flag is not RE2 syntax; write the pattern without it".into());
     }
     // `copies`: how many times the enclosing repetitions repeat this node
     fn walk(h: &Hir, copies: u32) -> Result<(), String> {

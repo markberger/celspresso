@@ -1320,9 +1320,12 @@ impl Encoder {
                         _ => (None, None),
                     };
                     // the length bound follows from the input constraints (when they're
-                    // assumed); stating it keeps uninterpreted parts (case mapping) inside it
+                    // assumed); stating it keeps uninterpreted parts (case mapping) inside it.
+                    // It is an overflow condition, not a fact: a solve rules it out, and an
+                    // answer stands only if no real input breaks it, so a static bound that
+                    // claims too much costs an UNKNOWN, never a wrong verdict
                     if let (Some(n), true) = (len, self.schema_constraints) {
-                        self.assumptions.push(s.length().le(ZInt::from_u64(n)));
+                        self.overflow.push(s.length().gt(ZInt::from_u64(n)));
                     }
                     let k = match pieces {
                         Some(n) if self.exact_splits => (n as usize).min(MAX_SLOTS),

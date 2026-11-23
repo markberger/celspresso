@@ -206,7 +206,12 @@ def lower(spec: TypeSpec, cons: dict[str, Any] | None) -> tuple[TypeSpec, dict[s
             out["items"] = ic
         return ("list", elem), (out or None)
     if kind == "map":
-        return ("map", lower(spec[1], None)[0], lower(spec[2], None)[0]), cons
+        vals, vc = lower(spec[2], (cons or {}).get("items"))
+        out = dict(cons or {})
+        out.pop("items", None)
+        if vc:
+            out["items"] = vc
+        return ("map", lower(spec[1], None)[0], vals), (out or None)
     return spec, cons
 
 
@@ -470,9 +475,12 @@ class SchemaBuilder:
             return ("list", elem)
         if origin in (dict, Mapping):
             k = self._convert(args[0], {}, f"{where} key") if args else "dyn"
-            v = self._convert(args[1], {}, f"{where} value") if args else "dyn"
+            val_cons: dict[str, Any] = {}
+            v = self._convert(args[1], val_cons, f"{where} value") if args else "dyn"
             _check_map_value(k, f"{where} key")
             _check_map_value(v, f"{where} value")
+            if val_cons:
+                cons["items"] = val_cons  # the constraints of every value
             return ("map", k, v)
         if tp in (list, tuple, set, frozenset):
             return ("list", "dyn")
@@ -610,9 +618,9 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
         else:
             raise bad("one_of with ints", "int or uint")
     if c.items is not None:
-        if kind != "list":
-            raise bad("items", "list")
-        _check_constraints(spec[1], c.items, f"{where}[]")
+        if kind not in ("list", "map"):
+            raise bad("items", "list or map")
+        _check_constraints(spec[-1], c.items, f"{where}[]")
 
 
 def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: str = "annotation") -> None:
