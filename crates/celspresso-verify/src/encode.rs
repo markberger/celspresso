@@ -1246,7 +1246,10 @@ impl Encoder {
                     [] => zutil::str_lit(""),
                     _ => return Some(Err("join() with this separator is not modeled".into())),
                 };
-                ok(Str(Self::join(slots, &sep)))
+                match Self::join(slots, &sep) {
+                    Some(r) => ok(Str(r)),
+                    None => Some(Err("join() over non-string elements is not modeled".into())),
+                }
             }
             ("split", [Str(s), Str(sep)]) => match zutil::str_value(sep) {
                 Some(t) if !t.is_empty() => ok(self.split(s, sep)),
@@ -1502,7 +1505,7 @@ impl Encoder {
         }
         let (lower_f, upper_f) = &*self.case_funcs.get_or_insert_with(|| {
             let s = Sort::string();
-            (FuncDecl::new("lowerAscii", &[&s], &s), FuncDecl::new("upperAscii", &[&s], &s))
+            (FuncDecl::new("lowerAscii!builtin", &[&s], &s), FuncDecl::new("upperAscii!builtin", &[&s], &s))
         });
         let app = |f: &FuncDecl, x: &ZStr| f.apply(&[x as &dyn Ast]).as_string().expect("string result");
         let (f, other) = if upper { (upper_f, lower_f) } else { (lower_f, upper_f) };
@@ -1531,16 +1534,16 @@ impl Encoder {
     }
 
     /// Live elements of `slots` joined by `sep` (liveness need not be a prefix: `filter`).
-    fn join(slots: &[(Bool, Sym)], sep: &ZStr) -> ZStr {
+    fn join(slots: &[(Bool, Sym)], sep: &ZStr) -> Option<ZStr> {
         let mut acc = zutil::str_lit("");
         let mut seen = ff();
         for (live, x) in slots {
-            let Sym::Str(x) = x else { continue };
+            let Sym::Str(x) = x else { return None };
             let next = seen.ite(&ZStr::concat(&[acc.clone(), sep.clone(), x.clone()]), x);
             acc = live.ite(&next, &acc);
             seen = or(&[&seen, live]);
         }
-        acc
+        Some(acc)
     }
 
     /// `s.split(sep)` for a non-empty `sep`: the pieces, in `unroll` slots, are the unique
@@ -1562,9 +1565,11 @@ impl Encoder {
             } else {
                 self.overflow.push(and(&[&live, &p.contains(sep)]));
             }
+            // unobservable, and pinning it keeps a split of a dead piece from "overflowing"
+            facts.push(live.not().implies(p.eq(zutil::str_lit(""))));
             slots.push((live, Sym::Str(p)));
         }
-        facts.push(Self::join(&slots, sep).eq(s));
+        facts.push(Self::join(&slots, sep).expect("string slots").eq(s));
         self.assumptions.push(and(&facts.iter().collect::<Vec<_>>()));
         Sym::List { slots, elem: CelType::String, trunc: false }
     }

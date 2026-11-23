@@ -106,17 +106,17 @@ fn goal(enc: &mut Encoder, q: &Query) -> Result<Bool, String> {
 }
 
 /// Whether the assumptions allow a value the encoding cut off at the unroll bound.
-fn overflows(enc: &Encoder, user: &[Bool], params: &Params) -> bool {
+/// Whether the assumptions (already asserted in `s`) allow a split with more pieces than
+/// its slots. Anything but a proof that they don't counts as yes.
+fn overflows(enc: &Encoder, s: &Solver) -> bool {
     if enc.overflow.is_empty() {
         return false;
     }
-    let s = Solver::new();
-    let _ = s.set_params(params);
-    for a in enc.assumptions.iter().chain(user) {
-        s.assert(a);
-    }
+    s.push();
     s.assert(or(&enc.overflow.iter().collect::<Vec<_>>()));
-    s.check() != SatResult::Unsat
+    let r = s.check();
+    let _ = s.pop(1);
+    r != SatResult::Unsat
 }
 
 fn unknown_reason(r: Option<String>) -> String {
@@ -177,7 +177,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
             }
             match s2.check() {
                 SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
-                _ if truncated || overflows(&enc, &user, &params) => {
+                _ if truncated || overflows(&enc, &s2) => {
                     bounded = true;
                     Status::Unknown(format!(
                         "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
@@ -456,6 +456,16 @@ fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, fu
     let base: Vec<Bool> = enc.assumptions.iter().chain(&user).cloned().chain([sv.err.not()]).collect();
     let mut reasons = Vec::new();
     let readable = ReadablePass::new(&enc.soft);
+    // a split with more pieces than slots makes every bound below a guess
+    let truncated = enc.bounded || {
+        let s = Solver::new();
+        let _ = s.set_params(&params);
+        for b in &base {
+            s.assert(b);
+        }
+        overflows(&enc, &s)
+    };
+    out.bounded = truncated;
     for maximize in [false, true] {
         let opt = Optimize::new();
         opt.set_params(&params).ok();
@@ -491,7 +501,7 @@ fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, fu
         let beyond = s.check();
         let _ = s.pop(1);
         let sound = match beyond {
-            SatResult::Unsat => !enc.bounded,
+            SatResult::Unsat => !truncated,
             SatResult::Sat => {
                 reasons
                     .push(format!("no {} bound: the expression is unbounded in this encoding", if maximize { "upper" } else { "lower" }));
@@ -523,7 +533,7 @@ fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, fu
             out.min = Some(ext);
         }
     }
-    if enc.bounded {
+    if truncated {
         reasons.push(format!(
             "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
             opts.unroll_limit

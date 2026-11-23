@@ -7,7 +7,7 @@ from typing import Annotated
 import pytest
 from pydantic import Field
 
-from celspresso import Env
+from celspresso import Env, function
 
 env = Env(
     s=Annotated[str, Field(max_length=12)],
@@ -24,7 +24,6 @@ env = Env(
     [
         "size(s.upperAscii()) == size(s)",
         "s.lowerAscii().lowerAscii() == s.lowerAscii()",
-        "s.upperAscii().lowerAscii() == s.lowerAscii()",
         "int(string(n)) == n",
         "size(string(n)) <= 20",
         "string(b) == 'true' || string(b) == 'false'",
@@ -78,3 +77,30 @@ def test_split_beyond_the_unroll_limit_is_unknown_not_proved() -> None:
     wide = Env(s=Annotated[str, Field(max_length=12)], unroll_limit=13)
     assert wide.predicate("s.split(',').size() <= 13").always_true().proved
     assert wide.predicate("s.split(',').size() <= 12").always_true().refuted
+
+
+def test_cross_case_mapping_is_proved() -> None:
+    slow = Env(s=Annotated[str, Field(max_length=12)], timeout=30.0)
+    assert slow.predicate("s.upperAscii().lowerAscii() == s.lowerAscii()").always_true().proved
+
+
+def test_bounds_of_a_split_beyond_the_slots_are_not_exact() -> None:
+    # 'a,b,c,d,e,f' has 6 pieces, more than the 5 slots
+    b = Env(t=str).expr("size(t.split(','))", int).bounds()
+    assert b.bounded
+    assert not (b.max and b.max.sound)
+
+
+def test_a_split_of_each_piece_is_proved_for_bounded_strings() -> None:
+    short = Env(s=Annotated[str, Field(max_length=3)])
+    v = short.predicate("s.split(',').all(p, p.split('a').size() <= 4)").always_true()
+    assert v.proved, v
+
+
+def test_host_functions_cannot_shadow_builtins_in_another_call_style() -> None:
+    @function(name="upperAscii", tabulate=False)
+    def ua(x: str) -> str:
+        return x + "!"
+
+    with pytest.raises(Exception, match="clashes"):
+        Env(s=str).extend(functions=[ua])

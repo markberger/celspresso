@@ -125,6 +125,11 @@ Remaining limits of those:
 - `split` uses `unroll_limit` slots. If the assumptions allow more pieces (an unbounded
   string, or `max_length` above the limit), a proof is UNKNOWN even when it holds for
   any number of pieces (`size(t.split(',')) >= 1`).
+- `split` always uses `unroll_limit` slots, even when `max_length` bounds the string;
+  sizing the slots from the bound (as list inputs do) would avoid raising the limit by hand.
+- Proofs and UNSATs about `int(t)` on an unbounded `t` often run to the timeout (Z3's
+  `str.to_int` is weak); asserting `t ∈ [0-9]+` on success may help, unmeasured.
+- A review fuzz run saw one nested-split query run far past its timeout; not reproduced.
 - *Fix:* `trim` via a regex over the whitespace class; `format` for constant format
   strings; lazy refinement of case-mapping axioms when a witness doesn't replay.
 - *Found:* claim-form walkthrough; partly fixed in the string-functions milestone.
