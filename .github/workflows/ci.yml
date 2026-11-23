@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # deps come from `uv sync --no-install-project`; the extension only from `maturin develop`,
+  # so `uv run` must not sync (that would build the Rust extension a second time)
+  UV_NO_SYNC: "1"
+
+jobs:
+  gate:
+    # Exactly what runs locally: lint, clippy, pyright, tests, coverage floors, the cel-spec
+    # conformance ratchet and the contract fuzzer. Keep this job a thin wrapper around check.sh.
+    name: gate (scripts/check.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.2  # pinned like the toolchain: upgrade deliberately
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # compiled dependencies stay valid when a test fails; keep them for the next run
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --group dev --locked --no-install-project
+      - run: scripts/check.sh  # builds the extension itself
+        env:
+          # z3-sys finds its prebuilt Z3 through the GitHub API; a token avoids the rate limit
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+
+  test:
+    # The Python tests on the oldest supported Python and on macOS.
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: macos-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --group dev --locked --no-install-project
+      - run: uv run maturin develop --release --quiet
+        env:
+          READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+      - run: uv run pytest -q
+
+  ci-ok:
+    # The one required check for merging: it stays named the same when the jobs above change.
+    name: ci-ok
+    if: always()
+    needs: [gate, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do [[ "$r" == "success" ]] || exit 1; done
