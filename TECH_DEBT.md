@@ -168,6 +168,9 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   UNKNOWN, so a question that needs about that long passes on a fast laptop and fails on a CI
   runner. `(b ? s : ' ').lowerAscii().upperAscii() <=> (b ? s : s).lowerAscii().upperAscii()`
   took 10.5 s locally, passed the local gate, failed CI's, and is now listed as known.
+  `ws.join('').startsWith(t.split(' ').join(' a1'))` (always_true) likewise: 0.8 s locally,
+  3 s then >12 s on CI's Linux runner, and 0.8-9 s locally under trivial rewrites (`true && `,
+  `(n == n) && `). split + join solve times are heavy-tailed (M1).
   *Fix:* give the gate a deterministic budget with Z3's `rlimit` (resource units) instead of
   wall-clock time, so a verdict is the same on any machine; keep the timeout as a backstop.
   *Found:* first CI run (PR #1).
