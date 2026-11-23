@@ -237,6 +237,8 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
 const DOUBLES: &str = "doubles are not part of celspresso's CEL subset (their arithmetic is slow to verify and rounds); \
      use ints or fixed-point numbers (T.fixed, or Decimal with decimal_places)";
 const BYTES: &str = "bytes values are not part of celspresso's CEL subset";
+const EMPTY_MAP: &str = "the empty map literal {} is not part of celspresso's CEL subset; \
+     test size(m) == 0 instead";
 const DYN: &str = "values of unknown type (dyn, or Any in Python) are not part of celspresso's CEL subset; \
      give the field, variable or function result a concrete type";
 
@@ -256,12 +258,67 @@ fn unmodeled(t: &CelType, schema: Option<&Schema>, seen: &mut Vec<String>) -> Op
     }
 }
 
+/// What a comparison of whole values of type `t` would compare that is outside the subset:
+/// doubles, bytes or dyn anywhere inside, struct fields included.
+fn compares_unmodeled(t: &CelType, schema: &Schema, seen: &mut Vec<String>) -> Option<&'static str> {
+    match t {
+        CelType::Dyn => Some(DYN),
+        CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) => compares_unmodeled(a, schema, seen),
+        CelType::Map(k, v) => compares_unmodeled(k, schema, seen).or_else(|| compares_unmodeled(v, schema, seen)),
+        CelType::Struct(n) if !seen.contains(n) => {
+            seen.push(n.clone());
+            schema.structs.get(n).and_then(|d| d.fields.iter().find_map(|f| compares_unmodeled(&f.ty, schema, seen)))
+        }
+        _ => unmodeled(t, None, &mut Vec::new()),
+    }
+}
+
+/// Idents bound by a comprehension whose type comes from somewhere already reported: the
+/// accumulator always (its init and step are checked), the iteration variables when the
+/// range is bad.
+fn derived_idents(c: &CheckedExpr) -> std::collections::HashSet<celspresso_syntax::ast::ExprId> {
+    fn collect(e: &Expr, names: &[&str], out: &mut std::collections::HashSet<celspresso_syntax::ast::ExprId>) {
+        match &e.kind {
+            ExprKind::Ident(n) if names.contains(&n.as_str()) => {
+                out.insert(e.id);
+            }
+            ExprKind::Comprehension(k) => {
+                collect(&k.iter_range, names, out);
+                collect(&k.accu_init, names, out);
+                // names rebound inside are a different variable
+                let bound = [Some(k.iter_var.as_str()), k.iter_var2.as_deref(), Some(k.accu_var.as_str())];
+                let inner: Vec<&str> = names.iter().copied().filter(|n| !bound.contains(&Some(*n))).collect();
+                for x in [&k.loop_condition, &k.loop_step, &k.result] {
+                    collect(x, &inner, out);
+                }
+            }
+            _ => children(e).into_iter().for_each(|k| collect(k, names, out)),
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    c.expr.walk(&mut |e: &Expr| {
+        if let ExprKind::Comprehension(k) = &e.kind {
+            let mut names = vec![k.accu_var.as_str()];
+            if bad(c, &k.iter_range).is_some() {
+                names.push(&k.iter_var);
+                names.extend(k.iter_var2.as_deref());
+            }
+            for x in [&k.loop_condition, &k.loop_step, &k.result] {
+                collect(x, &names, &mut out);
+            }
+        }
+    });
+    out
+}
+
 /// Why the value of `e` is outside the subset, if it is. A container of `dyn` only counts
 /// when written as a literal (`[1, 'a']`); a `dict[str, Any]` may be tested with `in`, and
 /// its values are caught where they are read out.
 fn bad(c: &CheckedExpr, e: &Expr) -> Option<&'static str> {
     let t = c.type_of(e.id);
-    if let Some(why) = unmodeled(t, None, &mut Vec::new()) {
+    let empty = matches!(&e.kind, ExprKind::List(v) if v.is_empty()) || matches!(&e.kind, ExprKind::Map(v) if v.is_empty());
+    // an empty literal takes its element type from context, which is reported where it comes from
+    if let Some(why) = unmodeled(t, None, &mut Vec::new()).filter(|_| !empty) {
         return Some(why);
     }
     let dyn_items = |t: &CelType| match t {
@@ -271,6 +328,8 @@ fn bad(c: &CheckedExpr, e: &Expr) -> Option<&'static str> {
     };
     match &e.kind {
         _ if matches!(t, CelType::Dyn) => Some(DYN),
+        _ if matches!(t, CelType::Optional(a) if matches!(**a, CelType::Dyn)) => Some(DYN),
+        ExprKind::Map(entries) if entries.is_empty() && dyn_items(t) => Some(EMPTY_MAP),
         ExprKind::List(items) if !items.is_empty() && dyn_items(t) => Some(DYN),
         ExprKind::Map(entries) if !entries.is_empty() && dyn_items(t) => Some(DYN),
         _ => None,
@@ -299,10 +358,11 @@ fn literal(e: &Expr) -> Option<&Literal> {
 /// Uses of CEL outside the subset, as (message, span), in source order.
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
     let mut out = Vec::new();
+    let derived = derived_idents(c);
     c.expr.walk(&mut |e: &Expr| {
         // report an unmodeled value where it originates, not at every expression it flows into
         if let Some(why) = bad(c, e) {
-            if !children(e).iter().any(|k| bad(c, k).is_some()) {
+            if !derived.contains(&e.id) && !children(e).iter().any(|k| bad(c, k).is_some()) {
                 out.push((why.to_string(), e.span));
             }
             return;
@@ -313,12 +373,22 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
         if all.iter().any(|a| bad(c, a).is_some()) {
             return;
         }
-        // comparing whole structs compares every field, including unread ones
-        if [ops::EQUALS, ops::NOT_EQUALS, ops::IN].contains(&function.as_str()) {
-            if let Some(why) = all.iter().find_map(|a| unmodeled(c.type_of(a.id), Some(&c.schema), &mut Vec::new())) {
-                out.push((format!("{why} (comparing these values compares every field; compare the fields you need)"), e.span));
-                return;
+        // comparing whole values compares everything inside, unread struct fields included
+        let compared: Vec<&CelType> = match (function.as_str(), all.as_slice()) {
+            (ops::EQUALS | ops::NOT_EQUALS, _) => all.iter().map(|a| c.type_of(a.id)).collect(),
+            (ops::IN, [x, coll]) => {
+                let elem = match c.type_of(coll.id) {
+                    CelType::List(a) => Some(&**a),
+                    CelType::Map(k, _) => Some(&**k),
+                    _ => None,
+                };
+                std::iter::once(c.type_of(x.id)).chain(elem).collect()
             }
+            _ => Vec::new(),
+        };
+        if let Some(why) = compared.iter().find_map(|t| compares_unmodeled(t, &c.schema, &mut Vec::new())) {
+            out.push((format!("{why} (this comparison looks at every element and field; compare the fields you need)"), e.span));
+            return;
         }
         let ids = match c.refs.get(&e.id) {
             Some(Reference::Function(ids)) => ids.clone(),
@@ -397,7 +467,8 @@ mod tests {
         }
         assert_eq!(outside("double(n) == double(n)").len(), 2);
         assert_eq!(outside("[1, 'a'][0] == 1").len(), 1);
-        assert!(outside("[] == xs && {} == {'a': n}").is_empty());
+        assert!(outside("[] == xs && size({'a': n}) == 1").is_empty());
+        assert!(outside("{}.size() == 0")[0].contains("size(m) == 0"));
     }
 
     #[test]

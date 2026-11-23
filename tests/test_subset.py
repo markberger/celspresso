@@ -230,3 +230,43 @@ def test_dyn_and_double_values_from_any_source_are_rejected(src: str, hint: str)
     with pytest.raises(CelTypeError, match=hint):
         env.compile(src)
     assert env.predicate("'k' in dm && size(dm) > 0").evaluate({"n": 0, "m": 0, "dm": {"k": 1}}) is True
+
+
+class Loose(BaseModel):
+    x: Any
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "1 in xs || !(1 in xs)",
+        "!(xs == [1]) || size(xs) > 0",
+        "!(dm == {'k': 1}) || 'k' in dm",
+        "!(dm.?k == optional.of(1)) || true",
+        "a == b",
+        "{}.size() == 0",
+    ],
+)
+def test_comparisons_that_reach_dyn_values_are_rejected(src: str) -> None:
+    env = Env(xs=Annotated[list[Any], Field(max_length=3)], dm=dict[str, Any], a=Loose, b=Loose)
+    with pytest.raises(CelTypeError, match=r"unknown type|size\(m\) == 0"):
+        env.compile(src)
+
+
+@pytest.mark.parametrize(
+    ("src", "errors"),
+    [
+        ("ds.filter(d, true).size() == 1", 1),
+        ("ns.map(y, double(y)).size() == 1", 1),
+        ("ds.exists(d, d > 1.0)", 2),
+    ],
+)
+def test_macros_report_each_bad_value_once(src: str, errors: int) -> None:
+    with pytest.raises(CelTypeError) as exc:
+        Env(ds=list[float], ns=list[int]).compile(src)
+    assert f"{errors} error" in str(exc.value)
+
+
+def test_macros_over_dyn_lists_still_catch_the_element() -> None:
+    with pytest.raises(CelTypeError, match="unknown type"):
+        Env(xs=Annotated[list[Any], Field(max_length=3)]).compile("xs.exists(q, q == 1)")

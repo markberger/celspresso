@@ -140,6 +140,8 @@ limit. Also:
 - `Env(d=float)` is accepted though every use of `d` is an error; it could fail at
   construction. `describe()` still lists such variables without saying so.
 - `o.?r` on an optional double field is rejected even when only `.hasValue()` is used.
+- `[n, null]` and `n > 0 ? 1 : null` type as dyn and are rejected, while `[p.nick, null]`
+  (a nullable field) is accepted; the checker could join int and null into `int?`.
 - The verifier answers UNSAT for `[1, 'a'][0] == 1` (heterogeneous list, true at
   runtime). The subset rejects it now, but the encoder bug remains for the Rust
   conformance path; fix it before allowing any dyn back in.
