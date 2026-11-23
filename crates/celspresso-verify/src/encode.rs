@@ -1324,17 +1324,23 @@ impl Encoder {
                     // It is an overflow condition, not a fact: a solve rules it out, and an
                     // answer stands only if no real input breaks it, so a static bound that
                     // claims too much costs an UNKNOWN, never a wrong verdict
-                    if let (Some(n), true) = (len, self.schema_constraints) {
-                        self.overflow.push(s.length().gt(ZInt::from_u64(n)));
-                    }
+                    let within = match (len, self.schema_constraints) {
+                        (Some(n), true) => {
+                            let within = s.length().le(ZInt::from_u64(n));
+                            self.overflow.push(within.not());
+                            Some(within)
+                        }
+                        _ => None,
+                    };
                     let k = match pieces {
                         Some(n) if self.exact_splits => (n as usize).min(MAX_SLOTS),
                         Some(n) => (n as usize).min(self.unroll),
                         None => self.unroll,
                     };
                     // with a slot for every possible piece the split can't overflow: saying so
-                    // spares the solver from rediscovering it (slowly, through string lengths)
-                    let exact = self.schema_constraints && pieces.is_some_and(|n| n as usize <= k);
+                    // spares the solver from rediscovering it (slowly, through string lengths).
+                    // That follows from the length bound, so it holds only within it
+                    let exact = within.filter(|_| pieces.is_some_and(|n| n as usize <= k));
                     ok(self.split(s, sep, k, exact))
                 }
                 _ => Some(Err("split() with an empty or non-constant separator is not modeled".into())),
@@ -1641,9 +1647,10 @@ impl Encoder {
 
     /// `s.split(sep)` for a non-empty `sep`: the pieces, in `k` slots, are the unique
     /// list whose join is `s` where each separator is the leftmost match after the previous
-    /// one. More pieces than slots is recorded in `overflow`, unless `exact` says `k` slots
-    /// hold every piece the split can have.
-    fn split(&mut self, s: &ZStr, sep: &ZStr, k: usize, exact: bool) -> Sym {
+    /// one. More pieces than slots is recorded in `overflow`, unless `exact` is the condition
+    /// (the string's length bound, itself an overflow condition) under which `k` slots hold
+    /// every piece the split can have.
+    fn split(&mut self, s: &ZStr, sep: &ZStr, k: usize, exact: Option<Bool>) -> Sym {
         let k = k.max(1);
         let n = ZInt::fresh_const("split#len");
         let mut facts = vec![int_range(&n, 1, k as i64)];
@@ -1654,8 +1661,11 @@ impl Encoder {
             let is_last = n.eq(ZInt::from_i64(i as i64 + 1));
             // a piece that is followed by a separator ends where the first match starts
             let first = zutil::str_index_of(&ZStr::concat(&[p.clone(), sep.clone()]), sep, &ZInt::from_i64(0)).eq(p.length());
-            if i + 1 < k || exact {
+            if i + 1 < k {
                 facts.push(live.implies(is_last.ite(&p.contains(sep).not(), &first)));
+            } else if let Some(within) = &exact {
+                // the last slot is the last piece of any string within the length bound
+                facts.push(and(&[within, &live]).implies(p.contains(sep).not()));
             } else {
                 self.overflow.push(and(&[&live, &p.contains(sep)]));
             }
