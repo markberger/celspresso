@@ -139,7 +139,7 @@ def test_optionals_and_presence_are_inside_the_subset() -> None:
 @pytest.mark.parametrize(
     ("src", "hint"),
     [
-        (r"s.matches(r'^\d{5}$')", "[0-9]"),
+        (r"s.matches(r'^\p{L}{5}$')", "[A-Za-z]"),
         ("s.matches('a(?=b)')", "invalid pattern"),
         ("s.matches('[')", "invalid"),
     ],
@@ -276,3 +276,19 @@ def test_macros_report_each_bad_value_once(src: str, errors: int) -> None:
 def test_macros_over_dyn_lists_still_catch_the_element() -> None:
     with pytest.raises(CelTypeError, match="unknown type"):
         Env(xs=Annotated[list[Any], Field(max_length=3)]).compile("xs.exists(q, q == 1)")
+
+
+def test_perl_classes_are_ascii_as_in_re2() -> None:
+    env = Env(s=Annotated[str, Field(max_length=6)])
+    # cel-go: '\d' is [0-9], '\w' is [0-9A-Za-z_], '\s' is [\t\n\f\r ]
+    for src, want in [
+        (r"'٣'.matches('\\d')", False),
+        (r"'7'.matches('\\d')", True),
+        (r"'é'.matches('^\\w$')", False),
+        (r"'é'.matches('^\\W$')", True),
+        ("' '.matches('\\\\s')", False),
+    ]:
+        assert env.predicate(src).evaluate({"s": ""}) is want, src
+    # the verifier sees the same small classes, so these are in the subset and decided
+    assert env.predicate(r"!s.matches('^\\d{3}$') || int(s) < 1000").always_true().proved
+    assert env.predicate(r"s.matches('^[\\w-]+$') && s.contains('é')").satisfiable().refuted

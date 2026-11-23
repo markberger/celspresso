@@ -613,10 +613,18 @@ impl Encoder {
                 SV { v: Sym::Struct { name: type_name.clone(), fields: out }, err: or(&errs.iter().collect::<Vec<_>>()) }
             }
             ExprKind::Comprehension(comp) => {
-                let range = self.enc(c, &comp.iter_range);
+                let mut range = self.enc(c, &comp.iter_range);
+                // iterating a null (a nullable list or map that is null) is an error
+                let range_v = match range.v.clone() {
+                    Sym::Nullable { is_null, inner } => {
+                        range.err = or(&[&range.err, &is_null]);
+                        *inner
+                    }
+                    v => v,
+                };
                 let two = comp.iter_var2.is_some();
                 // (live, first variable, second variable) per iteration
-                let (items, trunc): (Vec<(Bool, Sym, Option<Sym>)>, bool) = match range.v.clone() {
+                let (items, trunc): (Vec<(Bool, Sym, Option<Sym>)>, bool) = match range_v {
                     Sym::List { slots, trunc, .. } => {
                         let one = Int::from_i64(1);
                         let mut index = Int::from_i64(0);
@@ -1193,7 +1201,7 @@ impl Encoder {
                 let Some(pat) = zutil::str_value(p) else {
                     return Some(Err("matches() with a non-constant pattern".into()));
                 };
-                match zutil::translate_search(&pat) {
+                match zutil::translate_search(&celspresso_eval::re2::ascii_perl_classes(&pat)) {
                     Ok(re) => ok(Bool(s.regex_matches(&re))),
                     Err(why) => Some(Err(why)),
                 }

@@ -179,8 +179,9 @@ fn why(id: &str) -> &'static str {
     }
 }
 
-/// Most ranges a character class may have: Unicode classes (`\d`, `\w`, `\p{L}`) have
-/// dozens to hundreds and make Z3 crawl (`^\d{5}$` alone takes seconds).
+/// Most ranges a character class may have: Unicode classes (`\p{L}`, and Unicode `\d`
+/// before `re2::ascii_perl_classes` makes it `[0-9]`) have dozens to hundreds and make Z3
+/// crawl (Unicode `^\d{5}$` alone took seconds).
 const MAX_CLASS_RANGES: usize = 16;
 
 /// Most copies nested repetitions may make of a subpattern (`(a{10}){10}` makes 100).
@@ -203,8 +204,8 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
                     Class::Bytes(b) => b.ranges().len(),
                 };
                 if n > MAX_CLASS_RANGES {
-                    return Err("a large Unicode class (\\d, \\w, \\p{..}) is slow to \
-                                solve; spell out ASCII ranges such as [0-9] or [A-Za-z0-9_]"
+                    return Err("a large Unicode class such as \\p{L} is slow to solve; \
+                                spell out ASCII ranges such as [A-Za-z] or [0-9]"
                         .into());
                 }
                 Ok(())
@@ -452,7 +453,7 @@ fn builtin_violations(c: &CheckedExpr, e: &Expr, sizes: &Sizes, out: &mut Vec<(S
                 if !ok {
                     out.push((format!("'{}' needs {need} in celspresso's CEL subset", display_fn(function)), span));
                 } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
-                    if let Err(why) = pattern_in_profile(p) {
+                    if let Err(why) = pattern_in_profile(&celspresso_eval::re2::ascii_perl_classes(p)) {
                         out.push((format!("this pattern is outside celspresso's CEL subset: {why}"), span));
                     }
                 }
@@ -569,7 +570,7 @@ mod tests {
             ("t.split(s).size() == 1", "literal, non-empty separator"),
             ("t.split('').size() == 1", "literal, non-empty separator"),
             ("s.matches(s)", "literal pattern"),
-            ("s.matches(r'^\\d{5}$')", "[0-9]"),
+            ("s.matches(r'^\\p{L}{5}$')", "[A-Za-z]"),
             ("s.matches('a(?=b)')", "invalid pattern"),
             ("s.matches('[')", "invalid pattern"),
             ("s.matches('a\\\\bb')", "start and end"),

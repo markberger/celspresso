@@ -15,20 +15,6 @@ the validator and the Z3 encoding read them as such. The Pydantic path converts 
   ints through unconverted.
 - *Found:* review of `celspresso.schema` (M1).
 
-### Pydantic bounds on date, datetime and timedelta fields crash
-`Annotated[date, Field(ge=date(2020, 1, 1))]` raises `TypeError: float() argument must
-be ... not 'datetime.date'` while the Env is built. `_metadata_constraints` calls
-`float()` on every bound.
-- *Fix:* map temporal bounds to day numbers or epoch times in the encoding, or else reject
-  them with a clear message naming the field.
-
-### Constraints on top-level variables aren't checked against their type
-`Env(x=Annotated[str, annotated_types.Ge(3)])` is accepted. The bound is silently ignored
-by the prover. Struct fields (declared, or from an adapter) are checked by
-`_check_constraints`, but variables never go through it.
-- *Fix:* run `_check_constraints` on the result of `SchemaBuilder.convert` for variables,
-  `define` params and function signatures.
-
 ### Witnesses for Pydantic models with field aliases fail to decode
 `full_name: str = Field(alias="fullName")` gives UNKNOWN with "witness fails model
 validation", because `PydanticAdapter.decode` passes `model_validate` the field names.
@@ -106,12 +92,6 @@ first entry), which are exact only up to 2**53.
 - *Found:* M4 review.
 
 ## Verifier
-
-### Comprehensions over a nullable list are not modeled
-`s.c == null || s.c.all(x, x.startsWith('x'))` with `c: list(string)?` returns UNKNOWN,
-with "comprehension over this range is not yet modeled". The same comprehension over a
-non-nullable list works.
-- *Fix:* in the encoder, unwrap a nullable range under the guard that it isn't null.
 
 ### The subset leaves out some useful formatting builtins
 Every `Env` accepts only celspresso's CEL subset (`crates/celspresso-verify/src/subset.rs`): builtins are
@@ -194,14 +174,6 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
 - On strings with no `max_length` (the gate's unbounded pass): `math.least(s.indexOf('a') + n, m)`
   can't be shown error-free ("reached max unfolding": the index has no bound, so `+ n` might
   overflow as far as Z3 can tell).
-
-### `\d`, `\w`, `\s` and `\b` are Unicode-aware, unlike RE2
-CEL regexes are RE2, where the Perl classes are ASCII-only. The evaluator (`regex` crate)
-and the verifier (`regex-syntax`) both use Unicode classes, so they agree with each other
-but not with cel-go on non-ASCII input (`'٣'.matches('\\d')` is true here, false in cel-go).
-Fixing it would also make `\d` fast to verify (one range).
-- *Fix:* rewrite Perl classes to their ASCII forms in the regex AST before both the
-  evaluator and the verifier see them; add conformance-style tests.
 
 ### Some string functions are still not modeled
 `trim`, `replace`, `format`, `substring`-free `charAt` loops, `split` with a limit or an

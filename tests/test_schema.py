@@ -257,3 +257,31 @@ def test_a_class_and_a_declared_struct_with_equal_fields_are_different() -> None
     assert by_class.predicate("o.v > 1") != declared.predicate("o.v > 1")
     with pytest.raises(ValueError, match="different environments"):
         by_class.predicate("o.v > 1") & declared.predicate("o.v < 5")
+
+
+def test_constraints_on_variables_and_params_must_fit_their_type() -> None:
+    from typing import Annotated
+
+    import annotated_types as at
+
+    with pytest.raises(TypeError, match="x: a numeric bound applies to int"):
+        Env(x=Annotated[str, at.Ge(3)])
+    with pytest.raises(TypeError, match="x: a length applies to string"):
+        Env(x=Annotated[int, at.MaxLen(3)])
+    with pytest.raises(TypeError, match=r"f\(x\): a numeric bound"):
+        Env(n=int).define("f", "x + 1", params={"x": Annotated[str, at.Ge(1)]})
+
+
+def test_bounds_on_dates_and_durations_are_rejected_by_name() -> None:
+    import datetime as dt
+    from typing import Annotated
+
+    import pydantic
+
+    class P(pydantic.BaseModel):
+        born: Annotated[dt.date, pydantic.Field(ge=dt.date(2020, 1, 1))]
+
+    with pytest.raises(TypeError, match=r"P\.born: the bound ge=datetime\.date\(2020, 1, 1\)"):
+        Env(p=P)
+    with pytest.raises(TypeError, match=r"d: the bound le=.*assumption"):
+        Env(d=Annotated[dt.timedelta, pydantic.Field(le=dt.timedelta(days=3))])
