@@ -110,6 +110,22 @@ impl Sym {
         }
     }
 
+    /// Every string inside the value (through containers, structs and optionals).
+    pub fn str_leaves(&self, out: &mut Vec<ZStr>) {
+        match self {
+            Sym::Str(x) => out.push(x.clone()),
+            Sym::Nullable { inner, .. } => inner.str_leaves(out),
+            Sym::Optional { val, .. } => val.str_leaves(out),
+            Sym::List { slots, .. } => slots.iter().for_each(|(_, s)| s.str_leaves(out)),
+            Sym::Map { slots, .. } => slots.iter().for_each(|(_, k, v)| {
+                k.str_leaves(out);
+                v.str_leaves(out)
+            }),
+            Sym::Struct { fields, .. } => fields.values().for_each(|s| s.str_leaves(out)),
+            _ => {}
+        }
+    }
+
     pub fn as_bool(&self) -> Option<&Bool> {
         match self {
             Sym::Bool(b) => Some(b),

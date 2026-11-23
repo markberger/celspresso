@@ -131,3 +131,12 @@ def test_assumptions_about_split_pieces_cannot_hide_an_overflow() -> None:
     b = env.expr("t.split(',').map(p, p.contains(',') ? 1 / 0 : 1).size()", int).bounds()
     assert b.bounded
     assert not (b.max and b.max.sound)
+
+
+def test_splits_inside_a_comprehension_ignore_slots_that_dont_exist() -> None:
+    # dead list slots used to hold unbounded strings, so the split "overflowed" there and
+    # the extra-slot retries ended in a timeout
+    word = Annotated[str, Field(max_length=4)]
+    env = Env(ws=Annotated[list[word], Field(max_length=3)])
+    assert env.predicate("ws.all(w, w.split('-').size() <= 5)").always_true().proved
+    assert env.predicate("ws.all(w, w.split('-').size() <= 4)").always_true().refuted

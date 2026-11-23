@@ -153,14 +153,21 @@ const MAX_SPLIT_SLOTS: usize = 32;
 fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>) {
     // a split of a bounded string has boundedly many pieces: give it more slots until none
     // can overflow, rather than answering UNKNOWN at the unroll limit
+    let first = solve_once(q, assumptions, opts, funcs);
     let mut o = opts;
-    loop {
-        let (status, bounded, approximations, split_only) = solve_once(q, assumptions, o, funcs);
-        if !split_only || o.unroll_limit >= MAX_SPLIT_SLOTS {
-            return (status, bounded, approximations);
-        }
+    let mut split_only = first.3;
+    while split_only && o.unroll_limit < MAX_SPLIT_SLOTS {
         o.unroll_limit = (o.unroll_limit * 2).clamp(1, MAX_SPLIT_SLOTS);
+        let (status, bounded, approximations, again) = solve_once(q, assumptions, o, funcs);
+        match status {
+            // decided, or a real witness: done
+            Status::Found(_) | Status::NotFound => return (status, bounded, approximations),
+            // more slots made it harder (a timeout): the bounded answer is the better one
+            Status::Unknown(_) if !again => break,
+            Status::Unknown(_) => split_only = again,
+        }
     }
+    (first.0, first.1, first.2)
 }
 
 /// One solve. The last field is whether the answer was UNKNOWN only because a split might

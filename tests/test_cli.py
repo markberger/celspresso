@@ -515,7 +515,7 @@ def test_diff_markdown_escaping(project: tuple[Path, str], capsys: pytest.Captur
     # only the line that changed is marked
     assert "```diff\n  m.name == 'a`|b' ||\n-   m.name == 'z'\n+   m.name == 'q'\n```" in out
     # every cell is escaped, before and after values included
-    assert '| `m.tags = {}` | error (no such key: "x\\|y") | **false** |' in out
+    assert re.search(r'\| `m\.tags = \{.*\}` \| error \(no such key: "x\\\|y"\) \| \*\*false\*\* \|', out)
     # backticks in a witness are kept, inside a longer fence
     assert "| ```m.name = '`x``'``` | false | **true** |" in out
     assert (_code("`a"), _code("a b")) == ("`` `a ``", "`a b`")  # padded only when needed

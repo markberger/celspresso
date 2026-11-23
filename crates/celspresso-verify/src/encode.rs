@@ -125,6 +125,18 @@ impl Encoder {
         }
     }
 
+    /// A dead slot's value is never observed, and its schema constraints are guarded off, so
+    /// its strings are pinned to "": otherwise they are unbounded, and a split inside a
+    /// comprehension could "overflow" on a slot that doesn't exist.
+    fn pin_dead(&mut self, live: &Bool, vals: &[&Sym]) {
+        let mut strs = Vec::new();
+        vals.iter().for_each(|v| v.str_leaves(&mut strs));
+        if !strs.is_empty() {
+            let empty: Vec<Bool> = strs.iter().map(|x| x.eq(zutil::str_lit(""))).collect();
+            self.assumptions.push(live.not().implies(and(&empty.iter().collect::<Vec<_>>())));
+        }
+    }
+
     fn mk_input(&mut self, ty: &CelType, path: &str, cons: Option<&Constraints>, depth: usize) -> Sym {
         let cons = if self.schema_constraints { cons } else { None };
         match ty {
@@ -276,6 +288,7 @@ impl Encoder {
                     let from = self.assumptions.len();
                     let v = self.mk_input(elem, &format!("{path}[{i}]"), item_cons, depth + 1);
                     self.guard_since(from, &live);
+                    self.pin_dead(&live, &[&v]);
                     slots.push((live, v));
                 }
                 Sym::List { slots, elem: (**elem).clone(), trunc }
@@ -300,6 +313,7 @@ impl Encoder {
                     let k = self.mk_input(kt, &format!("{path}{{key{i}}}"), None, depth + 1);
                     let v = self.mk_input(vt, &format!("{path}{{val{i}}}"), val_cons, depth + 1);
                     self.guard_since(from, &live);
+                    self.pin_dead(&live, &[&k, &v]);
                     slots.push((live, k, v));
                 }
                 if let Some(d) = distinct_keys(&slots) {

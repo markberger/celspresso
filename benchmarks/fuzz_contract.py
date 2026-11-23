@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
-from celspresso import CelError, CelEvaluationError, Env, Status
+from celspresso import CelEvaluationError, CelSyntaxError, CelTypeError, Env, Status
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -273,7 +273,7 @@ def ask(env: Env, question: str, node: Node, other: Node | None, timeout: float)
             assert other is not None
             py = {"I": int, "S": str, "B": bool, "LI": list[int], "LS": list[str]}[node.ty]
             v = env.expr(src, py).equivalent(env.expr(other.text(), py), timeout=timeout)
-    except CelError as e:
+    except (CelSyntaxError, CelTypeError) as e:  # anything else raised while verifying fails the run
         return Outcome(question, shown, "REJECTED", 0.0, str(e).splitlines()[1] if "\n" in str(e) else str(e))
     ms = (time.perf_counter() - t0) * 1000
     status = v.status.name
@@ -391,6 +391,9 @@ def fuzz(
     for i in range(count):
         rng = random.Random(seed * 1_000_003 + i)
         g = Gen(rng)
+        # sampling and shrinking draw from their own stream: how many draws they make depends
+        # on which verdicts came back in time, and must not change the generated expressions
+        side = random.Random(~(seed * 1_000_003 + i))
         ty = rng.choice(["B", "B", "B", "I", "S", "LI"])
         node = g.gen(ty, depth)
         for q in QUESTIONS["B"] if ty == "B" else QUESTIONS["*"]:
@@ -404,13 +407,13 @@ def fuzz(
                 if out.status != "UNKNOWN":
                     out.detail = "SLOW"  # decided, but only with the longer limit
             if out.status in ("PROVED", "REFUTED", "SAT", "UNSAT"):
-                bad = contradicted(env, out, node, other, rng, samples)
+                bad = contradicted(env, out, node, other, side, samples)
                 if bad:
                     out.status, out.detail = "WRONG", bad
                 elif out.ms > budget_ms:
                     out.detail = "SLOW"
             elif out.status == "UNKNOWN" and not gate:
-                n2, o2 = shrink(env, out, node, other, g, timeout)
+                n2, o2 = shrink(env, out, node, other, Gen(side), timeout)
                 if n2 is not node:
                     out = Outcome(
                         q,
