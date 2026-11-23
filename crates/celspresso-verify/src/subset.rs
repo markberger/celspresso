@@ -6,6 +6,7 @@
 //! opaque or tabulated, which the user chose). The tiers come from probing every builtin:
 //! see `benchmarks/bench_strings.py` and TECH_DEBT.md ("The subset leaves out ...").
 
+use crate::sizes::{is_collection, Sizes};
 use celspresso_check::{display_fn, is_builtin, CelType, CheckedExpr, Reference, Schema};
 use celspresso_syntax::ast::{ops, Expr, ExprKind, Literal};
 use celspresso_syntax::Span;
@@ -357,8 +358,19 @@ fn literal(e: &Expr) -> Option<&Literal> {
 
 /// Uses of CEL outside the subset, as (message, span), in source order.
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
+    violations_in(c, true)
+}
+
+/// Like `violations`, but for a body whose parameters are bound at each use (a definition
+/// or a contract): their lengths are known only there, and each use is checked as a whole.
+pub fn violations_of_body(c: &CheckedExpr) -> Vec<(String, Span)> {
+    violations_in(c, false)
+}
+
+fn violations_in(c: &CheckedExpr, check_sizes: bool) -> Vec<(String, Span)> {
     let mut out = Vec::new();
     let derived = derived_idents(c);
+    let sizes = Sizes::new(c);
     c.expr.walk(&mut |e: &Expr| {
         // report an unmodeled value where it originates, not at every expression it flows into
         if let Some(why) = bad(c, e) {
@@ -367,6 +379,26 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
             }
             return;
         }
+        let before = out.len();
+        builtin_violations(c, e, &sizes, &mut out);
+        // a list or map past the encoded length can be refuted but never proved; report it
+        // where it originates, and not on top of an unsupported builtin
+        // (a value of unknown type inside is reported as that)
+        let t = c.type_of(e.id);
+        if check_sizes && out.len() == before && is_collection(t) && compares_unmodeled(t, &c.schema, &mut Vec::new()).is_none() {
+            if let Some(why) = sizes.unbounded(e) {
+                if !children(e).iter().any(|k| is_collection(c.type_of(k.id)) && sizes.unbounded(k).is_some()) {
+                    out.push((why, e.span));
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Builtins outside the subset (or used in ways outside it) at the call `e`.
+fn builtin_violations(c: &CheckedExpr, e: &Expr, sizes: &Sizes, out: &mut Vec<(String, Span)>) {
+    {
         let ExprKind::Call { target, function, args } = &e.kind else { return };
         let all: Vec<&Expr> = target.iter().map(|t| &**t).chain(args).collect();
         // an unmodeled operand is reported where it originates; one error is enough
@@ -389,6 +421,12 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
         if let Some(why) = compared.iter().find_map(|t| compares_unmodeled(t, &c.schema, &mut Vec::new())) {
             out.push((format!("{why} (this comparison looks at every element and field; compare the fields you need)"), e.span));
             return;
+        }
+        if matches!(function.as_str(), ops::EQUALS | ops::NOT_EQUALS | ops::IN) {
+            if let Some(why) = all.iter().find_map(|a| sizes.unbounded_inside(a)) {
+                out.push((format!("{why} (this comparison looks at every element and field; compare the fields you need)"), e.span));
+                return;
+            }
         }
         let ids = match c.refs.get(&e.id) {
             Some(Reference::Function(ids)) => ids.clone(),
@@ -422,8 +460,7 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
             }
             out.push((outside(function, why(id)), e.span));
         }
-    });
-    out
+    }
 }
 
 fn outside(function: &str, why: &str) -> String {
@@ -433,20 +470,32 @@ fn outside(function: &str, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celspresso_check::{check, CelType, Schema, VarDecl};
+    use celspresso_check::{check, CelType, Constraints, FieldDecl, Schema, StructDecl, VarDecl};
     use std::sync::Arc;
 
     fn outside(src: &str) -> Vec<String> {
         let mut s = Schema::with_stdlib();
-        for (n, t) in [
-            ("s", CelType::String),
-            ("n", CelType::Int),
-            ("d", CelType::Double),
-            ("xs", CelType::list(CelType::Int)),
-            ("at", CelType::Timestamp),
-            ("day", CelType::Date),
+        let max = |m: u64| Constraints { max_length: Some(m), ..Default::default() };
+        let tags = FieldDecl { name: "tags".into(), ty: CelType::list(CelType::String), constraints: Default::default() };
+        let id = FieldDecl { name: "id".into(), ty: CelType::Int, constraints: Default::default() };
+        s.structs.insert("O".into(), StructDecl { name: "O".into(), fields: vec![id, tags] });
+        for (n, t, c) in [
+            ("s", CelType::String, Default::default()),
+            ("n", CelType::Int, Default::default()),
+            ("d", CelType::Double, Default::default()),
+            ("xs", CelType::list(CelType::Int), max(4)),
+            ("ys", CelType::list(CelType::Int), Default::default()),
+            ("big", CelType::list(CelType::Int), max(1000)),
+            ("m", CelType::map(CelType::String, CelType::Int), Default::default()),
+            ("grid", CelType::list(CelType::list(CelType::Int)), max(3)),
+            ("os", CelType::list(CelType::Struct("O".into())), max(3)),
+            ("o", CelType::Struct("O".into()), Default::default()),
+            ("t", CelType::String, max(20)),
+            ("long", CelType::String, max(200)),
+            ("at", CelType::Timestamp, Default::default()),
+            ("day", CelType::Date, Default::default()),
         ] {
-            s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: Default::default() });
+            s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: c });
         }
         let checked = check(celspresso_syntax::parse(src).unwrap(), Arc::new(s)).unwrap();
         violations(&checked).into_iter().map(|(m, _)| m).collect()
@@ -493,7 +542,9 @@ mod tests {
             "(n < 10 ? '0' : '') + string(n) + '.' + string(n % 100)",
             "[s, 'x'].join(' ') == s + ' x' && int('12') == 12 && s.matches('^[0-9]+$')",
             r"s.matches(r'(?i)^[a-z]{2}\s*[0-9]{5}(-[0-9]{4})?$') && s.matches('.*') && s.matches('^(x+)?$')",
-            "s.split(',').size() > 1 && xs.all(x, x > 0) && xs.sum() < math.greatest(n, 3)",
+            "t.split(',').size() > 1 && xs.all(x, x > 0) && xs.sum() < math.greatest(n, 3)",
+            "(t + '-').split('-').size() > 1 && [1, 2].exists(x, x in xs + [n])",
+            "grid.size() < 2 && os.all(p, p.id > 0) && [xs, [1]].size() == 2 && o.id == 1",
             "at.getFullYear() == 2024 && at < timestamp('2025-01-01T00:00:00Z') && day.year() > 1900",
             "n * 2 < 10 && n < 3 ? 1u < 2u : -n < 7",
             "optional.of(s).orValue('') == s && {'a': n}['a'] == n",
@@ -515,8 +566,8 @@ mod tests {
             ("math.bitAnd(n, 3) == 1", "math function"),
             ("[3, 1].sort() == [1, 3]", "list function"),
             ("type(n) == int", "not part of celspresso's CEL subset"),
-            ("s.split(s).size() == 1", "literal, non-empty separator"),
-            ("s.split('').size() == 1", "literal, non-empty separator"),
+            ("t.split(s).size() == 1", "literal, non-empty separator"),
+            ("t.split('').size() == 1", "literal, non-empty separator"),
             ("s.matches(s)", "literal pattern"),
             ("s.matches(r'^\\d{5}$')", "[0-9]"),
             ("s.matches('a(?=b)')", "invalid pattern"),
@@ -525,6 +576,20 @@ mod tests {
             ("s.matches('a{2000}')", "repetition"),
             ("s.matches('^(a{100}){100}$')", "multiply"),
             ("timestamp(s) < at", "literal timestamp"),
+            ("ys.all(y, y > 0)", "'ys': it has no max_length"),
+            ("size(ys) > 10", "'ys': it has no max_length"),
+            ("1 in ys", "'ys'"),
+            ("'a' in m", "'m': it has no max_length"),
+            ("big.exists(x, x == 1)", "max_length 1000 is above 64"),
+            ("grid.all(r, r.size() < 9)", "'r': it has no max_length"),
+            ("grid[0][1] == 2", "'grid[..]': it has no max_length"),
+            ("os.exists(p, 'x' in p.tags)", "'p.tags'"),
+            ("o.tags.size() == 1", "'o.tags'"),
+            ("os.exists(p, p == o)", "field 'O.tags'"),
+            ("grid == [[1]]", "the items of 'grid'"),
+            ("s.split(',').size() == 1", "no max_length"),
+            ("long.split(',').size() == 1", "201 pieces"),
+            ("long.split(',,').size() == 1", "101 pieces"),
         ] {
             let errs = outside(src);
             assert!(!errs.is_empty(), "{src}");

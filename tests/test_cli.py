@@ -30,7 +30,7 @@ def flagged(cents: int) -> bool:
 
 class Item(BaseModel):
     name: str
-    tags: dict[str, int]
+    tags: Annotated[dict[str, int], Field(max_length=4)]
 
 env = Env(order=Order).extend(functions=[flagged])
 not_an_env = 3

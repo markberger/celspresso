@@ -20,7 +20,7 @@ ORDER = Struct(
         Field("status", T.string, Constraints(one_of=("new", "paid"))),
         Field("items", T.list(T.struct("shop.Item")), Constraints(max_length=3, items=None)),
         Field("note", T.nullable(T.string)),
-        Field("tags", T.map(T.string, T.int)),
+        Field("tags", T.map(T.string, T.int), Constraints(max_length=4)),
     ],
 )
 

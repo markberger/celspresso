@@ -19,6 +19,9 @@ pub struct Encoder {
     schema: Arc<Schema>,
     pub unroll: usize,
     pub schema_constraints: bool,
+    /// Give every split all the slots its static bound allows (for bounds(), which has no
+    /// retry), instead of starting at the unroll limit.
+    pub exact_splits: bool,
     /// Root variables (built lazily on first reference).
     pub vars: BTreeMap<String, Sym>,
     /// Facts about inputs: type ranges and schema constraints.
@@ -86,6 +89,7 @@ impl Encoder {
             schema,
             unroll,
             schema_constraints,
+            exact_splits: false,
             vars: BTreeMap::new(),
             assumptions: Vec::new(),
             soft: Vec::new(),
@@ -1296,7 +1300,32 @@ impl Encoder {
                 }
             }
             ("split", [Str(s), Str(sep)]) => match zutil::str_value(sep) {
-                Some(t) if !t.is_empty() => ok(self.split(s, sep)),
+                Some(t) if !t.is_empty() => {
+                    // the subset admits only splits with a static bound on their pieces and
+                    // length. Slots past the unroll limit are slow, so a solve starts there and
+                    // retries with more on an overflow; bounds() needs them all at once.
+                    let (pieces, len) = match &e.kind {
+                        ExprKind::Call { target: Some(t), args, .. } => {
+                            let sizes = crate::sizes::Sizes::new(c);
+                            (args.first().and_then(|sep| sizes.pieces(t, sep)), sizes.str_len(t))
+                        }
+                        _ => (None, None),
+                    };
+                    // the length bound follows from the input constraints (when they're
+                    // assumed); stating it keeps uninterpreted parts (case mapping) inside it
+                    if let (Some(n), true) = (len, self.schema_constraints) {
+                        self.assumptions.push(s.length().le(ZInt::from_u64(n)));
+                    }
+                    let k = match pieces {
+                        Some(n) if self.exact_splits => (n as usize).min(MAX_SLOTS),
+                        Some(n) => (n as usize).min(self.unroll),
+                        None => self.unroll,
+                    };
+                    // with a slot for every possible piece the split can't overflow: saying so
+                    // spares the solver from rediscovering it (slowly, through string lengths)
+                    let exact = self.schema_constraints && pieces.is_some_and(|n| n as usize <= k);
+                    ok(self.split(s, sep, k, exact))
+                }
                 _ => Some(Err("split() with an empty or non-constant separator is not modeled".into())),
             },
             ("year", [Date(d)]) => ok(Int(civil_from_days(d).0)),
@@ -1599,11 +1628,12 @@ impl Encoder {
         Some(acc)
     }
 
-    /// `s.split(sep)` for a non-empty `sep`: the pieces, in `unroll` slots, are the unique
+    /// `s.split(sep)` for a non-empty `sep`: the pieces, in `k` slots, are the unique
     /// list whose join is `s` where each separator is the leftmost match after the previous
-    /// one. More pieces than slots is recorded in `overflow`.
-    fn split(&mut self, s: &ZStr, sep: &ZStr) -> Sym {
-        let k = self.unroll.max(1);
+    /// one. More pieces than slots is recorded in `overflow`, unless `exact` says `k` slots
+    /// hold every piece the split can have.
+    fn split(&mut self, s: &ZStr, sep: &ZStr, k: usize, exact: bool) -> Sym {
+        let k = k.max(1);
         let n = ZInt::fresh_const("split#len");
         let mut facts = vec![int_range(&n, 1, k as i64)];
         let mut slots = Vec::with_capacity(k);
@@ -1613,7 +1643,7 @@ impl Encoder {
             let is_last = n.eq(ZInt::from_i64(i as i64 + 1));
             // a piece that is followed by a separator ends where the first match starts
             let first = zutil::str_index_of(&ZStr::concat(&[p.clone(), sep.clone()]), sep, &ZInt::from_i64(0)).eq(p.length());
-            if i + 1 < k {
+            if i + 1 < k || exact {
                 facts.push(live.implies(is_last.ite(&p.contains(sep).not(), &first)));
             } else {
                 self.overflow.push(and(&[&live, &p.contains(sep)]));

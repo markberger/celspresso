@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+from typing import Annotated
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from celspresso import CelEvaluationError, CelTypeError, Env
 from celspresso._types import cel_literal
+
+SmallMap = Annotated[dict[str, int], Field(max_length=4)]
 
 UTC = dt.timezone.utc
 
@@ -92,14 +95,14 @@ def test_extension_libraries() -> None:
 
 def test_namespaces_do_not_shadow_variables() -> None:
     # a variable named `math` keeps its meaning; math.greatest is then a field access
-    env = Env(math=dict[str, int])
+    env = Env(math=SmallMap)
     assert env.compile("math.greatest").evaluate({"math": {"greatest": 7}}) == 7
     with pytest.raises(CelTypeError):
         env.compile("math.greatest('a')")
 
 
 def test_optionals() -> None:
-    env = Env(m=dict[str, int])
+    env = Env(m=SmallMap)
     assert env.compile("m.?a.orValue(0)").evaluate({"m": {"a": 5}}) == 5
     assert env.compile("m.?b.orValue(0)").evaluate({"m": {}}) == 0
     assert env.compile("[?m.?a, ?m.?b, 3]").evaluate({"m": {"a": 1}}) == [1, 3]
@@ -115,11 +118,11 @@ def test_optionals() -> None:
 
 
 def test_the_verifier_reasons_about_optionals_and_maps() -> None:
-    env = Env(m=dict[str, int])
+    env = Env(m=SmallMap)
     v = env.predicate("m.?a.orValue(0) >= 0").always_true()
     assert v.refuted
     assert v.counterexample == {"m": {"a": -1}} or v.counterexample["m"]["a"] < 0
-    assert env.predicate("m.?a.orValue(1) >= 1 || m.a < 1").always_true().unknown  # m is unbounded
+    assert env.predicate("m.?a.orValue(1) >= 1 || m.a < 1").always_true().proved
 
 
 def test_block() -> None:

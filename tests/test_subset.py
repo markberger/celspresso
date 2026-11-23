@@ -126,7 +126,11 @@ class Person(BaseModel):
 
 
 def test_optionals_and_presence_are_inside_the_subset() -> None:
-    env = Env(p=Person, m=dict[str, int], xs=list[int])
+    env = Env(
+        p=Person,
+        m=Annotated[dict[str, int], Field(max_length=4)],
+        xs=Annotated[list[int], Field(max_length=4)],
+    )
     env.compile("p.?nick.orValue('') + string(m[?'k'].orValue(0)) + string(xs[?0].orValue(1))")
     env.compile("has(p.nick) && 'k' in m")
     env.compile("[?m[?'a'], 3] == [3] && {?'k': m[?'a']} == {}")
@@ -265,7 +269,7 @@ def test_comparisons_that_reach_dyn_values_are_rejected(src: str) -> None:
 )
 def test_macros_report_each_bad_value_once(src: str, errors: int) -> None:
     with pytest.raises(CelTypeError) as exc:
-        Env(ds=list[float], ns=list[int]).compile(src)
+        Env(ds=list[float], ns=Annotated[list[int], Field(max_length=3)]).compile(src)
     assert len(exc.value.diagnostics) == errors
 
 

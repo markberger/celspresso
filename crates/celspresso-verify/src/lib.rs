@@ -5,6 +5,7 @@
 //! (unless the encoding was bounded, in which case it degrades to `Unknown`).
 
 mod encode;
+pub mod sizes;
 pub mod subset;
 mod sym;
 mod zutil;
@@ -147,8 +148,9 @@ fn unknown_reason(r: Option<String>) -> String {
     }
 }
 
-/// Most split slots tried when only a split overflow stands between the query and an answer.
-const MAX_SPLIT_SLOTS: usize = 32;
+/// Most split slots tried when only a split overflow stands between the query and an answer:
+/// the most pieces the subset lets a split have, so the last retry is exact.
+const MAX_SPLIT_SLOTS: usize = sizes::MAX_PIECES as usize;
 
 fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>) {
     // a split of a bounded string has boundedly many pieces: give it more slots until none
@@ -486,6 +488,7 @@ pub fn bounds(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, func
 
 fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> BoundsOutcome {
     let mut enc = Encoder::new(e.schema.clone(), opts.unroll_limit, opts.schema_constraints);
+    enc.exact_splits = true;
     let sv = enc.encode(e);
     let (user, real) = encode_user(&mut enc, assumptions);
     let mut out = BoundsOutcome {

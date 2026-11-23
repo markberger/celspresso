@@ -96,7 +96,11 @@ def test_declared_struct_and_nullable_and_lists() -> None:
     item = Struct(
         "Item", [Field("cost", T.fixed(6, 2), Constraints(ge=0)), Field("tip", T.nullable(T.fixed(4, 1)))]
     )
-    env = Env(structs=[item], items=T.list(T.struct("Item")), costs=T.list(T.fixed(3, 0)))
+    env = Env(
+        structs=[item],
+        items=Annotated[T.list(T.struct("Item")), Constraints(max_length=4)],
+        costs=Annotated[T.list(T.fixed(3, 0)), Constraints(max_length=4)],
+    )
     data = {"items": [{"cost": Decimal("1.50"), "tip": None}, {"cost": Decimal(2), "tip": Decimal("0.5")}]}
     assert env.predicate("items.all(i, i.cost >= 150) && items[1].tip == 5").evaluate(data)
     assert env.predicate("costs.all(c, c <= 999)").evaluate({"costs": [Decimal(999)]})
@@ -278,7 +282,11 @@ def test_fixed_map_keys_are_rejected() -> None:
 
 def test_deeply_nested_unused_precision_and_extreme_bounds() -> None:
     ann = Annotated[int, PField(max_digits=5)]
-    assert Env(x=list[list[ann]]).predicate("size(x) == 1").evaluate({"x": [[1]]})
+    assert (
+        Env(x=Annotated[list[list[ann]], PField(max_length=2)])
+        .predicate("size(x) == 1")
+        .evaluate({"x": [[1]]})
+    )
     for b in (1e308, Decimal("1e999999"), Decimal("Infinity")):
         env = Env(x=Annotated[Decimal, PField(max_digits=4, decimal_places=2, le=b)])
         assert env.predicate("x <= 9999").always_true().proved

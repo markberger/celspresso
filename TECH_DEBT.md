@@ -191,9 +191,9 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   *Fix:* give the gate a deterministic budget with Z3's `rlimit` (resource units) instead of
   wall-clock time, so a verdict is the same on any machine; keep the timeout as a backstop.
   *Found:* first CI run (PR #1).
-- `bounds()` has neither the split retry nor the no-overflow assertion, so bounds of a
-  split are never marked sound: `s.split(',').size()` with max_length 8 gives an unproven
-  `[1, 5]` where the true max is 9 (review of the fuzzer milestone).
+- On strings with no `max_length` (the gate's unbounded pass): `math.least(s.indexOf('a') + n, m)`
+  can't be shown error-free ("reached max unfolding": the index has no bound, so `+ n` might
+  overflow as far as Z3 can tell).
 
 ### `\d`, `\w`, `\s` and `\b` are Unicode-aware, unlike RE2
 CEL regexes are RE2, where the Perl classes are ASCII-only. The evaluator (`regex` crate)
@@ -212,14 +212,8 @@ Remaining limits of those:
 - `lowerAscii`/`upperAscii` pin only the first 4 characters of a non-literal string
   (each extra character costs solver time). Facts about longer strings that depend on
   later characters may be UNKNOWN; counterexamples are always replayed, so never wrong.
-- `split` uses `unroll_limit` slots. If the assumptions allow more pieces (an unbounded
-  string, or `max_length` above the limit), a proof is UNKNOWN even when it holds for
-  any number of pieces (`size(t.split(',')) >= 1`).
-- `split` always uses `unroll_limit` slots, even when `max_length` bounds the string;
-  sizing the slots from the bound (as list inputs do) would avoid raising the limit by hand.
-- Overflow conditions are not guarded by whether a split is reached (an inactive
-  comprehension step, a filtered-out piece), and assumptions that read a split are left
-  out of the overflow check. Both only turn provable results into UNKNOWN.
+- A split inside a contract (`ensures`) reads a parameter with no declared length, so it
+  still uses `unroll_limit` slots and may overflow (UNKNOWN, never wrong).
 - Proofs and UNSATs about `int(t)` on an unbounded `t` often run to the timeout (Z3's
   `str.to_int` is weak); asserting `t ∈ [0-9]+` on success may help, unmeasured.
 - A review fuzz run saw one nested-split query run far past its timeout; not reproduced.

@@ -546,7 +546,15 @@ fn compile_err(kind: &str, src: &str, diags: Vec<(String, Span)>) -> PyErr {
 
 /// Reject uses of CEL outside celspresso's subset (what the verifier decides exactly and fast).
 fn in_subset(checked: &CheckedExpr, src: &str) -> PyResult<()> {
-    let outside = celspresso_verify::subset::violations(checked);
+    subset_result(celspresso_verify::subset::violations(checked), src)
+}
+
+/// `in_subset` for a body whose parameters are bound at each use (checked there, expanded).
+fn body_in_subset(checked: &CheckedExpr, src: &str) -> PyResult<()> {
+    subset_result(celspresso_verify::subset::violations_of_body(checked), src)
+}
+
+fn subset_result(outside: Vec<(String, Span)>, src: &str) -> PyResult<()> {
     if outside.is_empty() {
         Ok(())
     } else {
@@ -672,7 +680,7 @@ impl Core {
                 cs.vars.insert(n.clone(), VarDecl { name: n.clone(), ty: t, constraints: Constraints::default() });
             }
             let ensures = compile_source(&Arc::new(cs), &BTreeMap::new(), &src)?;
-            in_subset(&ensures, &src)?;
+            body_in_subset(&ensures, &src)?;
             if *ensures.output_type() != CelType::Bool {
                 return Err(PyValueError::new_err(format!("ensures for '{id}' must be a bool expression, not {}", ensures.output_type())));
             }
@@ -702,7 +710,7 @@ impl Core {
                         types.push(ty);
                     }
                     let checked = compile_source(&Arc::new(ds), &defmap, &src)?;
-                    in_subset(&checked, &src)?;
+                    body_in_subset(&checked, &src)?;
                     let result = checked.output_type().clone();
                     s.add_function(FunctionDecl {
                         name: name.clone(),

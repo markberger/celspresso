@@ -282,7 +282,9 @@ def test_option_names_as_variables() -> None:
     env = Env({"timeout": int, "unroll_limit": str}, timeout=2.0, flag=bool)
     assert env.variables == {"timeout": "int", "unroll_limit": "string", "flag": "bool"}
     assert env.predicate("timeout > 3 && flag").evaluate({"timeout": 5, "unroll_limit": "", "flag": True})
-    env2 = Env(x=int).extend({"functions": list[int], "assumptions": str}, unroll_limit=3)
+    env2 = Env(x=int).extend(
+        {"functions": Annotated[list[int], Field(max_length=3)], "assumptions": str}, unroll_limit=3
+    )
     assert env2.variables["functions"] == "list(int)"
     assert env2.predicate("size(functions) > 0").satisfiable().proved
 
@@ -488,7 +490,7 @@ class Inner:
 @dataclasses.dataclass
 class Outer:
     inner: Inner
-    items: list[Inner]
+    items: Annotated[list[Inner], Field(max_length=3)]
 
 
 def test_dataclass_with_nested_struct_roundtrip() -> None:

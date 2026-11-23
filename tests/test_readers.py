@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import pytest
 
@@ -103,7 +103,7 @@ def test_declared_structs_take_readers() -> None:
             Field("code", T.nullable(T.string), reader=lambda row: row.get("sku")),
         ],
     )
-    env = Env(structs=[item], items=T.list(T.struct("Item")))
+    env = Env(structs=[item], items=Annotated[T.list(T.struct("Item")), Constraints(max_length=8)])
     pred = env.predicate("items.all(i, i.qty > 0) && items.exists(i, i.code == 'A1')")
     assert pred.evaluate({"items": [{"QTY": 2, "sku": "A1"}, {"QTY": 1}]})
     # explain and RuleSet go through the same conversion
@@ -212,7 +212,7 @@ def test_envs_differing_only_in_readers_are_different() -> None:
 def test_reader_errors_name_the_field() -> None:
     env = Env(
         structs=[Struct("Item", [Field("qty", T.int, reader=lambda row: row.qty)])],
-        items=T.list(T.struct("Item")),
+        items=Annotated[T.list(T.struct("Item")), Constraints(max_length=8)],
     )
     with pytest.raises(AttributeError) as info:
         env.predicate("items.size() > 0").evaluate({"items": [{"qty": 1}]})
@@ -223,7 +223,7 @@ def test_readers_run_once_per_object_for_every_reachable_field() -> None:
     # the documented contract: conversion is eager, whatever the expression reads
     calls: list[int] = []
     item = Struct("Item", [Field("qty", T.int, reader=lambda row: calls.append(1) or row["QTY"])])
-    env = Env(structs=[item], items=T.list(T.struct("Item")), n=int)
+    env = Env(structs=[item], items=Annotated[T.list(T.struct("Item")), Constraints(max_length=8)], n=int)
     env.predicate("n > 0").evaluate({"items": [{"QTY": 1}, {"QTY": 2}], "n": 1})
     assert len(calls) == 2
 
