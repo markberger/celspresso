@@ -698,8 +698,15 @@ impl Core {
         Ok(Core { schema, defs: defmap })
     }
 
-    fn compile(&self, source: &str) -> PyResult<Program> {
+    #[pyo3(signature = (source, strict=false))]
+    fn compile(&self, source: &str, strict: bool) -> PyResult<Program> {
         let checked = compile_source(&self.schema, &self.defs, source)?;
+        if strict {
+            let outside = celspresso_verify::strict::violations(&checked);
+            if !outside.is_empty() {
+                return Err(compile_err("type", source, outside));
+            }
+        }
         Ok(Program { checked: Arc::new(checked), source: source.to_string() })
     }
 

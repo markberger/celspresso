@@ -1505,6 +1505,13 @@ impl Encoder {
         if let Some(v) = zutil::str_value(s) {
             return zutil::str_lit(&if upper { v.to_ascii_uppercase() } else { v.to_ascii_lowercase() });
         }
+        // case mapping is per character, so it distributes over concatenation (exactly)
+        if s.safe_decl().is_ok_and(|d| d.kind() == z3::DeclKind::SeqConcat) {
+            let parts: Vec<ZStr> = s.children().iter().filter_map(|c| c.as_string()).map(|c| self.ascii_case(upper, &c)).collect();
+            if parts.len() == s.num_children() {
+                return ZStr::concat(&parts);
+            }
+        }
         let (lower_f, upper_f) = &*self.case_funcs.get_or_insert_with(|| {
             let s = Sort::string();
             (FuncDecl::new("lowerAscii!builtin", &[&s], &s), FuncDecl::new("upperAscii!builtin", &[&s], &s))
@@ -1649,9 +1656,15 @@ fn trunc_divmod(a: &Int, b: &Int) -> (Int, Int) {
     let re = a.modulo(b);
     let zero = Int::from_i64(0);
     let adjust = and(&[&a.lt(&zero), &re.eq(&zero).not()]);
-    let step = b.gt(&zero).ite(&Int::from_i64(1), &Int::from_i64(-1));
+    // Z3's div/mod are Euclidean (0 <= mod < |b|); truncation differs only for a negative
+    // dividend with a remainder: q moves one step toward zero and r = mod - |b|, which keeps
+    // the encoding linear (no b * q) and, for constant b, free of sign tests on b
+    let (step, abs) = match b.as_i64() {
+        Some(c) => (Int::from_i64(c.signum()), Int::from_u64(c.unsigned_abs())),
+        None => (b.gt(&zero).ite(&Int::from_i64(1), &Int::from_i64(-1)), b.gt(&zero).ite(b, &-b)),
+    };
     let q = adjust.ite(&(&qe + &step), &qe);
-    let r = a - &(b * &q);
+    let r = adjust.ite(&(&re - &abs), &re);
     (q, r)
 }
 

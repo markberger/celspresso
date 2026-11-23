@@ -113,6 +113,21 @@ with "comprehension over this range is not yet modeled". The same comprehension 
 non-nullable list works.
 - *Fix:* in the encoder, unwrap a nullable range under the guard that it isn't null.
 
+### The strict profile leaves out some useful formatting builtins
+`Env` is strict by default (`crates/celspresso-verify/src/strict.rs`): builtins are
+allowed by overload id after probing, and everything else is a compile error. Left out
+for now but worth adding once modeled and measured: `trim`, `replace` and `format` with
+literal arguments, `string()` of dates, timestamps and durations, and `split` with a
+limit. Also:
+- Function `ensures` contracts and the CLI's rule files are compiled with the profile's
+  checks only where they go through `Env.compile`; contracts are not checked.
+- Doubles are allowed (arithmetic is exact but slower, ~350 ms for SAT on products);
+  `int(double)` and `string(double)` are not.
+- `ageOn` is allowed although satisfiability can take seconds; `string(int)` relating two
+  differently computed numbers can reach the timeout (see the cents benchmark case).
+- *Fix:* model the builtins above, measure with `benchmarks/bench_strings.py`, add their
+  ids to `ALLOWED` or `LITERAL_ARG`.
+
 ### Some string functions are still not modeled
 `trim`, `replace`, `format`, `substring`-free `charAt` loops, `split` with a limit or an
 empty or non-constant separator, `reverse` and `quote` return UNKNOWN ("depends on

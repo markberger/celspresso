@@ -32,7 +32,7 @@ T = TypeVar("T")
 ErrorMode = Literal["strict", "as_false"]
 Assumption = "str | Predicate"
 
-_OPTION_NAMES = ("timeout", "unroll_limit", "schema_constraints", "functions", "assumptions")
+_OPTION_NAMES = ("timeout", "unroll_limit", "schema_constraints", "strict", "functions", "assumptions")
 
 
 def _option_clash(name: str, value: Any) -> TypeError:
@@ -173,6 +173,12 @@ class Env:
 
     >>> Env({"timeout": int}, timeout=2.0).variables
     {'timeout': 'int'}
+
+    By default an Env is *strict*: expressions may use only the part of CEL the verifier
+    decides exactly and quickly (strings, ints, fixed-point numbers, dates, bounded lists
+    and maps, ...). Anything else (`sort`, bytes, time zones, `string(double)`, ...) is a
+    compile error that says why. `strict=False` accepts all of CEL for evaluation, at the
+    cost of UNKNOWN verdicts on what the verifier doesn't model.
     """
 
     def __init__(
@@ -183,6 +189,7 @@ class Env:
         timeout: float = 5.0,
         unroll_limit: int = 5,
         schema_constraints: bool = True,
+        strict: bool = True,
         debug_sample_proofs: int = 0,
         limits: Limits | None = None,
         structs: Iterable[Struct] = (),
@@ -190,6 +197,9 @@ class Env:
         **more_variables: Any,
     ) -> None:
         _check_options(timeout, unroll_limit, schema_constraints)
+        if not isinstance(strict, bool):
+            raise _option_clash("strict", strict)
+        self._strict = strict
         if (
             isinstance(debug_sample_proofs, bool)
             or not isinstance(debug_sample_proofs, int)
@@ -221,6 +231,7 @@ class Env:
         e._timeout = self._timeout
         e._unroll = self._unroll
         e._schema_constraints = self._schema_constraints
+        e._strict = self._strict
         e._sample = self._sample
         e._limits = self._limits
         e._builder = self._builder.copy()
@@ -366,7 +377,7 @@ class Env:
     def compile(self, source: str) -> Expr[Any]:
         """Compile CEL; returns a `Predicate` for bool expressions, `Expr` otherwise."""
         try:
-            prog = self._core.compile(source)
+            prog = self._core.compile(source, self._strict)
         except _core.CompileError as exc:
             _raise_compile(exc)
         if prog.output_type == "bool":

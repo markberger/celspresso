@@ -19,7 +19,7 @@ class Session(BaseModel):
     idle: dt.timedelta
 
 
-ENV = Env(s=Session, now=dt.datetime)
+ENV = Env(s=Session, now=dt.datetime, strict=False)  # the evaluator covers all of CEL
 SESSION = Session(started=dt.datetime(2026, 11, 21, 9, tzinfo=UTC), idle=dt.timedelta(minutes=3))
 
 

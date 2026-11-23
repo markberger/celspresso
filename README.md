@@ -171,6 +171,7 @@ Both commands take `--format markdown` (for a pull-request comment), `json`, or 
 
 - **Every counterexample is real.** It is replayed through the evaluator and validated by your Pydantic model before you see it.
 - **`UNKNOWN` can't be mistaken for an answer.** `bool(verdict)` raises, and `verdict.reason` names the timeout or the construct that isn't modeled yet.
+- **Expressions stay where the prover is exact and fast.** An `Env` is strict by default: it accepts strings, ints, fixed-point numbers, dates and timestamps, bounded lists and maps, regexes with literal patterns, and the conversions between them, and rejects at compile time what the prover can't decide exactly and quickly (`sort`, bytes, time zones, `string(double)`, ...), saying why and what to use instead. `Env(..., strict=False)` accepts all of CEL for evaluation; questions about the rest may come back `UNKNOWN`.
 - **The semantics are CEL's.** Integers are 64-bit with overflow errors, division truncates toward zero, and `&&` and `||` absorb errors. Your schema's `ge`, `le`, `max_length`, `Literal` and `Enum` become facts the prover relies on, and `evaluate()` rejects inputs that break them, so a rule never runs on data its proofs don't cover. For rules you didn't write, `Env(..., limits=Limits(max_cost=...))` caps evaluation cost.
 
 ## How it compares
