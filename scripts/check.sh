@@ -33,7 +33,7 @@ cargo run -q -p celspresso-conformance --release | tail -n 3
 
 if [[ "${1:-}" != "--fast" ]]; then
   step "contract fuzzer (fails on a wrong verdict or an UNKNOWN not in benchmarks/contract_known.txt)"
-  uv run python benchmarks/fuzz_contract.py --gate | tail -n 12
+  uv run python benchmarks/fuzz_contract.py --gate | tail -n 40
 
   step "rust tests + conformance coverage (floor ${RUST_LINE_FLOOR}% lines)"
   # unit tests and the cel-spec suite both count: the suite is the evaluator's main test

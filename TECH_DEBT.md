@@ -184,6 +184,13 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   giving false UNSAT/PROVED when a contract can't hold on such an argument. They are now
   guarded by the path condition (review round 2). Other lazily evaluated constructs, if
   any are added, must push a path condition too.
+- The gate depends on wall-clock time: a timeout is retried at 4x (12 s) before it counts as
+  UNKNOWN, so a question that needs about that long passes on a fast laptop and fails on a CI
+  runner. `(b ? s : ' ').lowerAscii().upperAscii() <=> (b ? s : s).lowerAscii().upperAscii()`
+  took 10.5 s locally, passed the local gate, failed CI's, and is now listed as known.
+  *Fix:* give the gate a deterministic budget with Z3's `rlimit` (resource units) instead of
+  wall-clock time, so a verdict is the same on any machine; keep the timeout as a backstop.
+  *Found:* first CI run (PR #1).
 - `bounds()` has neither the split retry nor the no-overflow assertion, so bounds of a
   split are never marked sound: `s.split(',').size()` with max_length 8 gives an unproven
   `[1, 5]` where the true max is 9 (review of the fuzzer milestone).
