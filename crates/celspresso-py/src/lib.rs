@@ -610,6 +610,23 @@ impl Core {
         for (name, t, c) in vars {
             s.vars.insert(name.clone(), VarDecl { name, ty: type_from_py(&t)?, constraints: constraints_from_py(c.as_ref())? });
         }
+        if strict {
+            // schema patterns are standing assumptions on every query, so they must be quick too
+            let fields = s.structs.values().flat_map(|d| d.fields.iter().map(move |f| (format!("{}.{}", d.name, f.name), &f.constraints)));
+            let vars = s.vars.values().map(|v| (v.name.clone(), &v.constraints));
+            for (name, mut c) in fields.chain(vars) {
+                // the field's own pattern, then its items' (list elements), and so on down
+                loop {
+                    if let Some(Err(why)) = c.pattern.as_deref().map(celspresso_verify::strict::pattern_in_profile) {
+                        return Err(PyValueError::new_err(format!("the pattern on '{name}' is outside the strict profile: {why}")));
+                    }
+                    match &c.items {
+                        Some(items) => c = items,
+                        None => break,
+                    }
+                }
+            }
+        }
         let mut contracts = Vec::new();
         for (name, id, receiver, params, result, ensures) in functions {
             let params = params.iter().map(type_from_py).collect::<PyResult<Vec<_>>>()?;

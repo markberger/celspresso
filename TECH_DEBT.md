@@ -119,8 +119,15 @@ allowed by overload id after probing, and everything else is a compile error. Le
 for now but worth adding once modeled and measured: `trim`, `replace` and `format` with
 literal arguments, `string()` of dates, timestamps and durations, and `split` with a
 limit. Also:
-- Function `ensures` contracts and the CLI's rule files are compiled with the profile's
-  checks only where they go through `Env.compile`; contracts are not checked.
+- Errors in a definition, `ensures` contract or assumption say "1 error in CEL
+  expression" without naming which definition or contract it was.
+- A rule file with a `vars` table is always strict, but the error suggests strict=False,
+  which a rule file can't express (only `env = "module:attr"` can).
+- Host functions returning bytes are accepted; their verdicts are UNKNOWN (opaque).
+- Fixed-offset time zones (`at.getHours('+01:00')`) are modeled exactly but rejected
+  with every `*_with_tz` overload; a literal fixed offset could be allowed.
+- `matches('^foo$|^bar$')` (anchors inside a top-level alternation) is rejected by both
+  the profile and the translator; translating branch by branch would accept it.
 - Doubles are allowed (arithmetic is exact but slower, ~350 ms for SAT on products);
   `int(double)` and `string(double)` are not.
 - `ageOn` is allowed although satisfiability can take seconds; `string(int)` relating two
@@ -133,6 +140,19 @@ limit. Also:
   past the 5 s timeout, so the solver timeout isn't always honored either).
 - *Fix:* model the builtins above, measure with `benchmarks/bench_strings.py`, add their
   ids to `ALLOWED` or `LITERAL_ARG`.
+
+### Simple in-profile string questions still time out
+The profile promises fast, exact answers, but these come back UNKNOWN at the 5 s timeout
+(second strict-profile review):
+- Fixed-count regex repetition with a literal `contains`/`indexOf`/`split`:
+  `s.matches('^[a-z]{12}$') && !s.contains('q')`. The same fact as `!s.matches('q')`
+  takes 0.1 s, so the encoding of `contains` with a literal needle is at fault.
+- Concatenated `string(int)`s: `string(n) + '-' + string(k) == '12-3'` with n, k in
+  [0, 99]; date formatting from accessors; `xs.map(x, x.upperAscii()).join(',')`.
+- `s.upperAscii() == 'ABCDEFGH'` (case mapping is exact for 4 characters only).
+- *Fix:* encode literal-needle `contains`/`startsWith`/`endsWith` as regex membership;
+  digit-count lemmas or explicit digits for bounded ints; exact bounded case mapping
+  (or allow case mapping only within `max_length` ≤ 4). Track with the rewrite corpus.
 
 ### `\d`, `\w`, `\s` and `\b` are Unicode-aware, unlike RE2
 CEL regexes are RE2, where the Perl classes are ASCII-only. The evaluator (`regex` crate)

@@ -5,7 +5,7 @@
 //! opaque or tabulated, which the user chose). The tiers come from probing every builtin:
 //! see `benchmarks/bench_strings.py` and TECH_DEBT.md ("Strict profile").
 
-use celspresso_check::{display_fn, is_builtin, CelType, CheckedExpr, Reference};
+use celspresso_check::{display_fn, is_builtin, CelType, CheckedExpr, Reference, Schema};
 use celspresso_syntax::ast::{ops, Expr, ExprKind, Literal};
 use celspresso_syntax::Span;
 
@@ -156,10 +156,12 @@ fn is_comparison(id: &str) -> bool {
     rest.is_some_and(|t| COMPARED.contains(&t))
 }
 
-/// A builtin overload, as opposed to a host function. Users can't declare operator or
-/// internal names, so overloads the checker synthesizes for those count as builtins too.
+/// A builtin overload, as opposed to a host function. Operator and internal names (`_+_`,
+/// `_?._`, `@in`) contain characters no declared function name can, so overloads the checker
+/// synthesizes for those count as builtins too.
 fn builtin(function: &str, id: &str) -> bool {
-    is_builtin(function, id) || function.starts_with('_') || function.starts_with('@')
+    let internal = !function.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.');
+    is_builtin(function, id) || internal
 }
 
 /// Modeled internal calls the checker records without an overload id.
@@ -193,12 +195,19 @@ fn why(id: &str) -> &'static str {
 /// dozens to hundreds and make Z3 crawl (`^\d{5}$` alone takes seconds).
 const MAX_CLASS_RANGES: usize = 16;
 
+/// Most copies nested repetitions may make of a subpattern (`(a{10}){10}` makes 100).
+const MAX_REPEAT: u32 = 1000;
+
 /// Whether the verifier translates a `matches` pattern exactly and solves it quickly; mirrors
 /// `zutil::translate_search`, which accepts only top-level `^` and `$` anchors.
 pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
     use regex_syntax::hir::{Class, Hir, HirKind, Look};
     let hir = regex_syntax::ParserBuilder::new().build().parse(pattern).map_err(|e| format!("invalid pattern: {e}"))?;
-    fn walk(h: &Hir) -> Result<(), String> {
+    if let Some(e) = celspresso_eval::validate::pattern_error(pattern) {
+        return Err(e);
+    }
+    // `copies`: how many times the enclosing repetitions repeat this node
+    fn walk(h: &Hir, copies: u32) -> Result<(), String> {
         match h.kind() {
             HirKind::Class(c) => {
                 let n = match c {
@@ -213,10 +222,15 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
                 Ok(())
             }
             HirKind::Look(_) => Err("anchors and word boundaries are allowed only at the start and end".into()),
-            HirKind::Repetition(r) if r.max.unwrap_or(r.min) > 1000 => Err("a repetition bound above 1000".into()),
-            HirKind::Repetition(r) => walk(&r.sub),
-            HirKind::Capture(c) => walk(&c.sub),
-            HirKind::Concat(xs) | HirKind::Alternation(xs) => xs.iter().try_for_each(walk),
+            HirKind::Repetition(r) => {
+                let copies = copies.saturating_mul(r.max.unwrap_or(r.min).max(1));
+                if copies > MAX_REPEAT {
+                    return Err(format!("repetition bounds multiply to more than {MAX_REPEAT}"));
+                }
+                walk(&r.sub, copies)
+            }
+            HirKind::Capture(c) => walk(&c.sub, copies),
+            HirKind::Concat(xs) | HirKind::Alternation(xs) => xs.iter().try_for_each(|x| walk(x, copies)),
             HirKind::Empty | HirKind::Literal(_) => Ok(()),
         }
     }
@@ -230,14 +244,19 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
     if matches!(parts.last().map(|h| h.kind()), Some(HirKind::Look(Look::End))) {
         parts.pop();
     }
-    parts.iter().try_for_each(walk)
+    parts.iter().try_for_each(|p| walk(p, 1))
 }
 
-fn has_bytes(t: &CelType) -> bool {
+/// Whether a value of type `t` can hold bytes, looking through containers and struct fields.
+fn has_bytes(t: &CelType, schema: &Schema, seen: &mut Vec<String>) -> bool {
     match t {
         CelType::Bytes => true,
-        CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) | CelType::Type(a) => has_bytes(a),
-        CelType::Map(k, v) => has_bytes(k) || has_bytes(v),
+        CelType::List(a) | CelType::Nullable(a) | CelType::Optional(a) | CelType::Type(a) => has_bytes(a, schema, seen),
+        CelType::Map(k, v) => has_bytes(k, schema, seen) || has_bytes(v, schema, seen),
+        CelType::Struct(n) if !seen.contains(n) => {
+            seen.push(n.clone());
+            schema.structs.get(n).is_some_and(|d| d.fields.iter().any(|f| has_bytes(&f.ty, schema, seen)))
+        }
         _ => false,
     }
 }
@@ -251,10 +270,19 @@ fn literal(e: &Expr) -> Option<&Literal> {
 
 /// Uses of CEL outside the strict profile, as (message, span), in source order.
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
+    // a struct only read through (`p.name`) is fine even if another field holds bytes
+    let mut read_through = std::collections::HashSet::new();
+    c.expr.walk(&mut |e: &Expr| {
+        if let ExprKind::Select { operand, test_only: false, .. } = &e.kind {
+            read_through.insert(operand.id);
+        }
+    });
     let mut out = Vec::new();
     c.expr.walk(&mut |e: &Expr| match &e.kind {
         // values enter through literals, variables and fields; flagging those covers every use
-        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Select { .. } if has_bytes(c.type_of(e.id)) => {
+        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Select { .. }
+            if !read_through.contains(&e.id) && has_bytes(c.type_of(e.id), &c.schema, &mut Vec::new()) =>
+        {
             out.push(("bytes values are outside the strict profile: bytes are not modeled".to_string(), e.span));
         }
         ExprKind::Call { target, function, args } => {
@@ -278,11 +306,13 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
                         Literal::String(s) => !(s.is_empty() && *id == "string_split_string"),
                         _ => false,
                     });
+                    // point at the argument that has to change
+                    let span = all.get(*at).map_or(e.span, |a| a.span);
                     if !ok {
-                        out.push((format!("'{}' needs {need} in the strict profile", display_fn(function)), e.span));
+                        out.push((format!("'{}' needs {need} in the strict profile", display_fn(function)), span));
                     } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
                         if let Err(why) = pattern_in_profile(p) {
-                            out.push((format!("this pattern is outside the strict profile: {why}"), e.span));
+                            out.push((format!("this pattern is outside the strict profile: {why}"), span));
                         }
                     }
                     continue;
@@ -373,6 +403,7 @@ mod tests {
             ("s.matches('[')", "invalid pattern"),
             ("s.matches('a\\\\bb')", "start and end"),
             ("s.matches('a{2000}')", "repetition"),
+            ("s.matches('^(a{100}){100}$')", "multiply"),
             ("timestamp(s) < at", "literal timestamp"),
         ] {
             let errs = outside(src);

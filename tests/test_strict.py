@@ -139,3 +139,38 @@ def test_patterns_must_be_ones_the_verifier_solves_quickly(src: str, hint: str) 
     with pytest.raises(CelTypeError, match="pattern") as exc:
         Env(s=Name).compile(src)
     assert hint in str(exc.value)
+
+
+class Pair(BaseModel):
+    data: bytes
+    name: str
+
+
+def test_structs_holding_bytes_are_outside_the_profile() -> None:
+    with pytest.raises(CelTypeError, match="bytes values"):
+        Env(p=Pair, q=Pair).compile("p.name != q.name || p == q")
+    Env(p=Pair).compile("p.name == 'x'")  # reading other fields is fine
+
+
+def test_host_functions_may_start_with_an_underscore() -> None:
+    @function
+    def _clean(x: str) -> str:
+        return x.strip()
+
+    assert Env(s=Name).extend(functions=[_clean]).predicate("_clean(s) == s").evaluate({"s": "a"}) is True
+
+
+def test_schema_patterns_must_be_in_the_profile() -> None:
+    slow = Annotated[str, Field(pattern=r"^\w+@\w+$", max_length=20)]
+    with pytest.raises(ValueError, match="pattern on 'z' is outside the strict profile"):
+        Env(z=slow)
+    Env(z=slow, strict=False)
+    with pytest.raises(ValueError, match="pattern on 'zs'"):
+        Env(zs=list[slow])
+    Env(z=Annotated[str, Field(pattern=r"^[A-Za-z0-9_]+@[a-z]+$", max_length=20)])
+
+
+def test_pattern_errors_point_at_the_pattern() -> None:
+    with pytest.raises(CelTypeError) as exc:
+        Env(s=Name).compile("s.matches('[')")
+    assert "\n  |           ^^^" in str(exc.value)

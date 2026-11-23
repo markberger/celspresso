@@ -117,6 +117,8 @@ fn tr(h: &Hir) -> Result<Regexp, String> {
             let rs: Vec<Regexp> = c.ranges().iter().filter_map(|r| re_range(r.start() as u32, r.end() as u32)).collect();
             if rs.is_empty() {
                 Regexp::empty()
+            } else if rs.len() == 1 {
+                rs.into_iter().next().unwrap()
             } else {
                 Regexp::union(&rs)
             }
