@@ -164,6 +164,22 @@ The profile promises fast, exact answers, but these come back UNKNOWN at the 5 s
   digit-count lemmas or explicit digits for bounded ints; exact bounded case mapping
   (or allow case mapping only within `max_length` ≤ 4). Track with the rewrite corpus.
 
+### The contract fuzzer's known UNKNOWNs
+`benchmarks/fuzz_contract.py --gate` (full `check.sh`) lists the in-subset questions that are
+still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Current causes:
+- split + join of a string longer than ~4 characters: even `s.split(' ').join('')`
+  equivalent to itself times out (max_length 6: >10 s at any slot count; 4: 1.9 s at 5
+  slots, 8.4 s at 8). Each side gets its own split encoding.
+- case mapping beyond 4 characters (above), and `lowerAscii`/`upperAscii` under
+  `contains`/`endsWith`/`matches`, which also make up most of the fuzzer's slow verdicts.
+- *Fix:* encode structurally identical subexpressions once (hash-cons by canonical AST
+  under the same bindings), so `a <=> a` and shared subterms are free; a cheaper split
+  encoding for a literal one-character separator; the case-mapping fix above.
+- *Found:* contract fuzzer (fuzzer milestone). The fuzzer also found that split used
+  `unroll_limit` slots on bounded strings (now grown up to 32 slots until no overflow is
+  possible) and that overflowing split models gave witnesses that never replayed (now
+  excluded from the solve).
+
 ### `\d`, `\w`, `\s` and `\b` are Unicode-aware, unlike RE2
 CEL regexes are RE2, where the Perl classes are ASCII-only. The evaluator (`regex` crate)
 and the verifier (`regex-syntax`) both use Unicode classes, so they agree with each other

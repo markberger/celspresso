@@ -147,7 +147,25 @@ fn unknown_reason(r: Option<String>) -> String {
     }
 }
 
+/// Most split slots tried when only a split overflow stands between the query and an answer.
+const MAX_SPLIT_SLOTS: usize = 32;
+
 fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>) {
+    // a split of a bounded string has boundedly many pieces: give it more slots until none
+    // can overflow, rather than answering UNKNOWN at the unroll limit
+    let mut o = opts;
+    loop {
+        let (status, bounded, approximations, split_only) = solve_once(q, assumptions, o, funcs);
+        if !split_only || o.unroll_limit >= MAX_SPLIT_SLOTS {
+            return (status, bounded, approximations);
+        }
+        o.unroll_limit = (o.unroll_limit * 2).clamp(1, MAX_SPLIT_SLOTS);
+    }
+}
+
+/// One solve. The last field is whether the answer was UNKNOWN only because a split might
+/// have more pieces than its slots (no list was truncated), so more slots could decide it.
+fn solve_once(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>, bool) {
     let schema = match q {
         Query::Satisfiable(e) | Query::AlwaysTrue(e) | Query::CanError(e) | Query::Implies(e, _) | Query::Equivalent(e, _, _) => {
             e.schema.clone()
@@ -156,9 +174,10 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
     let mut enc = Encoder::new(schema, opts.unroll_limit, opts.schema_constraints);
     let g = match goal(&mut enc, q) {
         Ok(g) => g,
-        Err(why) => return (Status::Unknown(why), false, vec![]),
+        Err(why) => return (Status::Unknown(why), false, vec![], false),
     };
     let (user, real) = encode_user(&mut enc, assumptions);
+    let mut split_only = false;
     let approximations: Vec<String> = enc.approximations.iter().cloned().collect();
     // whether the encoding was cut off at the unroll limit; reported only if the result relied on it
     let truncated = enc.bounded;
@@ -172,6 +191,11 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
         solver.assert(a);
     }
     solver.assert(&g);
+    // in a model where a split overflows, its last piece is the unsplit remainder: never a
+    // faithful witness. Rule those out; if that leaves none, `overflows` below says so.
+    if !enc.overflow.is_empty() {
+        solver.assert(or(&enc.overflow.iter().collect::<Vec<_>>()).not());
+    }
     let readable = ReadablePass::new(&enc.soft);
 
     // One solve, one replay. Host functions are never called during solving: they are
@@ -199,6 +223,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
                 SatResult::Unsat => Status::Unknown("assumptions are unsatisfiable".into()),
                 _ if truncated || overflows(&enc, &real, &params) => {
                     bounded = true;
+                    split_only = !truncated;
                     Status::Unknown(format!(
                         "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
                         opts.unroll_limit
@@ -212,7 +237,7 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
         }
         SatResult::Unknown => Status::Unknown(unknown_reason(solver.get_reason_unknown())),
     };
-    (status, bounded, approximations)
+    (status, bounded, approximations, split_only)
 }
 
 /// Proof sampling: draw diverse models of the assumptions alone (random targets for every

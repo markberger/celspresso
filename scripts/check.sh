@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local quality gates: lint, types, tests, and coverage floors.
 # Usage: scripts/check.sh            (everything)
-#        scripts/check.sh --fast     (skip the Rust coverage build)
+#        scripts/check.sh --fast     (skip the contract fuzzer and the Rust coverage build)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,6 +32,9 @@ git submodule update --init --quiet third_party/cel-spec
 cargo run -q -p celspresso-conformance --release | tail -n 3
 
 if [[ "${1:-}" != "--fast" ]]; then
+  step "contract fuzzer (fails on a wrong verdict or an UNKNOWN not in benchmarks/contract_known.txt)"
+  uv run python benchmarks/fuzz_contract.py --gate | tail -n 12
+
   step "rust tests + conformance coverage (floor ${RUST_LINE_FLOOR}% lines)"
   # unit tests and the cel-spec suite both count: the suite is the evaluator's main test
   cargo llvm-cov clean --workspace

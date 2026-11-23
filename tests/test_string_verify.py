@@ -69,9 +69,15 @@ def test_int_parsing_errors_are_found() -> None:
         env.predicate("int(t) > 0").evaluate(v.witness)
 
 
-def test_split_beyond_the_unroll_limit_is_unknown_not_proved() -> None:
-    # 12 characters can split into 13 pieces, more than the 5 slots
+def test_split_of_a_bounded_string_gets_enough_slots() -> None:
+    # 12 characters can split into 13 pieces, more than the 5 slots: more are added
     v = env.predicate("s.split(',').size() <= 12").always_true()
+    assert v.refuted
+    assert env.predicate("s.split(',').size() <= 13").always_true().proved
+
+
+def test_split_of_an_unbounded_string_is_unknown_not_proved() -> None:
+    v = Env(s=str).predicate("s.split(',').size() <= 40").always_true()
     assert v.unknown
     assert v.bounded or "unroll" in v.reason
     wide = Env(s=Annotated[str, Field(max_length=12)], unroll_limit=13)
