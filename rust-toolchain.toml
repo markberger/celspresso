@@ -1,0 +1,6 @@
+# Pinned so the local gate and CI run the same rustc and clippy: a new stable release adds
+# lints, which would fail CI on code that passes locally. Upgrade deliberately, in its own PR.
+[toolchain]
+channel = "1.93.1"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+profile = "minimal"
