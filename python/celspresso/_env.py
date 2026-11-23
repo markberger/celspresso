@@ -48,11 +48,6 @@ def _check_options(timeout: Any, unroll_limit: Any) -> None:
         raise _option_clash("unroll_limit", unroll_limit)
 
 
-def _is_type_like(v: Any) -> bool:
-    """Could `v` declare a variable's type (a class, a generic alias, Annotated, a Struct)?"""
-    return isinstance(v, (type, Struct, TypeRef, str)) or hasattr(v, "__origin__")
-
-
 def _option_list(name: str, value: Any) -> list[Any]:
     """A list-valued option (`structs=`, `adapters=`), which a variable of that name
     would collide with."""
@@ -198,7 +193,8 @@ class Env:
     ) -> None:
         _check_options(timeout, unroll_limit)
         for gone in ("schema_constraints", "debug_sample_proofs"):
-            if gone in more_variables and not _is_type_like(more_variables[gone]):
+            # their old values were bools and ints, never a type
+            if isinstance(more_variables.get(gone), (bool, int)):
                 raise TypeError(
                     f"{gone}={more_variables[gone]!r}: '{gone}' is no longer an Env option "
                     f"(it was for testing the verifier). To declare a variable named '{gone}', "
@@ -670,6 +666,8 @@ class Env:
         # this env's own assumptions apply even to a Predicate compiled in a sibling Env
         assuming = (*self._assumptions, *spec.assumptions)
         src = rule if isinstance(rule, str) else rule.source
+        if isinstance(rule, Predicate) and rule._env._fingerprint != self._fingerprint:
+            raise ValueError("check_rule was given a Predicate from a different Env")
         try:
             pred = self.predicate(rule) if isinstance(rule, str) else rule
         except CelError as e:
@@ -760,6 +758,14 @@ def _failure(pred: Predicate, v: Verdict) -> str:
         except Exception:  # noqa: BLE001 - the cause is a nicety; the witness is the evidence
             cause = ""
     return f"fails{cause} when {v.witness}"
+
+
+def _joint_env(env: Env, other: Predicate | str) -> Env:
+    """`env`, plus the assumptions `other` was compiled under, so `p & q` keeps both."""
+    if not isinstance(other, Predicate):
+        return env
+    extra = [a for a in other._env._assumptions if a not in env._assumptions]
+    return env.assume(*extra) if extra else env
 
 
 def _value_or_error(e: Expr[Any], data: Mapping[str, Any]) -> Any:
@@ -1248,10 +1254,12 @@ class Predicate(Expr[bool]):
         )
 
     def __and__(self, other: Predicate | str) -> Predicate:
-        return self._env.predicate(f"({self.source}) && {_pred_operand(self._env, other)}")
+        operand = _pred_operand(self._env, other)
+        return _joint_env(self._env, other).predicate(f"({self.source}) && {operand}")
 
     def __or__(self, other: Predicate | str) -> Predicate:
-        return self._env.predicate(f"({self.source}) || {_pred_operand(self._env, other)}")
+        operand = _pred_operand(self._env, other)
+        return _joint_env(self._env, other).predicate(f"({self.source}) || {operand}")
 
     def __invert__(self) -> Predicate:
         return self._env.predicate(f"!({self.source})")

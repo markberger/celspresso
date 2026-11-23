@@ -588,6 +588,13 @@ def test_assumptions_follow_every_env_involved() -> None:
     # and an operand compiled under assumptions keeps them
     assert env.predicate("x > 5").implies(positive.predicate("x > 0")).proved
     assert positive.compile("100 / x").never_errors().proved
+    # combining predicates keeps both sides' assumptions
+    base = Env(x=int, y=int)
+    p, q = base.assume("x > 0").predicate("x > 0"), base.assume("y > 0").predicate("y > 0")
+    assert p.implies(q).proved
+    assert (p & ~q).satisfiable().refuted
+    with pytest.raises(ValueError, match="different Env"):
+        positive.check_rule(Env(z=str).predicate("z == 'a'"))
 
 
 def test_spec_is_a_read_only_value() -> None:
@@ -602,6 +609,11 @@ def test_spec_is_a_read_only_value() -> None:
     assert spec == Spec(["x < 10"], examples=[({"x": 1}, True)])
     with pytest.raises(TypeError, match="compiled Predicate"):
         spec.check("x < 5")  # type: ignore[arg-type]
+    import copy
+    import pickle
+
+    assert copy.deepcopy(spec) == spec
+    assert pickle.loads(pickle.dumps(spec)) == spec
 
 
 def test_removed_env_options_say_so() -> None:
@@ -610,5 +622,6 @@ def test_removed_env_options_say_so() -> None:
     with pytest.raises(TypeError, match="no longer an Env option"):
         Env(x=int, debug_sample_proofs=3)  # type: ignore[arg-type]
     assert Env(schema_constraints=bool).variables == {"schema_constraints": "bool"}
+    assert Env(schema_constraints=int | None).variables == {"schema_constraints": "int?"}
     with pytest.raises(TypeError, match=r"env\.assume"):
         Env(x=int).extend(assumptions={"x > 0"})

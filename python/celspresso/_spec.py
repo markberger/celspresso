@@ -68,6 +68,10 @@ class Spec:
             _check_condition("assumptions", a)
         object.__setattr__(self, "assumptions", asm)
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # the read-only mapping proxies can't be pickled or deep-copied; rebuild instead
+        return (_rebuild, (dict(self.invariants), dict(self.require), self.examples, self.assumptions))
+
     def check(self, rule: Predicate, *, timeout: float | None = None) -> RuleCheck:
         """`rule.env.check_rule(rule, self)`: vet a compiled rule against this spec."""
         from ._env import Predicate
@@ -87,6 +91,10 @@ class Spec:
             examples=self.examples,
             assumptions=(*self.assumptions, *conditions),
         )
+
+
+def _rebuild(invariants: dict[str, Any], require: dict[str, Any], examples: Any, assumptions: Any) -> Spec:
+    return Spec(invariants, require=require, examples=examples, assumptions=assumptions)
 
 
 def _check_condition(where: str, c: Any) -> None:
