@@ -17,6 +17,7 @@ from ._errors import (
 )
 from ._ruleset import RuleSet
 from ._spec import Spec
+from ._table import NoRowMatches, Row, Table
 from ._verdict import Bounds, Difference, Extreme, Stats, Status, Verdict, Witness
 
 try:
@@ -38,13 +39,16 @@ __all__ = [
     "Expr",
     "Extreme",
     "Limits",
+    "NoRowMatches",
     "Predicate",
     "Problem",
+    "Row",
     "RuleCheck",
     "RuleSet",
     "Spec",
     "Stats",
     "Status",
+    "Table",
     "Verdict",
     "VerificationFailed",
     "VerificationTimeout",
