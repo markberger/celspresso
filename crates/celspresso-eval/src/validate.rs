@@ -30,9 +30,11 @@ pub fn validate(v: &Value, ty: &CelType, cons: &Constraints, schema: &Schema, pa
                 validate(x, elem, ic, schema, &format!("{path}[{i}]"))?;
             }
         }
-        (Value::Map(m), CelType::Map(_, vt)) => {
+        (Value::Map(m), CelType::Map(kt, vt)) => {
             let ic = cons.items.as_deref().unwrap_or(&none);
+            let kc = cons.keys.as_deref().unwrap_or(&none);
             for (k, x) in m.iter() {
+                validate(&k.to_value(), kt, kc, schema, &format!("{path} key {}", key_label(k)))?;
                 validate(x, vt, ic, schema, &format!("{path}[{}]", key_label(k)))?;
             }
         }

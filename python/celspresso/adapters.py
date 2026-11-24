@@ -101,7 +101,17 @@ class PydanticAdapter:
         return ctx.struct(tp, build)
 
     def decode(self, tp: Any, data: dict[str, Any]) -> Any:
-        return tp.model_validate(data)
+        # `data` is keyed by field name, not alias, and holds CEL values (an enum as its
+        # value), so validate by name and leniently
+        try:
+            return tp.model_validate(data, strict=False, by_name=True)
+        except TypeError:  # Pydantic < 2.11 has no by_name
+            aliased = {}
+            for name, value in data.items():
+                info = tp.model_fields.get(name)
+                alias = getattr(info, "validation_alias", None) or getattr(info, "alias", None)
+                aliased[alias if isinstance(alias, str) else name] = value
+            return tp.model_validate(aliased, strict=False)
 
 
 class DataclassAdapter:

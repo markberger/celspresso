@@ -15,12 +15,6 @@ the validator and the Z3 encoding read them as such. The Pydantic path converts 
   ints through unconverted.
 - *Found:* review of `celspresso.schema` (M1).
 
-### Witnesses for Pydantic models with field aliases fail to decode
-`full_name: str = Field(alias="fullName")` gives UNKNOWN with "witness fails model
-validation", because `PydanticAdapter.decode` passes `model_validate` the field names.
-- *Fix:* call `model_validate(data, by_name=True)` (Pydantic ≥ 2.11), or else map names to
-  aliases from `model_fields`.
-
 ### A Pydantic model can't contain a type from a custom adapter
 Pydantic refuses to build a model whose field is a foreign type unless
 `arbitrary_types_allowed` is set. Even then, `model_validate` would reject the value the

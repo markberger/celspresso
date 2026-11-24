@@ -111,6 +111,7 @@ fn constraints_from_py(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Constraints> 
                 c.one_of = Some(out);
             }
             "items" => c.items = Some(Box::new(constraints_from_py(Some(&v))?)),
+            "keys" => c.keys = Some(Box::new(constraints_from_py(Some(&v))?)),
             "scale" => c.scale = Some(v.extract()?),
             other => return Err(PyValueError::new_err(format!("unknown constraint '{other}'"))),
         }
@@ -621,16 +622,14 @@ impl Core {
             // schema patterns are standing assumptions on every query, so they must be quick too
             let fields = s.structs.values().flat_map(|d| d.fields.iter().map(move |f| (format!("{}.{}", d.name, f.name), &f.constraints)));
             let vars = s.vars.values().map(|v| (v.name.clone(), &v.constraints));
-            for (name, mut c) in fields.chain(vars) {
-                // the field's own pattern, then its items' (list elements), and so on down
-                loop {
+            for (name, c) in fields.chain(vars) {
+                // the field's own pattern, then its items' and keys', and so on down
+                let mut todo = vec![c];
+                while let Some(c) = todo.pop() {
                     if let Some(Err(why)) = c.pattern.as_deref().map(celspresso_verify::subset::pattern_in_profile) {
                         return Err(PyValueError::new_err(format!("the pattern on '{name}' is outside celspresso's CEL subset: {why}")));
                     }
-                    match &c.items {
-                        Some(items) => c = items,
-                        None => break,
-                    }
+                    todo.extend(c.items.as_deref().into_iter().chain(c.keys.as_deref()));
                 }
             }
         }

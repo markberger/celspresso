@@ -102,12 +102,15 @@ impl<'a> Sizes<'a> {
         if let ExprKind::Comprehension(k) = &e.kind {
             self.visit(&k.iter_range, scope);
             self.visit(&k.accu_init, scope);
-            // the element (or map value) variable reads the range's items
-            let items = self.cons.get(&k.iter_range.id).map(|c| c.items.as_deref().cloned().unwrap_or_default());
+            // the element (or map value) variable reads the range's items, a map key its keys
+            let range = self.cons.get(&k.iter_range.id);
+            let items = range.map(|c| c.items.as_deref().cloned().unwrap_or_default());
+            let keys = range.map(|c| c.keys.as_deref().cloned().unwrap_or_default());
             let is_map = matches!(strip(self.c.type_of(k.iter_range.id)), CelType::Map(..));
             let (first, second) = match &k.iter_var2 {
-                None if is_map => (None, None),
+                None if is_map => (keys, None),
                 None => (items, None),
+                Some(_) if is_map => (keys, items),
                 Some(_) => (None, items),
             };
             let depth = scope.len();
