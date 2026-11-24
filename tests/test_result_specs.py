@@ -2,6 +2,7 @@
 with `ensures` over `result`, `returns` and value examples."""
 
 import dataclasses
+import enum
 import pickle
 from decimal import Decimal
 from typing import Annotated, Literal
@@ -266,3 +267,41 @@ def test_fields_of_a_built_struct_are_bounded_by_what_built_them() -> None:
 
     with pytest.raises(CelSubsetError, match="can't bound"):
         tight.extend(functions=[make]).predicate("size(make(1).tags) <= 4")
+
+
+class Color(enum.Enum):
+    R = "r"
+    G = "g"
+
+
+class Odd(BaseModel):
+    pair: tuple[int, int]
+    big: Annotated[int, Field(ge=2**53)]
+    huge: Annotated[int, Field(le=2**70)]
+    color: Color
+    seen: set[int]
+
+
+def test_built_results_check_exact_bounds_lengths_and_compare_enums_and_sets() -> None:
+    odd = Env(o=Order, structs=[Odd])
+    good = "Odd{pair: [1, 2], big: 9007199254740992, huge: o.total, color: 'r', seen: [2, 1]}"
+    spec = Spec(
+        returns=Odd,
+        examples=[(LOST, {"pair": (1, 2), "big": 2**53, "huge": 10, "color": "r", "seen": [1, 2]})],
+    )
+    assert odd.check_rule(good, spec).ok, str(odd.check_rule(good, spec))
+    # a tuple's length, and an int bound past 2**53, are checked exactly
+    r = odd.check_rule(good.replace("[1, 2]", "[1, 2, 3]"), Spec(returns=Odd))
+    assert "the result.pair has size <= 2 fails" in str(r)
+    r = odd.check_rule(good.replace("9007199254740992", "9007199254740991"), Spec(returns=Odd))
+    assert "the result.big >= 9007199254740992 fails" in str(r)
+
+    # a bound a double can't hold is refused, never rounded
+    class Inexact(BaseModel):
+        n: Annotated[int, Field(ge=2**53 + 1)]
+
+    with pytest.raises(ValueError, match="not exactly representable"):
+        Env(i=Inexact)
+    # a rule that reads no input says so
+    const = env.check_rule("-1", Spec(returns=Annotated[int, Field(ge=0)]))
+    assert "isn't a valid int on every input: the result >= 0 fails" in str(const)

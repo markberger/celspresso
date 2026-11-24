@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+import fractions
 import inspect
 import itertools
 import math
@@ -772,7 +774,7 @@ class Env:
                 msg = f"ensures '{name}' doesn't apply to this rule's result ({expr.output_type}): {v}"
                 problems.append(Problem("invalid", msg, name))
             elif v.refuted:
-                msg = f"violates ensures '{name}' when {v.counterexample}{_result_note(expr, v)}"
+                msg = f"violates ensures '{name}' {_when(v)}{_result_note(expr, v)}"
                 problems.append(Problem("violates", msg, name, v))
             elif v.unknown:
                 problems.append(
@@ -803,13 +805,12 @@ class Env:
             if isinstance(v, CelError):
                 # e.g. a list field of a struct inside a list the rule built: its size isn't
                 # known statically
-                why = "the verifier can't bound the size of that value where the rule builds it"
+                why = str(v)
+                if "max_length" in why or "can't bound" in why:
+                    why = "the verifier can't bound the size of that value where the rule builds it"
                 problems.append(Problem("unverified", f"could not verify that {what}: {why}"))
             elif v.refuted:
-                msg = (
-                    f"gives a result that isn't a valid {type_name(want)} when {v.counterexample}: "
-                    f"{what} fails"
-                )
+                msg = f"gives a result that isn't a valid {type_name(want)} {_when(v)}: {what} fails"
                 problems.append(Problem("violates", msg, None, v))
             elif v.unknown:
                 problems.append(Problem("unverified", f"could not verify that {what}: {v.reason}", None, v))
@@ -897,6 +898,12 @@ def _failure(pred: Expr[Any], v: Verdict) -> str:
     return f"fails{cause} when {v.witness}"
 
 
+def _when(v: Verdict) -> str:
+    """'when <counterexample>', or 'on every input' for a rule that reads no input."""
+    cex = str(v.counterexample or "")
+    return f"when {cex}" if cex else "on every input"
+
+
 def _result_note(expr: Expr[Any], v: Verdict) -> str:
     """': the result is X' for a counterexample, when the rule can be replayed on it."""
     if v.witness is None:
@@ -911,6 +918,19 @@ def _same_result(got: Any, expected: Any) -> bool:
     """Whether a rule's value is the expected one, at every level: booleans must match
     exactly (True is not 1), and a struct matches an instance or a mapping of its fields."""
     got, expected = _plain(got), _plain(expected)
+    if isinstance(got, (set, frozenset)) or isinstance(expected, (set, frozenset)):
+        # a set field matches its items in any order
+        if not isinstance(got, (set, frozenset, list, tuple)) or not isinstance(
+            expected, (set, frozenset, list, tuple)
+        ):
+            return False
+        rest = list(expected)
+        for a in got:
+            hit = next((i for i, b in enumerate(rest) if _same_result(a, b)), None)
+            if hit is None:
+                return False
+            rest.pop(hit)
+        return not rest
     if isinstance(got, bool) or isinstance(expected, bool):
         return isinstance(got, bool) and isinstance(expected, bool) and got == expected
     if isinstance(got, Mapping) and isinstance(expected, Mapping):
@@ -929,6 +949,8 @@ def _plain(value: Any) -> Any:
 
     if isinstance(value, type):
         return value
+    if isinstance(value, enum.Enum):
+        return value.value
     fields = getattr(type(value), "model_fields", None)
     if isinstance(fields, Mapping):
         return {k: getattr(value, k) for k in fields}
@@ -968,15 +990,25 @@ def _fits(
     if isinstance(spec, str):
         u = "u" if spec == "uint" else ""
         if spec in ("int", "uint"):
-            for key, op in (("ge", ">="), ("gt", ">"), ("le", "<="), ("lt", "<")):
-                if key in c:
-                    b = float(c[key])
-                    n = int(math.ceil(b) if op in (">=", ">") else math.floor(b))
-                    if not b.is_integer() and op in (">", "<"):
-                        op = ">=" if op == ">" else "<="
-                    out.append((f"{shown} {op} {n}", f"{x} {op} {n}{u}"))
+            lo, hi = (0, 2**64 - 1) if u else (-(2**63), 2**63 - 1)
+            for key in ("ge", "gt", "le", "lt"):
+                if key not in c:
+                    continue
+                # the least (ge, gt) or greatest (le, lt) integer allowed, exactly
+                b = c[key] if isinstance(c[key], int) else fractions.Fraction(c[key])
+                n = {
+                    "ge": math.ceil(b),
+                    "gt": math.floor(b) + 1,
+                    "le": math.floor(b),
+                    "lt": math.ceil(b) - 1,
+                }[key]
+                op = ">=" if key in ("ge", "gt") else "<="
+                if (op == ">=" and n <= lo) or (op == "<=" and n >= hi):
+                    continue  # every value of the type meets it
+                cond = "false" if not lo <= n <= hi else f"{x} {op} {n}{u}"
+                out.append((f"{shown} {op} {n}", cond))
         if "one_of" in c:
-            vals = ", ".join(cel_literal(v) + (u if isinstance(v, int) else "") for v in c["one_of"])
+            vals = ", ".join(f"{v}{u}" if isinstance(v, int) else cel_literal(v) for v in c["one_of"])
             out.append((f"{shown} is one of {vals}", f"{x} in [{vals}]"))
         sizes()
         if "pattern" in c:

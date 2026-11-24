@@ -146,7 +146,7 @@ print(env.check_rule("""
 
 How the checks treat a rule that computes a value:
 - `returns` makes a result of the wrong type a rejection. For a fixed-point result, `returns=T.fixed(...)` also makes examples and reports use `Decimal`s.
-- A result must meet the constraints its class declares (`Literal` values, `ge`, `max_length`, ...). The verifier assumes those of inputs, but a value the rule builds is checked, so an accepted rule never builds a `Decision` that Pydantic rejects.
+- A result must meet the constraints its class declares: `Literal` and enum values, `ge`/`gt`/`le`/`lt`, `min_length`/`max_length`, `pattern`, and tuple lengths, through lists, maps, optional fields and nested structs. The verifier assumes these of inputs, but checks a value the rule builds. Custom validators, `multiple_of`, map-key constraints and `Literal[True]` are not checked.
 - `examples` take the expected result: a value, a model instance, or a dict of its fields.
 - Inputs on which the rule fails are reported once, as a runtime failure. The `ensures` checks cover only the inputs where the rule has a value.
 - Invariants and `require` apply only to true/false rules.

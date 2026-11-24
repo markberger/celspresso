@@ -482,6 +482,11 @@ class SchemaBuilder:
                 args = (args[0],)
             elif origin is tuple and len(set(args)) > 1:
                 raise TypeError(f"{where}: heterogeneous tuples are not supported; use list[T]")
+            elif origin is tuple and args and args != ((),):
+                # a fixed-length tuple has exactly that many items
+                n = len(args)
+                cons["min_length"] = max(cons.get("min_length", n), n)
+                cons["max_length"] = min(cons.get("max_length", n), n)
             item_cons: dict[str, Any] = {}
             elem = self._convert(args[0], item_cons, f"{where}[]") if args else "dyn"
             if item_cons:
@@ -655,7 +660,7 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: 
                             " take ge/gt/le/lt (state a bound on a date, time or duration as an"
                             " assumption: env.assume(...))"
                         )
-                    val = val if isinstance(val, decimal.Decimal) else float(val)
+                    val = val if isinstance(val, (decimal.Decimal, int)) else float(val)
                 elif key == "pattern" and not isinstance(val, str):
                     val = getattr(val, "pattern", val)  # a compiled re.Pattern
                 cons[key] = val
