@@ -154,6 +154,12 @@ def test_rule_files_take_tables(tmp_path: Path, capsys: pytest.CaptureFixture[st
     bad.write_text(TABLE_FILE.format(mod=mod, deny=DENY, refund=REFUND).replace("then =", "than ="))
     assert main(["check", str(bad)]) == 2
     assert "must have when and then" in capsys.readouterr().err
+    # a table's line is its [rules.name] header
+    main(["check", str(f), "--format", "json"])
+    import json
+
+    lines = TABLE_FILE.splitlines()
+    assert json.loads(capsys.readouterr().out)["rules"]["refund"]["line"] == lines.index("[rules.refund]") + 1
 
 
 def _models_source() -> str:
@@ -170,3 +176,23 @@ class Decision(BaseModel):
     action: Literal["refund", "review", "deny"]
     amount: Annotated[int, Field(ge=0)]
 """
+
+
+def test_a_condition_that_fails_is_not_coverage() -> None:
+    env = Env(xs=Annotated[list[int], Field(max_length=3)])
+    t = env.decision_table([("xs[0] > 0", "1"), ("xs[0] <= 0", "2")])
+    r = t.check(Spec(ensures={"p": "result > 0"}))
+    assert kinds(r) == ["no_match"], str(r)
+    assert "a row's condition fails before any row matches when xs = []" in str(r)
+
+
+def test_errors_name_the_row_and_evaluate_agrees_with_expr() -> None:
+    from celspresso import CelError
+
+    r = ENV.decision_table({"a": ("true", DENY), "b": ("order.nope", DENY)}).check()
+    assert str(r) == "rejected:\n- b's condition: " + str(r).split("b's condition: ")[1]
+    assert "the default:" in str(ENV.decision_table([("true", DENY)], default="zz").check())
+    mixed = ENV.decision_table([("order.total > 5", "1")], default="'a'")
+    assert kinds(mixed.check()) == ["invalid"]
+    with pytest.raises(CelError):
+        mixed.evaluate({"order": {"status": "ok", "total": 1, "days": 1}})

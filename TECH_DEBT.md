@@ -271,3 +271,26 @@ are already unverified.
 merging `constraints_from` with Annotated metadata).
 - *Fix:* take the lcm in units after scaling, or mark the field unverified.
 - *Found:* review of the result-boundary change.
+
+### A decision-table example no row matches reports the generated sentinel
+With no default, `Spec(examples=...)` on an input no row matches says "evaluation fails:
+index out of range: 1 | [(...)][1]" rather than "no row matches".
+- *Fix:* run examples through `matching_row` first in `DecisionTable.check`.
+- *Found:* review of decision tables.
+
+### RuleSet and check_rule don't take a DecisionTable
+They need `table.expr` or `table.source`, which loses the table checks, and
+`RuleSet.may_error` flags the no-default sentinel on every table without a default.
+- *Fix:* accept a `DecisionTable` and dispatch to `table.check`.
+- *Found:* review of decision tables.
+
+### A shadowed row's message names every earlier row
+"small loss and big loss catch every input it matches", even when one row suffices.
+- *Fix:* find a minimal covering subset (one solver call per earlier row).
+- *Found:* review of decision tables.
+
+### YAML line numbers can land inside a table
+`_yaml_line` matches `name:` at any depth, so a string rule named `rows`, `when`, `then`,
+`name` or `default` after a table resolves to a row's line.
+- *Fix:* match only keys at the rules section's indentation.
+- *Found:* review of decision tables.

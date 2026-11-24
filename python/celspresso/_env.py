@@ -31,7 +31,7 @@ from .schema import Struct, TypeRef, _contains_fixed
 if typing.TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ._table import Row, Table
+    from ._table import DecisionTable, Row
     from .adapters import TypeAdapter
 
 __all__ = ["Env", "Explanation", "Expr", "Predicate", "Problem", "RuleCheck", "function"]
@@ -658,15 +658,15 @@ class Env:
         default: str | None = None,
         *,
         unique: bool = False,
-    ) -> Table:
+    ) -> DecisionTable:
         """A first-match decision table: `rows` of `(when, then)` (or `Row`s, or a mapping
         of row names to pairs), tried in order; the first row whose `when` holds gives
         the result, else `default`. `table.check(spec)` proves every input is decided,
         no row is dead, and (with `unique`) no two rows overlap, then checks the whole
         table against `spec` like `check_rule`."""
-        from ._table import Table
+        from ._table import DecisionTable
 
-        return Table(self, rows, default, unique=unique)
+        return DecisionTable(self, rows, default, unique=unique)
 
     def check_rule(
         self,

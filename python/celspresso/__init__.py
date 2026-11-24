@@ -17,7 +17,7 @@ from ._errors import (
 )
 from ._ruleset import RuleSet
 from ._spec import Spec
-from ._table import NoRowMatches, Row, Table
+from ._table import DecisionTable, NoRowMatches, Row
 from ._verdict import Bounds, Difference, Extreme, Stats, Status, Verdict, Witness
 
 try:
@@ -32,6 +32,7 @@ __all__ = [
     "CelSubsetError",
     "CelSyntaxError",
     "CelTypeError",
+    "DecisionTable",
     "Diagnostic",
     "Difference",
     "Env",
@@ -48,7 +49,6 @@ __all__ = [
     "Spec",
     "Stats",
     "Status",
-    "Table",
     "Verdict",
     "VerificationFailed",
     "VerificationTimeout",

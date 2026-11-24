@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Row:
-    """One row of a `Table`: when `when` holds (and no earlier row does), the table
+    """One row of a `DecisionTable`: when `when` holds (and no earlier row does), the table
     gives `then`. `name` labels it in reports (default: `row 1`, `row 2`, ...)."""
 
     when: str
@@ -26,11 +26,15 @@ class Row:
     name: str | None = None
 
 
+class _RowError(ValueError):
+    """A row (or the default) doesn't compile; the message names it."""
+
+
 class NoRowMatches(LookupError):
-    """`Table.evaluate` was given an input that no row matches (and there's no default)."""
+    """`DecisionTable.evaluate` was given an input that no row matches (and there's no default)."""
 
 
-class Table:
+class DecisionTable:
     """A first-match decision table, built with `Env.decision_table`.
 
     It is one CEL expression (`source`, `expr`), so everything that works on a rule
@@ -59,32 +63,46 @@ class Table:
         self.unique = unique
         self.source = _source(self.rows, default)
         self._expr: Expr[Any] | None = None
+        self._compiled: list[tuple[Predicate, Expr[Any]]] | None = None
 
     def __repr__(self) -> str:
-        return f"Table({len(self.rows)} rows{', default' if self.default is not None else ''})"
+        return f"DecisionTable({len(self.rows)} rows{', default' if self.default is not None else ''})"
 
     @property
     def expr(self) -> Expr[Any]:
         """The whole table as one compiled expression. With no default, an input that
         no row matches makes it fail (an index-out-of-range error)."""
         if self._expr is None:
+            self._parts()  # an error names the row, not a position in the generated source
             self._expr = self.env.compile(self.source)
         return self._expr
 
+    def _parts(self) -> list[tuple[Predicate, Expr[Any]]]:
+        """Each row's compiled `when` and `then`; a CelError names the row."""
+        if self._compiled is None:
+            parts = []
+            for row in self.rows:
+                for what, src in (("condition", row.when), ("result", row.then)):
+                    try:
+                        compiled = self.env.predicate(src) if what == "condition" else self.env.compile(src)
+                    except CelError as e:
+                        raise _RowError(f"{row.name}'s {what}: {e}") from None
+                    parts.append(compiled)
+            self._compiled = list(zip(parts[::2], parts[1::2], strict=True))  # type: ignore[arg-type]
+        return self._compiled
+
     def evaluate(self, data: Mapping[str, Any]) -> Any:
-        """The `then` of the first row whose `when` holds on `data`, else the default.
-        Raises NoRowMatches when nothing matches and there's no default."""
-        for row in self.rows:
-            if self.env.predicate(row.when).evaluate(data):
-                return self.env.compile(row.then).evaluate(data)
-        if self.default is None:
+        """What the table gives on `data`: the result of the first row whose `when` holds,
+        else the default. Raises NoRowMatches when nothing matches and there's no default."""
+        expr = self.expr
+        if self.default is None and self.matching_row(data) is None:
             raise NoRowMatches("no row of the table matches this input")
-        return self.env.compile(self.default).evaluate(data)
+        return expr.evaluate(data)
 
     def matching_row(self, data: Mapping[str, Any]) -> str | None:
         """The name of the row that decides `data` (None: no row, so the default)."""
-        for row in self.rows:
-            if self.env.predicate(row.when).evaluate(data):
+        for row, (when, _) in zip(self.rows, self._parts(), strict=True):
+            if when.evaluate(data):
                 return row.name
         return None
 
@@ -99,12 +117,14 @@ class Table:
         spec = spec if isinstance(spec, Spec) else Spec(spec)
         assuming = spec.assumptions
         try:
-            whens = [self.env.predicate(r.when) for r in self.rows]
-        except CelError as e:
-            return RuleCheck(self.source, None, (Problem("invalid", f"a row's condition: {e}"),))
-        try:  # every result has one type (and the spec's, if it names one)
-            self.expr  # noqa: B018
-        except CelError as e:
+            whens = [w for w, _ in self._parts()]
+            if self.default is not None:
+                try:
+                    self.env.compile(self.default)
+                except CelError as e:
+                    raise _RowError(f"the default: {e}") from None
+            self.expr  # noqa: B018 - every result has one type
+        except (CelError, _RowError) as e:
             return RuleCheck(self.source, None, (Problem("invalid", str(e)),))
         problems: list[Problem] = []
 
@@ -121,15 +141,27 @@ class Table:
                 alone = i > 0 and w.satisfiable(assuming=assuming, timeout=timeout).proved
                 why = f": {_names(self.rows[:i])} catch every input it matches" if alone else ""
                 problems.append(Problem("shadowed", f"{row.name} never decides anything{why}", None, v))
-        gap = self.env.predicate(f"!(\n{any_row}\n)").satisfiable(assuming=assuming, timeout=timeout)
-        if gap.unknown:
-            undecided("every input matches a row", gap)
-        elif gap.proved and self.default is None:
-            problems.append(Problem("no_match", f"no row matches {_when(gap)}", None, gap))
-        elif gap.refuted and self.default is not None:
-            problems.append(
-                Problem("shadowed", "the default is never used: the rows cover every input", None, gap)
-            )
+        if self.default is None:
+            # a condition that fails counts as no match: the table fails there too
+            cover = self.env.predicate(any_row).always_true(assuming=assuming, timeout=timeout)
+            if cover.unknown:
+                undecided("every input matches a row", cover)
+            elif cover.refuted:
+                why = "no row matches"
+                if cover.witness is not None:
+                    try:
+                        self.matching_row(cover.witness)
+                    except Exception:  # noqa: BLE001 - CelEvaluationError, as the table itself
+                        why = "a row's condition fails before any row matches"
+                problems.append(Problem("no_match", f"{why} {_when_cex(cover)}", None, cover))
+        else:
+            gap = self.env.predicate(f"!(\n{any_row}\n)").satisfiable(assuming=assuming, timeout=timeout)
+            if gap.unknown:
+                undecided("the default is ever used", gap)
+            elif gap.refuted:
+                problems.append(
+                    Problem("shadowed", "the default is never used: the rows cover every input", None, gap)
+                )
         if self.unique:
             for (a, wa), (b, wb) in combinations(zip(self.rows, whens, strict=True), 2):
                 v = self.env.predicate(f"{_wrap(wa.source)} && {_wrap(wb.source)}").satisfiable(
@@ -141,8 +173,9 @@ class Table:
                     problems.append(
                         Problem("overlap", f"{a.name} and {b.name} both match {_when(v)}", None, v)
                     )
-        # the table as one rule; without a default, inputs no row matches were reported
-        # above, and only fail, so the rule's own checks are over the inputs some row takes
+        # the table as one rule. Without a default, the inputs on which no row's condition
+        # is true were all reported above (they only fail), so the rule's own checks are
+        # over the rest: assuming some condition is true drops nothing unreported
         whole = spec if self.default is not None else spec.assuming(any_row)
         rule = self.env.check_rule(self.source, whole, timeout=timeout)
         problems += [self._attribute(p) for p in rule.problems]
@@ -198,6 +231,11 @@ def _any(whens: Sequence[Predicate]) -> str:
 def _when(v: Verdict) -> str:
     """'when <the satisfying input>', or 'on every input' when it reads no input."""
     shown = str(v.witness or "")
+    return f"when {shown}" if shown else "on every input"
+
+
+def _when_cex(v: Verdict) -> str:
+    shown = str(v.counterexample or "")
     return f"when {shown}" if shown else "on every input"
 
 

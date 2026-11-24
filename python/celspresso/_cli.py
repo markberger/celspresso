@@ -68,7 +68,7 @@ from . import __version__
 from ._env import Env, Expr, Problem, RuleCheck, _value_or_error
 from ._errors import CelError
 from ._spec import Spec
-from ._table import Row, Table
+from ._table import DecisionTable, Row
 from ._verdict import Difference, _outcome
 
 if TYPE_CHECKING:
@@ -110,7 +110,7 @@ class RuleFile:
     assumptions: list[str] = field(default_factory=list)
     returns: str | None = None  # as written in the file
     returns_type: Any = None
-    tables: dict[str, Table] = field(default_factory=dict)  # rules written as tables
+    tables: dict[str, DecisionTable] = field(default_factory=dict)  # rules written as tables
 
     @property
     def spec(self) -> Spec:
@@ -156,6 +156,9 @@ def _toml_line(lines: list[str], section: str, name: str) -> int:
         m = header.match(line)
         if m:
             current = m.group(1).strip().strip("\"'")
+            parts = [p.strip().strip("\"'") for p in m.group(1).split(".")]
+            if parts == [section, name]:  # [rules.name]: a table
+                return i
             head = i if current == section and not head else head
         elif current == section:
             if key.match(line):
@@ -295,13 +298,13 @@ def _strings(data: dict[str, Any], key: str, path: str) -> dict[str, str]:
     return {str(k): v for k, v in raw.items()}
 
 
-def _rules(data: dict[str, Any], env: Env, path: str) -> tuple[dict[str, str], dict[str, Table]]:
+def _rules(data: dict[str, Any], env: Env, path: str) -> tuple[dict[str, str], dict[str, DecisionTable]]:
     """The file's rules as CEL sources, and the ones written as decision tables."""
     raw = data.get("rules", {})
     if not isinstance(raw, dict):
         raise UsageError(f"{path}: [rules] must map names to CEL expressions or tables")
     rules: dict[str, str] = {}
-    tables: dict[str, Table] = {}
+    tables: dict[str, DecisionTable] = {}
     for name, v in raw.items():
         name = str(name)
         if isinstance(v, str):
@@ -314,7 +317,7 @@ def _rules(data: dict[str, Any], env: Env, path: str) -> tuple[dict[str, str], d
     return rules, tables
 
 
-def _table(env: Env, v: dict[str, Any], where: str) -> Table:
+def _table(env: Env, v: dict[str, Any], where: str) -> DecisionTable:
     unknown = set(v) - {"rows", "default", "unique"}
     if unknown:
         raise UsageError(f"{where}: unknown table setting(s): {', '.join(sorted(unknown))}")
@@ -334,7 +337,7 @@ def _table(env: Env, v: dict[str, Any], where: str) -> Table:
     if not isinstance(unique, bool):
         raise UsageError(f"{where}: unique must be true or false")
     try:
-        return Table(env, out, default, unique=unique)
+        return DecisionTable(env, out, default, unique=unique)
     except ValueError as e:
         raise UsageError(f"{where}: {e}") from None
 
