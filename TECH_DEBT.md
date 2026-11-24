@@ -275,7 +275,10 @@ merging `constraints_from` with Annotated metadata).
 ### A decision-table example no row matches reports the generated sentinel
 With no default, `Spec(examples=...)` on an input no row matches says "evaluation fails:
 index out of range: 1 | [(...)][1]" rather than "no row matches".
-- *Fix:* run examples through `matching_row` first in `DecisionTable.check`.
+`celspresso diff` shows it too ("1 -> error (index out of range: 1)") when a default is
+dropped.
+- *Fix:* run examples through `matching_row` first in `DecisionTable.check`; in diff,
+  describe a sentinel error as "no row matches".
 - *Found:* review of decision tables.
 
 ### RuleSet and check_rule don't take a DecisionTable
@@ -293,4 +296,24 @@ They need `table.expr` or `table.source`, which loses the table checks, and
 `_yaml_line` matches `name:` at any depth, so a string rule named `rows`, `when`, `then`,
 `name` or `default` after a table resolves to a row's line.
 - *Fix:* match only keys at the rules section's indentation.
+- *Found:* review of decision tables.
+
+### Some decision-table errors and messages still point at generated source
+Rows whose results have different types, a table deeper than the nesting limit (~198
+rows), and an invalid table in `celspresso diff` report positions in the generated
+ternary, not a row. "X catches every input it matches" is also said when X's condition
+fails (rather than holds) on those inputs.
+- *Fix:* type-check results per row against the first; cap rows with a clear message;
+  build diff sources through `DecisionTable`; reword when earlier conditions can fail.
+- *Found:* review of decision tables.
+
+### TOML line numbers for less common table spellings
+`[rules."a.b"]`, `[[rules.t.rows]]`, top-level `rules.t.rows = [...]` and `t.rows = [...]`
+inside `[rules]` fall back to a section line or 1.
+- *Fix:* parse TOML keys properly (tomllib keeps no positions; a small key tokenizer).
+- *Found:* review of decision tables.
+
+### `unique=True` costs one solver call per pair of rows
+About 18k calls at 190 rows.
+- *Fix:* one query per row against the disjunction of later rows, then pair up only hits.
 - *Found:* review of decision tables.

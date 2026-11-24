@@ -25,12 +25,17 @@ class Row:
     then: str
     name: str | None = None
 
+    def __post_init__(self) -> None:
+        if not (isinstance(self.when, str) and isinstance(self.then, str)):
+            raise TypeError(f"a table row's when and then are CEL strings, got {self.when!r}, {self.then!r}")
 
-class _RowError(ValueError):
-    """A row (or the default) doesn't compile; the message names it."""
+
+class TableRowError(CelError):
+    """A row's condition or result (or the default) doesn't compile. The message names
+    the row; the compile error itself is `__cause__`."""
 
 
-class NoRowMatches(LookupError):
+class NoRowMatches(CelError, LookupError):
     """`DecisionTable.evaluate` was given an input that no row matches (and there's no default)."""
 
 
@@ -86,7 +91,7 @@ class DecisionTable:
                     try:
                         compiled = self.env.predicate(src) if what == "condition" else self.env.compile(src)
                     except CelError as e:
-                        raise _RowError(f"{row.name}'s {what}: {e}") from None
+                        raise TableRowError(f"{row.name}'s {what}: {e}") from e
                     parts.append(compiled)
             self._compiled = list(zip(parts[::2], parts[1::2], strict=True))  # type: ignore[arg-type]
         return self._compiled
@@ -122,9 +127,9 @@ class DecisionTable:
                 try:
                     self.env.compile(self.default)
                 except CelError as e:
-                    raise _RowError(f"the default: {e}") from None
+                    raise TableRowError(f"the default: {e}") from e
             self.expr  # noqa: B018 - every result has one type
-        except (CelError, _RowError) as e:
+        except CelError as e:
             return RuleCheck(self.source, None, (Problem("invalid", str(e)),))
         problems: list[Problem] = []
 
@@ -139,7 +144,8 @@ class DecisionTable:
                 undecided(f"{row.name} can match", v)
             elif v.refuted:
                 alone = i > 0 and w.satisfiable(assuming=assuming, timeout=timeout).proved
-                why = f": {_names(self.rows[:i])} catch every input it matches" if alone else ""
+                verb = "catches" if i == 1 else "catch"
+                why = f": {_names(self.rows[:i])} {verb} every input it matches" if alone else ""
                 problems.append(Problem("shadowed", f"{row.name} never decides anything{why}", None, v))
         if self.default is None:
             # a condition that fails counts as no match: the table fails there too
@@ -160,7 +166,12 @@ class DecisionTable:
                 undecided("the default is ever used", gap)
             elif gap.refuted:
                 problems.append(
-                    Problem("shadowed", "the default is never used: the rows cover every input", None, gap)
+                    Problem(
+                        "shadowed",
+                        "the default is never used: on every input a row matches (or a condition fails)",
+                        None,
+                        gap,
+                    )
                 )
         if self.unique:
             for (a, wa), (b, wb) in combinations(zip(self.rows, whens, strict=True), 2):

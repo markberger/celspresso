@@ -62,7 +62,7 @@ def test_gaps_dead_rows_and_a_dead_default() -> None:
     )
     r = t.check(SPEC)
     assert kinds(r) == ["shadowed", "shadowed", "no_match"], str(r)
-    assert "fresh lost never decides anything: lost catch every input it matches" in str(r)
+    assert "fresh lost never decides anything: lost catches every input it matches" in str(r)
     assert "negative never decides anything\n" in str(r) + "\n"  # its condition can't hold
     assert "no row matches when" in str(r)
     assert t.rows[3].name == "row 4"
@@ -142,7 +142,7 @@ def test_rule_files_take_tables(tmp_path: Path, capsys: pytest.CaptureFixture[st
     out = capsys.readouterr().out
     assert code == 1
     assert "plain: ok" in out
-    assert "dead never decides anything: small lost catch every input it matches" in out
+    assert "dead never decides anything: small lost catches every input it matches" in out
     # a table is diffed by what it does
     g = tmp_path / "new.toml"
     g.write_text(TABLE_FILE.format(mod=mod, deny=DENY, refund=REFUND).replace("<= 20000", "<= 30000"))
@@ -187,8 +187,15 @@ def test_a_condition_that_fails_is_not_coverage() -> None:
 
 
 def test_errors_name_the_row_and_evaluate_agrees_with_expr() -> None:
-    from celspresso import CelError
+    from celspresso import CelError, TableRowError
 
+    bad = ENV.decision_table([("true", DENY), ("order.total <", DENY)])
+    with pytest.raises(TableRowError, match="row 2's condition"):
+        bad.expr
+    with pytest.raises(CelError):
+        bad.evaluate({"order": {"status": "ok", "total": 1, "days": 1}})
+    with pytest.raises(TypeError, match="CEL strings"):
+        Row(123, "1")  # type: ignore[arg-type]
     r = ENV.decision_table({"a": ("true", DENY), "b": ("order.nope", DENY)}).check()
     assert str(r) == "rejected:\n- b's condition: " + str(r).split("b's condition: ")[1]
     assert "the default:" in str(ENV.decision_table([("true", DENY)], default="zz").check())

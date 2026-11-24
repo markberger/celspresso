@@ -173,7 +173,7 @@ print(refunds.check(DECISIONS))
 # - no row matches when order.days_since_delivery = 0, order.status = 'delivered', order.tier = 'standard', order.total_cents = 0
 ```
 
-Pass `default=` for the inputs no row matches. A table is one CEL expression (`table.source`, `table.expr`), so `diff`, `equivalent` and everything else work on it too. `table.evaluate(data)` gives the first match's result, and `table.matching_row(data)` names the row.
+Pass `default=` for the inputs no row matches; a default that no input can reach is reported as dead too. A table is one CEL expression, `table.expr`, so `diff`, `equivalent` and the other questions work on that. `table.evaluate(data)` gives the first match's result, and `table.matching_row(data)` names the row.
 
 `check_rule` also flags code that type-checks but can't be what was meant. For example, `order.tier == 'Gold'` can never be true when the tier is `'standard'` or `'gold'`. Habits from other languages get a pointer to the CEL form: `and` → `&&`, `len(x)` → `size(x)`, `None` → `null`.
 

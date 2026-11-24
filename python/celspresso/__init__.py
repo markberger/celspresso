@@ -17,7 +17,7 @@ from ._errors import (
 )
 from ._ruleset import RuleSet
 from ._spec import Spec
-from ._table import DecisionTable, NoRowMatches, Row
+from ._table import DecisionTable, NoRowMatches, Row, TableRowError
 from ._verdict import Bounds, Difference, Extreme, Stats, Status, Verdict, Witness
 
 try:
@@ -49,6 +49,7 @@ __all__ = [
     "Spec",
     "Stats",
     "Status",
+    "TableRowError",
     "Verdict",
     "VerificationFailed",
     "VerificationTimeout",
