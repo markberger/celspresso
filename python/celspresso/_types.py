@@ -257,13 +257,20 @@ class SchemaBuilder:
 
     # -- public -----------------------------------------------------------
 
-    def declare(self, structs: Iterable[Struct]) -> None:
-        """Add `schema.Struct` declarations. Redeclaring a name is fine if the definition
-        is identical; a different struct (or a class) under the same name is an error."""
-        new = list(structs)
+    def declare(self, structs: Iterable[Any]) -> None:
+        """Add `schema.Struct` declarations, and register classes (a Pydantic model, a
+        dataclass, anything an adapter maps to a struct) so expressions can build them
+        (`Decision{...}`) even when no variable has that type. Redeclaring a name is fine
+        if the definition is identical; a different struct (or a class) under the same
+        name is an error."""
+        items = list(structs)
+        for st in items:
+            if not isinstance(st, (Struct, type)):
+                raise TypeError(
+                    f"structs=[...] expects celspresso.schema.Struct values or classes, got {st!r}"
+                )
+        new = [st for st in items if isinstance(st, Struct)]
         for st in new:
-            if not isinstance(st, Struct):
-                raise TypeError(f"structs=[...] expects celspresso.schema.Struct values, got {st!r}")
             spec = st._spec()
             if st.name in self.structs:
                 if st.name in self.owners:
@@ -279,6 +286,13 @@ class SchemaBuilder:
                 where = f"{st.name}.{f.name}"
                 self._check_refs(f.type._spec, where, by_name=True)
                 _check_constraints(f.type._spec, f.constraints, where)
+        for cls in items:
+            if isinstance(cls, type):
+                spec, _ = self.convert(cls, f"structs=[{cls.__name__}]")
+                if not (isinstance(spec, tuple) and spec[0] == "struct"):
+                    raise TypeError(
+                        f"structs=[{cls.__name__}]: {cls!r} is not a struct type (a model or dataclass)"
+                    )
 
     def _check_refs(self, spec: TypeSpec, where: str, *, by_name: bool) -> None:
         """Every struct `spec` mentions must exist. `by_name` refs (a user's T.struct) may
@@ -468,6 +482,11 @@ class SchemaBuilder:
                 args = (args[0],)
             elif origin is tuple and len(set(args)) > 1:
                 raise TypeError(f"{where}: heterogeneous tuples are not supported; use list[T]")
+            elif origin is tuple and args and args != ((),):
+                # a fixed-length tuple has exactly that many items
+                n = len(args)
+                cons["min_length"] = max(cons.get("min_length", n), n)
+                cons["max_length"] = min(cons.get("max_length", n), n)
             item_cons: dict[str, Any] = {}
             elem = self._convert(args[0], item_cons, f"{where}[]") if args else "dyn"
             if item_cons:
@@ -641,7 +660,7 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: 
                             " take ge/gt/le/lt (state a bound on a date, time or duration as an"
                             " assumption: env.assume(...))"
                         )
-                    val = val if isinstance(val, decimal.Decimal) else float(val)
+                    val = val if isinstance(val, (decimal.Decimal, int)) else float(val)
                 elif key == "pattern" and not isinstance(val, str):
                     val = getattr(val, "pattern", val)  # a compiled re.Pattern
                 cons[key] = val

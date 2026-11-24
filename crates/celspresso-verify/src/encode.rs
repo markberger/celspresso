@@ -647,6 +647,9 @@ impl Encoder {
                     self.bounded = true;
                 }
                 let init = self.enc(c, &comp.accu_init);
+                // the evaluator computes the initial value up front, so its error is the
+                // comprehension's even if nothing reads it (`cel.bind(r, 1 / x, true)`)
+                let init_err = init.err.clone();
                 self.locals.push((comp.accu_var.clone(), init));
                 let accu_idx = self.locals.len() - 1;
                 let mut stopped = ff();
@@ -673,7 +676,7 @@ impl Encoder {
                 }
                 let mut res = self.enc(c, &comp.result);
                 self.locals.truncate(accu_idx);
-                res.err = or(&[&res.err, &range.err]);
+                res.err = or(&[&res.err, &range.err, &init_err]);
                 res
             }
             ExprKind::Call { function, args, .. } if function == ops::OPT_SELECT && args.len() == 2 => {

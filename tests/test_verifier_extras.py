@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import BaseModel, Field
 
-from celspresso import Bounds, CelSubsetError, CelTypeError, Env, RuleSet, function
+from celspresso import Bounds, CelEvaluationError, CelSubsetError, CelTypeError, Env, RuleSet, function
 from celspresso._env import _debug_options
 
 
@@ -140,3 +140,16 @@ def test_comprehensions_over_a_nullable_list() -> None:
     assert v.counterexample.relevant == {"t.tags": None}
     found = e.predicate("t.tags != null && t.tags.exists(x, x == 'y') && size(t.tags) == 2").satisfiable()
     assert found.proved
+
+
+def test_an_unused_argument_that_fails_still_fails() -> None:
+    # the evaluator computes bound values (and a definition's arguments) up front, so the
+    # verifier must count their errors even when nothing reads them
+    env = Env(x=int).define("always_one", "1", params={"v": int})
+    for src in ("cel.bind(r, 10 / x, true)", "always_one(10 / x) == 1"):
+        p = env.predicate(src)
+        v = p.never_errors()
+        assert v.refuted, src
+        assert v.counterexample == {"x": 0}, src
+        with pytest.raises(CelEvaluationError):
+            p.evaluate({"x": 0})

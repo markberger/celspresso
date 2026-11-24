@@ -182,6 +182,11 @@ fn error_semantics() {
         s => panic!("{s:?}"),
     }
     assert!(matches!(run(Query::CanError(&c("x + 0 == x || true"))).status, Status::NotFound));
+    // a bound value is computed up front: its error counts even when nothing reads it
+    match run(Query::CanError(&c("cel.bind(r, 10 / x, true)"))).status {
+        Status::Found(w) => assert_eq!(w["x"], Value::Int(0)),
+        s => panic!("{s:?}"),
+    }
 }
 
 #[test]

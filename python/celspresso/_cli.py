@@ -14,12 +14,31 @@ A rule file (TOML, JSON, or YAML when PyYAML is installed) names its variables a
     [require]                                # what each rule must allow
     damaged_recent = "order.status == 'damaged' && order.days_since_delivery <= 7"
 
+Rules may compute a value instead (an amount, a label, a struct). Say what every result
+must satisfy with `ensures`, over the inputs and `result`::
+
+    vars = { order = "refunds:Order" }
+    structs = ["refunds:Decision"]           # classes the rules may build: Decision{...}
+    returns = "refunds:Decision"             # optional: the type every rule must give
+    # (a file's rules share its spec: give true/false and value rules separate files)
+
+    [rules]
+    refund = '''order.status == 'lost'
+        ? Decision{action: 'refund', amount: order.total_cents}
+        : Decision{action: 'deny', amount: 0}'''
+
+    [ensures]
+    capped = "result.amount <= order.total_cents"
+
+Invariants and require entries apply only to true/false rules.
+
 Exit status:
 
 - 0: everything was proved.
 - 1: a rule has problems. For `check`, a rule was rejected. For `diff`, a rule in the new
   file is invalid or undecided, or fails its check; with `--fail-on-change`, also any
-  change to a rule's behaviour, an invariant, a require entry or an assumption.
+  change to a rule's behaviour, the spec (invariants, require, ensures, returns) or an
+  assumption.
 - 2: the command line or the file can't be used (including a file with no rules), or
   celspresso itself failed.
 """
@@ -38,7 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import __version__
-from ._env import Env, Predicate, Problem, RuleCheck, _value_or_error
+from ._env import Env, Expr, Problem, RuleCheck, _value_or_error
 from ._errors import CelError
 from ._spec import Spec
 from ._verdict import Difference, _outcome
@@ -51,8 +70,16 @@ if TYPE_CHECKING:
 __all__ = ["main"]
 
 _TYPES: dict[str, Any] = {"int": int, "str": str, "bool": bool}
-_SECTIONS = ("rules", "invariants", "require")
-_SINGULAR = {"rules": "rule", "invariants": "invariant", "require": "require", "assumptions": "assumption"}
+_SECTIONS = ("rules", "invariants", "require", "ensures")
+_CONDITIONS = ("invariants", "require", "ensures")
+_SINGULAR = {
+    "rules": "rule",
+    "invariants": "invariant",
+    "require": "require",
+    "ensures": "ensures",
+    "returns": "returns",
+    "assumptions": "assumption",
+}
 
 
 class UsageError(Exception):
@@ -70,12 +97,22 @@ class RuleFile:
     rules: dict[str, str]
     invariants: dict[str, str] = field(default_factory=dict)
     require: dict[str, str] = field(default_factory=dict)
+    ensures: dict[str, str] = field(default_factory=dict)
     assumptions: list[str] = field(default_factory=list)
+    returns: str | None = None  # as written in the file
+    returns_type: Any = None
 
     @property
     def spec(self) -> Spec:
-        """The file's invariants, require entries and assumptions, as one Spec."""
-        return Spec(self.invariants, require=self.require, assumptions=self.assumptions)
+        """The file's invariants, require and ensures entries, result type and
+        assumptions, as one Spec."""
+        return Spec(
+            self.invariants,
+            require=self.require,
+            ensures=self.ensures,
+            returns=self.returns_type,
+            assumptions=self.assumptions,
+        )
 
     def line_of(self, name: str, section: str = "rules") -> int:
         """The 1-based line that defines `name` in `section` ("rules", "invariants",
@@ -249,50 +286,82 @@ def _strings(data: dict[str, Any], key: str, path: str) -> dict[str, str]:
 
 
 def build_env(data: dict[str, Any], path: str) -> Env:
-    """The Env a rule file describes: `env = "module:attr"`, or a table of `vars`."""
-    sys.path[:0] = [p for p in (str(Path(path).resolve().parent), str(Path.cwd())) if p not in sys.path]
+    """The Env a rule file describes: `env = "module:attr"`, or a table of `vars`; plus
+    any `structs` the rules build."""
+    _add_import_paths(path)
     if "env" in data and "vars" in data:
         raise UsageError(f"{path}: give either env or vars, not both")
+    raw_structs = data.get("structs", [])
+    if not isinstance(raw_structs, list) or not all(isinstance(t, str) for t in raw_structs):
+        raise UsageError(f'{path}: structs must be a list of types ("module:Type")')
+    structs = [_import(t, f"{path}: structs") for t in raw_structs]
     if "env" in data:
         env = _import(str(data["env"]), f"{path}: env")
         if not isinstance(env, Env):
             raise UsageError(f"{path}: env {data['env']!r} is a {type(env).__name__}, not a celspresso Env")
-        return env
+        if not structs:
+            return env
+        try:
+            return env.extend(structs=structs)
+        except (TypeError, ValueError) as e:
+            raise UsageError(f"{path}: {e}") from None
     raw = data.get("vars")
     if not isinstance(raw, dict) or not raw:
         raise UsageError(f'{path}: declare the rules\' variables with vars = {{ name = "module:Type" }}')
     variables = {str(n): _import(str(t), f"{path}: vars.{n}") for n, t in raw.items()}
     try:
-        return Env(variables)
+        return Env(variables, structs=structs)
     except (TypeError, ValueError) as e:
         raise UsageError(f"{path}: {e}") from None
+
+
+def _add_import_paths(path: str) -> None:
+    """Let `module:attr` references find modules next to the file and in the cwd."""
+    sys.path[:0] = [p for p in (str(Path(path).resolve().parent), str(Path.cwd())) if p not in sys.path]
 
 
 def load(path: str, *, text: str | None = None, env: Env | None = None, validate: bool = True) -> RuleFile:
     """Read a rule file. `text` overrides the file's contents (an older git revision),
     and `env` reuses an Env instead of building the file's own. With `validate`, every
-    invariant, require entry and assumption must compile (rules are reported per rule)."""
+    invariant, require entry and assumption must compile (rules, and ensures entries,
+    which depend on a rule's result, are reported per rule)."""
     if text is None:
         try:
             text = Path(path).read_text(encoding="utf-8")
         except OSError as e:
             raise UsageError(f"can't read {path}: {e.strerror}") from None
     data = parse(text, path)
-    unknown = set(data) - {"env", "vars", "assumptions", *_SECTIONS}
+    unknown = set(data) - {"env", "vars", "structs", "returns", "assumptions", *_SECTIONS}
     if unknown:
         raise UsageError(f"{path}: unknown setting(s): {', '.join(sorted(unknown))}")
     assumptions = data.get("assumptions", [])
     if not isinstance(assumptions, list) or not all(isinstance(a, str) for a in assumptions):
         raise UsageError(f"{path}: assumptions must be a list of CEL expressions (strings)")
+    returns = data.get("returns")
+    if returns is not None and not isinstance(returns, str):
+        raise UsageError(f'{path}: returns must be a type ("module:Type", or int, str, bool)')
+    env = env if env is not None else build_env(data, path)
+    if returns is not None:
+        _add_import_paths(path)
     rf = RuleFile(
         path=path,
         text=text,
-        env=env if env is not None else build_env(data, path),
+        env=env,
         rules=_strings(data, "rules", path),
         invariants=_strings(data, "invariants", path),
         require=_strings(data, "require", path),
+        ensures=_strings(data, "ensures", path),
         assumptions=assumptions,
+        returns=returns,
+        returns_type=None if returns is None else _import(returns, f"{path}: returns"),
     )
+    if rf.returns_type is not None:
+        try:
+            rf.env._builder.copy().convert(rf.returns_type, "returns")
+        except (TypeError, ValueError) as e:
+            raise UsageError(
+                f"{path}: returns = {returns!r} is not a type celspresso can check: {e}"
+            ) from None
     if validate:
         conditions = [
             *((f"[{s}] {k}", v) for s in ("invariants", "require") for k, v in getattr(rf, s).items()),
@@ -365,8 +434,9 @@ class Example:
 class Change:
     """One entry of a diff. For a rule (`section="rules"`): how its behaviour changed, one
     of added, removed, changed, unchanged, undecided or invalid. For an invariant, a
-    require entry or an assumption: added, removed or changed (assumptions, a list, are
-    named by their text and are only ever added or removed)."""
+    require or ensures entry, the result type or an assumption: added, removed or
+    changed (assumptions, a list, are named by their text and are only ever added or
+    removed)."""
 
     name: str
     status: str
@@ -380,23 +450,23 @@ class Change:
     def label(self) -> str:
         if self.section == "rules":
             return self.name
-        if self.section == "assumptions":
-            return "assumption"
+        if self.section in ("assumptions", "returns"):
+            return _SINGULAR[self.section]  # one entry, named by its value
         return f"{_SINGULAR[self.section]} {self.name}"
 
 
-def _compile(env: Env, source: str | None) -> tuple[Predicate | None, str | None]:
+def _compile(env: Env, source: str | None) -> tuple[Expr[Any] | None, str | None]:
     if source is None:
         return None, None
     try:
-        return env.predicate(source), None
+        return env.compile(source), None
     except CelError as e:
         return None, str(e)
 
 
 def run_diff(old: RuleFile, new: RuleFile, *, limit: int = 3, timeout: float | None = None) -> list[Change]:
     """Every rule in either file with its behaviour change, then every edit to the
-    invariants, require entries and assumptions. Both versions of a rule are compiled
+    invariants, require and ensures entries, result type and assumptions. Both versions of a rule are compiled
     against the new file's Env and compared under the assumptions the two files share
     (an assumption added in the new file can't hide a change)."""
     shared = [a for a in new.assumptions if a in old.assumptions]
@@ -404,7 +474,7 @@ def run_diff(old: RuleFile, new: RuleFile, *, limit: int = 3, timeout: float | N
         _rule_change(new.env, name, old.rules.get(name), new.rules.get(name), shared, limit, timeout)
         for name in [*old.rules, *(n for n in new.rules if n not in old.rules)]
     ]
-    for section in ("invariants", "require"):
+    for section in _CONDITIONS:
         before: dict[str, str] = getattr(old, section)
         after: dict[str, str] = getattr(new, section)
         for name in [*before, *(n for n in after if n not in before)]:
@@ -412,6 +482,9 @@ def run_diff(old: RuleFile, new: RuleFile, *, limit: int = 3, timeout: float | N
             if a != b:
                 status = "added" if a is None else "removed" if b is None else "changed"
                 out.append(Change(name, status, a, b, section=section))
+    if old.returns != new.returns:
+        status = "added" if old.returns is None else "removed" if new.returns is None else "changed"
+        out.append(Change("returns", status, old.returns, new.returns, section="returns"))
     out += [Change(a, "removed", a, None, section="assumptions") for a in old.assumptions if a not in shared]
     out += [Change(a, "added", None, a, section="assumptions") for a in new.assumptions if a not in shared]
     return out
@@ -437,6 +510,9 @@ def _rule_change(
         return Change(name, "added", a, b, reason=f"the old version didn't compile: {old_error}")
     if pa.canonical == pb.canonical:
         return Change(name, "unchanged", a, b)
+    if "dyn" not in (pa.output_type, pb.output_type) and pa.output_type != pb.output_type:
+        why = f"it now gives {pb.output_type}, not {pa.output_type}"
+        return Change(name, "changed", a, b, reason=why)
     v = pa.equivalent(pb, assuming=assuming, timeout=timeout)
     if v.proved:
         return Change(name, "unchanged", a, b, reason="rewritten, but proved equivalent")
@@ -545,8 +621,10 @@ def diff_markdown(changes: list[Change], label: str) -> str:
         return head + f"No rule changed behaviour ({n} rule{'s' if n != 1 else ''} compared).\n"
     out = [head + _summary(changes) + "\n"]
     for c in interesting:
-        title = {"rules": "", "assumptions": "assumption"}.get(c.section, _SINGULAR[c.section] + " ")
-        if c.section != "assumptions":
+        title = {"rules": "", "assumptions": "assumption", "returns": "returns"}.get(
+            c.section, _SINGULAR[c.section] + " "
+        )
+        if c.section not in ("assumptions", "returns"):
             title += _code(c.name)
         out.append(f"#### {title}: {c.status}\n")
         if c.old is not None and c.new is not None:
@@ -574,7 +652,7 @@ def _summary(changes: list[Change]) -> str:
     parts = [f"**{counts[s]} {s}**" if s != "unchanged" else f"{counts[s]} {s}" for s in order if s in counts]
     edits = sum(c.section != "rules" for c in changes)
     if edits:
-        parts.append(f"**{edits} invariant, require or assumption edit{'s' if edits != 1 else ''}**")
+        parts.append(f"**{edits} spec or assumption edit{'s' if edits != 1 else ''}**")
     return ", ".join(parts)
 
 
@@ -750,7 +828,7 @@ def cmd_diff(args: argparse.Namespace, out: Callable[[str], None]) -> int:
     )
     checks = run_check(new, names, args.timeout) if args.check else {}
     heading = (
-        "checks on every rule (invariants, require entries or assumptions changed):"
+        "checks on every rule (the spec or assumptions changed):"
         if everything
         else "checks on added and changed rules:"
     )
@@ -791,7 +869,10 @@ def _parser() -> argparse.ArgumentParser:
     }
     timeout: dict[str, Any] = {"type": float, "default": None, "help": "seconds per solver query"}
 
-    c = sub.add_parser("check", help="prove each rule can fire, can't fail, and keeps the invariants")
+    c = sub.add_parser(
+        "check",
+        help="prove each rule can fire, can't fail, and keeps the invariants (or, for a value, the ensures)",
+    )
     c.add_argument("file", help="rule file (.toml, .json, .yaml)")
     c.add_argument("--rule", action="append", help="check only this rule (repeatable)")
     c.add_argument("--format", **fmt)
@@ -812,7 +893,7 @@ def _parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--fail-on-change",
         action="store_true",
-        help="exit 1 if any rule's behaviour, invariant, require entry or assumption changed",
+        help="exit 1 if any rule's behaviour, the spec or an assumption changed",
     )
     d.add_argument("--format", **fmt)
     d.add_argument("--timeout", **timeout)

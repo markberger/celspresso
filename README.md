@@ -53,7 +53,7 @@ uv sync --group dev && uv run maturin develop --release
 | `a.diff(b)` | Where do they disagree, and why? | one input per distinct reason, with both answers |
 | `e.never_errors()` | Is evaluation free of failures (÷0, overflow, missing key)? | `PROVED` / `REFUTED` + counterexample |
 | `e.bounds()` | What's the smallest and largest value it can take? | proved `[min, max]` + an input for each |
-| `env.check_rule(src, spec)` | Is this rule safe, and useful enough, to accept? | report |
+| `env.check_rule(src, spec)` | Is this rule (a predicate, or one that computes a value) safe, and useful enough, to accept? | report |
 
 The status always answers the question asked: `PROVED` means the property holds, `REFUTED` that it doesn't, `UNKNOWN` that the solver couldn't decide. `verdict.expect()` passes only on `PROVED`.
 
@@ -116,6 +116,42 @@ print(env.check_rule(rule, spec))
 # - too narrow: doesn't allow 'small lost orders', e.g. when order.days_since_delivery = 91, order.status = 'lost', order.total_cents = 0
 ```
 
+### Rules that compute a value
+
+Most logic an agent writes computes something: an amount, a queue name, or a decision plus its parameters. A rule can return any type, including a struct the rule builds itself. Declare the struct's class with `structs=[...]`. `ensures` then states what every result must satisfy, over the inputs and `result`:
+
+```python
+class Decision(BaseModel):
+    action: Literal["refund", "escalate", "deny"]
+    amount_cents: int
+
+env = Env(order=Order, structs=[Decision])
+DECISIONS = Spec(
+    returns=Decision,
+    ensures={
+        "never refund more than was paid": "result.amount_cents <= order.total_cents",
+        "only refunds move money": "result.action == 'refund' || result.amount_cents == 0",
+        "refunds over $500 need a human": "result.action != 'refund' || result.amount_cents <= 50000",
+    },
+)
+print(env.check_rule("""
+    order.status == 'lost'
+        ? (order.total_cents <= 50000 ? Decision{action: 'refund', amount_cents: order.total_cents}
+                                      : Decision{action: 'escalate', amount_cents: order.total_cents})
+        : Decision{action: 'deny', amount_cents: 0}
+""", DECISIONS))
+# rejected:
+# - violates ensures 'only refunds move money' when order.status = 'lost', order.total_cents = 50001: the result is Decision(action='escalate', amount_cents=50001)
+```
+
+How the checks treat a rule that computes a value:
+- `returns` makes a result of the wrong type a rejection. For a fixed-point result, `returns=T.fixed(...)` also makes examples and reports use `Decimal`s.
+- A result must meet the constraints its class declares: `Literal` and enum values, `ge`/`gt`/`le`/`lt`, `min_length`/`max_length`, `pattern`, and tuple lengths, through lists, maps, optional fields and nested structs. The verifier assumes these of inputs, but checks a value the rule builds. Custom validators, `multiple_of`, map-key constraints and `Literal[True]` are not checked.
+- `examples` take the expected result: a value, a model instance, or a dict of its fields.
+- Inputs on which the rule fails are reported once, as a runtime failure. The `ensures` checks cover only the inputs where the rule has a value.
+- Invariants and `require` apply only to true/false rules.
+- `check_rule` accepts a rule that computes a value only when the spec says something about results (`returns` or `ensures`). So a gate written for true/false rules never passes such a rule by accident.
+
 `check_rule` also flags code that type-checks but can't be what was meant. For example, `order.tier == 'Gold'` can never be true when the tier is `'standard'` or `'gold'`. Habits from other languages get a pointer to the CEL form: `and` → `&&`, `len(x)` → `size(x)`, `None` → `null`.
 
 `env.describe()` gives an LLM everything it needs in one block of text: variables, fields, types and constraints, functions, definitions and a CEL cheat sheet. The report is plain text too, so the two drive a repair loop:
@@ -148,6 +184,17 @@ lost = "order.status == 'lost' && order.days_since_delivery <= 60 && order.total
 [invariants]
 capped = "order.total_cents <= 50000"
 recent = "order.days_since_delivery <= 90"
+```
+
+Rules that compute a value take an `[ensures]` table over `result`. They can also take the result type and the classes the rules build:
+
+```toml
+vars = { order = "refunds:Order" }
+structs = ["refunds:Decision"]
+returns = "refunds:Decision"
+
+[ensures]
+capped = "result.amount_cents <= order.total_cents"
 ```
 
 `celspresso check rules.toml` runs `check_rule` on every rule and exits non-zero if any is rejected. `celspresso diff rules.toml --against main` compares each rule with its version at a git revision. Instead of a text diff, it reports what the change *does*:

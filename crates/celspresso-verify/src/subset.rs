@@ -404,6 +404,9 @@ fn violations_in(c: &CheckedExpr, check_sizes: bool) -> Vec<(String, Span)> {
             return;
         }
         let before = out.len();
+        if let Some(why) = unset_fields(c, e) {
+            out.push((why, e.span));
+        }
         builtin_violations(c, e, &sizes, &mut out);
         // a list or map past the encoded length can be refuted but never proved; report it
         // where it originates, and not on top of an unsupported builtin
@@ -418,6 +421,24 @@ fn violations_in(c: &CheckedExpr, check_sizes: bool) -> Vec<(String, Span)> {
         }
     });
     out
+}
+
+/// A struct literal that leaves a field out. Fields have no defaults here: reading an
+/// unset one is an error, and a result missing one can't become a Python value. So
+/// every field is set, which also keeps a rule's output explicit.
+fn unset_fields(c: &CheckedExpr, e: &Expr) -> Option<String> {
+    let ExprKind::Struct { type_name, fields } = &e.kind else { return None };
+    let decl = c.schema.structs.get(type_name)?;
+    let missing: Vec<String> =
+        decl.fields.iter().filter(|f| !fields.iter().any(|(n, _)| n == &f.name)).map(|f| format!("'{}'", f.name)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let (s, them) = if missing.len() == 1 { ("", "it") } else { ("s", "them") };
+    Some(format!(
+        "{type_name}{{...}} leaves out field{s} {}: fields have no default values in celspresso's CEL subset; set {them} (to null, for a nullable field)",
+        missing.join(", ")
+    ))
 }
 
 /// Builtins outside the subset (or used in ways outside it) at the call `e`.

@@ -608,13 +608,16 @@ def test_spec_is_a_read_only_value() -> None:
     with pytest.raises(TypeError, match="unhashable"):
         hash(spec)
     assert spec == Spec(["x < 10"], examples=[({"x": 1}, True)])
-    with pytest.raises(TypeError, match="compiled Predicate"):
+    with pytest.raises(TypeError, match="compiled rule"):
         spec.check("x < 5")  # type: ignore[arg-type]
     import copy
     import pickle
 
     assert copy.deepcopy(spec) == spec
     assert pickle.loads(pickle.dumps(spec)) == spec
+    full = Spec(ensures={"small": "result < 10"}, returns=int, examples=[({"x": 1}, 2)]).assuming("x > 0")
+    assert pickle.loads(pickle.dumps(full)) == full
+    assert (full.returns, dict(full.ensures), full.assumptions) == (int, {"small": "result < 10"}, ("x > 0",))
 
 
 def test_removed_env_options_say_so() -> None:
