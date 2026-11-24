@@ -182,7 +182,7 @@ def scaling_lists(runs: int) -> None:
                 measure(env.predicate("xs.filter(x, x > 0).map(x, x * 2).all(y, y > 0)").always_true, runs),
             )
         )
-    table("Scaling: list length (exact, no unroll bound)", rows)
+    table("Scaling: list length (max_length, exact)", rows)
 
 
 def batch_ops(runs: int) -> None:

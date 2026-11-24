@@ -71,7 +71,7 @@ def test_int_parsing_errors_are_found() -> None:
 
 
 def test_a_split_gets_a_slot_for_every_piece_it_can_have() -> None:
-    # 12 characters can split into 13 pieces, more than the 5-element unroll limit
+    # 12 characters can split into 13 pieces, more than a first solve's 5 split slots
     v = env.predicate("s.split(',').size() <= 12").always_true()
     assert v.refuted
     assert env.predicate("s.split(',').size() <= 13").always_true().proved

@@ -226,10 +226,9 @@ def test_env_construction_errors() -> None:
 
 
 def test_env_introspection_and_options() -> None:
-    env = Env(x=int, s=str).extend(timeout=1.0, unroll_limit=2, y=int)
+    env = Env(x=int, s=str).extend(timeout=1.0, y=int)
     assert repr(env) == "Env(x: int, s: string, y: int)"
     assert env._timeout == 1.0
-    assert env._unroll == 2
 
 
 def test_renamed_function_and_table_mapping() -> None:
@@ -279,11 +278,11 @@ def test_expr_equality_is_syntactic_and_hashable() -> None:
 
 
 def test_option_names_as_variables() -> None:
-    env = Env({"timeout": int, "unroll_limit": str}, timeout=2.0, flag=bool)
-    assert env.variables == {"timeout": "int", "unroll_limit": "string", "flag": "bool"}
-    assert env.predicate("timeout > 3 && flag").evaluate({"timeout": 5, "unroll_limit": "", "flag": True})
+    env = Env({"timeout": int, "limits": str}, timeout=2.0, flag=bool)
+    assert env.variables == {"timeout": "int", "limits": "string", "flag": "bool"}
+    assert env.predicate("timeout > 3 && flag").evaluate({"timeout": 5, "limits": "", "flag": True})
     env2 = Env(x=int).extend(
-        {"functions": Annotated[list[int], Field(max_length=3)], "assumptions": str}, unroll_limit=3
+        {"functions": Annotated[list[int], Field(max_length=3)], "assumptions": str}, timeout=3.0
     )
     assert env2.variables["functions"] == "list(int)"
     assert env2.predicate("size(functions) > 0").satisfiable().proved
@@ -291,7 +290,7 @@ def test_option_names_as_variables() -> None:
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"timeout": int}, {"timeout": True}, {"unroll_limit": 2.5}],
+    [{"timeout": int}, {"timeout": True}, {"limits": int}],
 )
 def test_option_clash_gives_clear_error(kwargs: dict[str, object]) -> None:
     with pytest.raises(TypeError, match="is an Env option"):
@@ -416,7 +415,7 @@ def test_verdict_unknown_and_timeout() -> None:
     with pytest.raises(VerificationTimeout):
         timed_out.expect()
     assert "bounded=True" in repr(timed_out)
-    assert "unroll limit" in str(timed_out)
+    assert "cut off" in str(timed_out)
     with pytest.raises(VerificationFailed) as ei:
         Verdict(Status.REFUTED, "q").expect()
     assert ei.value.verdict.refuted
@@ -623,6 +622,8 @@ def test_removed_env_options_say_so() -> None:
         Env(x=int, schema_constraints=False)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="no longer an Env option"):
         Env(x=int, debug_sample_proofs=3)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="no longer an Env option"):
+        Env(x=int).extend(unroll_limit=5)  # type: ignore[arg-type]
     assert Env(schema_constraints=bool).variables == {"schema_constraints": "bool"}
     assert Env(schema_constraints=int | None).variables == {"schema_constraints": "int?"}
     with pytest.raises(TypeError, match=r"env\.assume"):

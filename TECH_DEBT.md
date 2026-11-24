@@ -156,7 +156,7 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   under the same bindings), so `a <=> a` and shared subterms are free; a cheaper split
   encoding for a literal one-character separator; the case-mapping fix above.
 - *Found:* contract fuzzer (fuzzer milestone). The fuzzer also found that split used
-  `unroll_limit` slots on bounded strings (now grown up to 32 slots until no overflow is
+  the fixed unroll limit's slots on bounded strings (now grown up to 32 slots until no overflow is
   possible) and that overflowing split models gave witnesses that never replayed (now
   excluded from the solve).
 - Contract (`ensures`, `total=True`) facts were asserted for every encoded call, even
@@ -188,7 +188,7 @@ Remaining limits of those:
   (each extra character costs solver time). Facts about longer strings that depend on
   later characters may be UNKNOWN; counterexamples are always replayed, so never wrong.
 - A split inside a contract (`ensures`) reads a parameter with no declared length, so it
-  still uses `unroll_limit` slots and may overflow (UNKNOWN, never wrong). Contract bodies
+  has no static piece count: it gets the retry's slots (up to 32) and may overflow (UNKNOWN, never wrong). Contract bodies
   skip the size check (each use passes bounded arguments), but contracts aren't expanded at
   the use, so nothing checks the split: `ensures="p.split(',').size() <= 40"` with an
   argument of max_length 60 takes 10-20 s to come back UNKNOWN (review of M1).

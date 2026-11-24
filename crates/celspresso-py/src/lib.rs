@@ -895,7 +895,7 @@ impl Program {
 
 /// kind: satisfiable | always_true | equivalent | implies | can_error
 #[pyfunction]
-#[pyo3(signature = (kind, a, b, assumptions, timeout_ms, unroll_limit, schema_constraints, errors, functions=None, sample_proofs=0))]
+#[pyo3(signature = (kind, a, b, assumptions, timeout_ms, schema_constraints, errors, functions=None, sample_proofs=0))]
 #[allow(clippy::too_many_arguments)]
 fn verify<'py>(
     py: Python<'py>,
@@ -904,7 +904,6 @@ fn verify<'py>(
     b: Option<PyRef<'py, Program>>,
     assumptions: Vec<PyRef<'py, Program>>,
     timeout_ms: u64,
-    unroll_limit: usize,
     schema_constraints: bool,
     errors: &str,
     functions: Option<&Bound<'py, PyDict>>,
@@ -922,7 +921,7 @@ fn verify<'py>(
     let kind_owned = kind.to_string();
     let bb = if matches!(kind, "equivalent" | "implies") { Some(need_b()?) } else { None };
     let funcs = PyFunctions::from_dict(functions)?;
-    let opts = Options { timeout_ms, unroll_limit, schema_constraints, sample_proofs };
+    let opts = Options { timeout_ms, schema_constraints, sample_proofs };
     let out = py.detach(|| {
         let refs: Vec<&CheckedExpr> = asm.iter().map(|x| x.as_ref()).collect();
         let q = match kind_owned.as_str() {
@@ -966,13 +965,12 @@ fn verify<'py>(
 
 /// The range of a numeric expression: {min, max: {value, witness, attained, sound} | None, reason, ...}.
 #[pyfunction]
-#[pyo3(signature = (a, assumptions, timeout_ms, unroll_limit, schema_constraints, functions=None))]
+#[pyo3(signature = (a, assumptions, timeout_ms, schema_constraints, functions=None))]
 fn bounds<'py>(
     py: Python<'py>,
     a: PyRef<'py, Program>,
     assumptions: Vec<PyRef<'py, Program>>,
     timeout_ms: u64,
-    unroll_limit: usize,
     schema_constraints: bool,
     functions: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -980,7 +978,7 @@ fn bounds<'py>(
     let ae = a.checked.clone();
     let asm: Vec<Arc<CheckedExpr>> = assumptions.iter().map(|p| p.checked.clone()).collect();
     let funcs = PyFunctions::from_dict(functions)?;
-    let opts = Options { timeout_ms, unroll_limit, schema_constraints, sample_proofs };
+    let opts = Options { timeout_ms, schema_constraints, sample_proofs };
     let out = py.detach(|| {
         let refs: Vec<&CheckedExpr> = asm.iter().map(|x| x.as_ref()).collect();
         run_bounds(&ae, &refs, opts, &funcs)

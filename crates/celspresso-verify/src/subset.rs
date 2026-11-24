@@ -73,7 +73,7 @@ const ALLOWED: &[&str] = &[
     "string_upper_ascii",
     "list_join",
     "list_join_string",
-    // lists and maps (bounded by max_length or the unroll limit)
+    // lists and maps (the subset requires a static bound on each: see sizes.rs)
     "add_list",
     "index_list",
     "index_map",

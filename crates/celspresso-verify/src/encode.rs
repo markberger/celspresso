@@ -12,23 +12,26 @@ use z3::ast::{Ast, Bool, Dynamic, Float, Int, Int as ZInt, RoundingMode, String 
 use z3::{FuncDecl, Model, Sort};
 
 pub const MAX_SLOTS: usize = 64;
+
+/// Slots for a list or map with no static bound, and a split's first try. The subset admits
+/// no such list or map, so one is reached only through an approximation; results that rely
+/// on it are UNKNOWN, never wrong (`bounded`).
+pub const FALLBACK_SLOTS: usize = 5;
 const I64_MIN: i64 = i64::MIN;
 const I64_MAX: i64 = i64::MAX;
 
 pub struct Encoder {
     schema: Arc<Schema>,
-    pub unroll: usize,
     pub schema_constraints: bool,
-    /// Give every split all the slots its static bound allows (for bounds(), which has no
-    /// retry), instead of starting at the unroll limit.
-    pub exact_splits: bool,
+    /// Most slots a split gets (fewer if its static bound allows fewer pieces).
+    pub split_slots: usize,
     /// Root variables (built lazily on first reference).
     pub vars: BTreeMap<String, Sym>,
     /// Facts about inputs: type ranges and schema constraints.
     pub assumptions: Vec<Bool>,
     /// Soft preferences for readable witnesses.
     pub soft: Vec<Bool>,
-    /// Some consumed list may have been truncated at the unroll bound.
+    /// Some consumed list or map may have been cut off at `FALLBACK_SLOTS`.
     pub bounded: bool,
     /// Places where the encoding over-approximates (named in UNKNOWN reasons).
     pub approximations: BTreeSet<String>,
@@ -49,8 +52,8 @@ pub struct Encoder {
     index_terms: Vec<(ZStr, ZStr, ZInt, bool)>,
     /// lowerAscii and upperAscii as uninterpreted String -> String functions (plus axioms).
     case_funcs: Option<(FuncDecl, FuncDecl)>,
-    /// Conditions under which some value was cut off at the unroll bound (a split with
-    /// more pieces than slots). A proof holds only if the assumptions rule them all out.
+    /// Conditions under which a split was cut off (more pieces than slots, or a string past
+    /// its static length bound). A proof holds only if the assumptions rule them all out.
     pub overflow: Vec<Bool>,
     /// Conditions under which the expression being encoded actually runs (a taken ternary
     /// branch, a right operand that isn't short-circuited, a live comprehension step).
@@ -84,12 +87,11 @@ fn uint_range(x: &Int) -> Bool {
 }
 
 impl Encoder {
-    pub fn new(schema: Arc<Schema>, unroll: usize, schema_constraints: bool) -> Encoder {
+    pub fn new(schema: Arc<Schema>, schema_constraints: bool) -> Encoder {
         Encoder {
             schema,
-            unroll,
+            split_slots: FALLBACK_SLOTS,
             schema_constraints,
-            exact_splits: false,
             vars: BTreeMap::new(),
             assumptions: Vec::new(),
             soft: Vec::new(),
@@ -297,9 +299,9 @@ impl Encoder {
             CelType::List(elem) => {
                 let max_len = cons.and_then(|c| c.max_length);
                 let (n, trunc) = match max_len {
-                    // a declared max_length raises the unroll bound automatically, so the encoding is exact
-                    Some(m) if (m as usize) <= self.unroll.max(MAX_SLOTS) => (m as usize, false),
-                    _ => (self.unroll, true),
+                    // a declared max_length makes the encoding exact
+                    Some(m) if (m as usize) <= MAX_SLOTS => (m as usize, false),
+                    _ => (FALLBACK_SLOTS, true),
                 };
                 let len = Int::new_const(format!("{path}#len"));
                 self.assumptions.push(int_range(&len, 0, n as i64));
@@ -322,8 +324,8 @@ impl Encoder {
             CelType::Map(kt, vt) if depth < 8 && is_key_type(kt) => {
                 let max_len = cons.and_then(|c| c.max_length);
                 let (n, trunc) = match max_len {
-                    Some(m) if (m as usize) <= self.unroll.max(MAX_SLOTS) => (m as usize, false),
-                    _ => (self.unroll, true),
+                    Some(m) if (m as usize) <= MAX_SLOTS => (m as usize, false),
+                    _ => (FALLBACK_SLOTS, true),
                 };
                 let len = Int::new_const(format!("{path}#len"));
                 self.assumptions.push(int_range(&len, 0, n as i64));
@@ -427,8 +429,8 @@ impl Encoder {
                 Sym::Nullable { is_null, inner: Box::new(self.fresh(t)) }
             }
             CelType::List(t) => {
-                // unknown lists: bounded, so marks results as bounded when consumed
-                let n = self.unroll;
+                // unknown lists: cut off, so marks results as bounded when consumed
+                let n = FALLBACK_SLOTS;
                 let len = Int::new_const(self.fresh_name("len"));
                 self.assumptions.push(int_range(&len, 0, n as i64));
                 let slots = (0..n).map(|i| (len.gt(Int::from_i64(i as i64)), self.fresh(t))).collect();
@@ -439,7 +441,7 @@ impl Encoder {
                 Sym::Optional { has, val: Box::new(self.fresh(t)) }
             }
             CelType::Map(kt, vt) if is_key_type(kt) => {
-                let n = self.unroll;
+                let n = FALLBACK_SLOTS;
                 let len = Int::new_const(self.fresh_name("len"));
                 self.assumptions.push(int_range(&len, 0, n as i64));
                 let slots: Vec<(Bool, Sym, Sym)> =
@@ -1310,8 +1312,8 @@ impl Encoder {
             ("split", [Str(s), Str(sep)]) => match zutil::str_value(sep) {
                 Some(t) if !t.is_empty() => {
                     // the subset admits only splits with a static bound on their pieces and
-                    // length. Slots past the unroll limit are slow, so a solve starts there and
-                    // retries with more on an overflow; bounds() needs them all at once.
+                    // length. Slots are slow, so a solve starts with few and retries with more
+                    // on an overflow; bounds() gets them all at once.
                     let (pieces, len) = match &e.kind {
                         ExprKind::Call { target: Some(t), args, .. } => {
                             let sizes = crate::sizes::Sizes::new(c);
@@ -1332,11 +1334,7 @@ impl Encoder {
                         }
                         _ => None,
                     };
-                    let k = match pieces {
-                        Some(n) if self.exact_splits => (n as usize).min(MAX_SLOTS),
-                        Some(n) => (n as usize).min(self.unroll),
-                        None => self.unroll,
-                    };
+                    let k = pieces.map_or(self.split_slots, |n| (n as usize).min(self.split_slots));
                     // with a slot for every possible piece the split can't overflow: saying so
                     // spares the solver from rediscovering it (slowly, through string lengths).
                     // That follows from the length bound, so it holds only within it
