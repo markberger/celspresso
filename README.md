@@ -152,6 +152,29 @@ How the checks treat a rule that computes a value:
 - Invariants and `require` apply only to true/false rules.
 - `check_rule` accepts a rule that computes a value only when the spec says something about results (`returns` or `ensures`). So a gate written for true/false rules never passes such a rule by accident.
 
+### Decision tables
+
+Logic with many cases is easier to write, read and review as a table: rows of `when -> then`, where the first row that matches gives the result. `table.check(spec)` proves the table decides every input, that every row decides some input (a row that earlier rows always pre-empt is a bug), and, with `unique=True`, that no two rows overlap. Then it checks the whole table against the spec like `check_rule`, naming the row behind each counterexample:
+
+```python
+refunds = env.decision_table({
+    "small loss":  ("order.status == 'lost' && order.total_cents <= 50000",
+                    "Decision{action: 'refund', amount_cents: order.total_cents}"),
+    "big loss":    ("order.status == 'lost'",
+                    "Decision{action: 'escalate', amount_cents: 0}"),
+    "gold lost":   ("order.status == 'lost' && order.tier == 'gold'",
+                    "Decision{action: 'refund', amount_cents: order.total_cents}"),
+    "late damage": ("order.status == 'damaged' && order.days_since_delivery > 30",
+                    "Decision{action: 'deny', amount_cents: 0}"),
+})
+print(refunds.check(DECISIONS))
+# rejected:
+# - gold lost never decides anything: small loss and big loss catch every input it matches
+# - no row matches when order.days_since_delivery = 0, order.status = 'delivered', order.tier = 'standard', order.total_cents = 0
+```
+
+Pass `default=` for the inputs no row matches; a default that no input can reach is reported as dead too. A table is one CEL expression, `table.expr`, so `diff`, `equivalent` and the other questions work on that. `table.evaluate(data)` gives the first match's result, and `table.matching_row(data)` names the row.
+
 `check_rule` also flags code that type-checks but can't be what was meant. For example, `order.tier == 'Gold'` can never be true when the tier is `'standard'` or `'gold'`. Habits from other languages get a pointer to the CEL form: `and` → `&&`, `len(x)` → `size(x)`, `None` → `null`.
 
 `env.describe()` gives an LLM everything it needs in one block of text: variables, fields, types and constraints, functions, definitions and a CEL cheat sheet. The report is plain text too, so the two drive a repair loop:
@@ -195,6 +218,19 @@ returns = "refunds:Decision"
 
 [ensures]
 capped = "result.amount_cents <= order.total_cents"
+```
+
+A rule can also be a decision table:
+
+```toml
+[rules.refund]
+default = "Decision{action: 'deny', amount_cents: 0}"   # optional
+rows = [
+  { name = "small loss", when = "order.status == 'lost' && order.total_cents <= 50000",
+    then = "Decision{action: 'refund', amount_cents: order.total_cents}" },
+  { name = "big loss", when = "order.status == 'lost'",
+    then = "Decision{action: 'escalate', amount_cents: 0}" },
+]
 ```
 
 `celspresso check rules.toml` runs `check_rule` on every rule and exits non-zero if any is rejected. `celspresso diff rules.toml --against main` compares each rule with its version at a git revision. Instead of a text diff, it reports what the change *does*:

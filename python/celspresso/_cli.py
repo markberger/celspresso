@@ -32,6 +32,14 @@ must satisfy with `ensures`, over the inputs and `result`::
 
 Invariants and require entries apply only to true/false rules.
 
+A rule may be a decision table: rows tried in order, the first match giving the result::
+
+    [rules.refund]
+    default = "Decision{action: 'deny', amount: 0}"   # optional
+    rows = [
+      { name = "lost", when = "order.status == 'lost'", then = "Decision{action: 'refund', amount: 1}" },
+    ]
+
 Exit status:
 
 - 0: everything was proved.
@@ -60,6 +68,7 @@ from . import __version__
 from ._env import Env, Expr, Problem, RuleCheck, _value_or_error
 from ._errors import CelError
 from ._spec import Spec
+from ._table import DecisionTable, Row
 from ._verdict import Difference, _outcome
 
 if TYPE_CHECKING:
@@ -101,6 +110,7 @@ class RuleFile:
     assumptions: list[str] = field(default_factory=list)
     returns: str | None = None  # as written in the file
     returns_type: Any = None
+    tables: dict[str, DecisionTable] = field(default_factory=dict)  # rules written as tables
 
     @property
     def spec(self) -> Spec:
@@ -146,6 +156,9 @@ def _toml_line(lines: list[str], section: str, name: str) -> int:
         m = header.match(line)
         if m:
             current = m.group(1).strip().strip("\"'")
+            parts = [p.strip().strip("\"'") for p in m.group(1).split(".")]
+            if parts == [section, name]:  # [rules.name]: a table
+                return i
             head = i if current == section and not head else head
         elif current == section:
             if key.match(line):
@@ -285,6 +298,50 @@ def _strings(data: dict[str, Any], key: str, path: str) -> dict[str, str]:
     return {str(k): v for k, v in raw.items()}
 
 
+def _rules(data: dict[str, Any], env: Env, path: str) -> tuple[dict[str, str], dict[str, DecisionTable]]:
+    """The file's rules as CEL sources, and the ones written as decision tables."""
+    raw = data.get("rules", {})
+    if not isinstance(raw, dict):
+        raise UsageError(f"{path}: [rules] must map names to CEL expressions or tables")
+    rules: dict[str, str] = {}
+    tables: dict[str, DecisionTable] = {}
+    for name, v in raw.items():
+        name = str(name)
+        if isinstance(v, str):
+            rules[name] = v
+        elif isinstance(v, dict):
+            tables[name] = _table(env, v, f"{path}: rule {name}")
+            rules[name] = tables[name].source
+        else:
+            raise UsageError(f"{path}: rule {name} must be a CEL expression or a table (rows = [...])")
+    return rules, tables
+
+
+def _table(env: Env, v: dict[str, Any], where: str) -> DecisionTable:
+    unknown = set(v) - {"rows", "default", "unique"}
+    if unknown:
+        raise UsageError(f"{where}: unknown table setting(s): {', '.join(sorted(unknown))}")
+    rows = v.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise UsageError(f"{where}: a table needs rows = [{{ when = ..., then = ... }}, ...]")
+    out = []
+    for i, r in enumerate(rows, 1):
+        if not (isinstance(r, dict) and set(r) <= {"name", "when", "then"} and {"when", "then"} <= set(r)):
+            raise UsageError(f"{where}: row {i} must have when and then (and optionally name)")
+        if not all(isinstance(x, str) for x in r.values()):
+            raise UsageError(f"{where}: row {i}'s name, when and then must be strings")
+        out.append(Row(r["when"], r["then"], r.get("name")))
+    default, unique = v.get("default"), v.get("unique", False)
+    if default is not None and not isinstance(default, str):
+        raise UsageError(f"{where}: default must be a CEL expression (a string)")
+    if not isinstance(unique, bool):
+        raise UsageError(f"{where}: unique must be true or false")
+    try:
+        return DecisionTable(env, out, default, unique=unique)
+    except ValueError as e:
+        raise UsageError(f"{where}: {e}") from None
+
+
 def build_env(data: dict[str, Any], path: str) -> Env:
     """The Env a rule file describes: `env = "module:attr"`, or a table of `vars`; plus
     any `structs` the rules build."""
@@ -347,7 +404,7 @@ def load(path: str, *, text: str | None = None, env: Env | None = None, validate
         path=path,
         text=text,
         env=env,
-        rules=_strings(data, "rules", path),
+        rules={},
         invariants=_strings(data, "invariants", path),
         require=_strings(data, "require", path),
         ensures=_strings(data, "ensures", path),
@@ -355,6 +412,7 @@ def load(path: str, *, text: str | None = None, env: Env | None = None, validate
         returns=returns,
         returns_type=None if returns is None else _import(returns, f"{path}: returns"),
     )
+    rf.rules, rf.tables = _rules(data, env, path)
     if rf.returns_type is not None:
         try:
             rf.env._builder.copy().convert(rf.returns_type, "returns")
@@ -413,7 +471,9 @@ def run_check(
     """`Env.check_rule` on each rule (or just `names`), with the file's invariants,
     requirements and assumptions."""
     return {
-        n: rf.env.check_rule(rf.rules[n], rf.spec, timeout=timeout)
+        n: rf.tables[n].check(rf.spec, timeout=timeout)
+        if n in rf.tables
+        else rf.env.check_rule(rf.rules[n], rf.spec, timeout=timeout)
         for n in (rf.rules if names is None else names)
     }
 

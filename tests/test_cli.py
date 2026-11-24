@@ -298,7 +298,7 @@ def test_diff_against_a_git_revision(project: tuple[Path, str], capsys: pytest.C
         ("r.toml", 'vars = { x = "{mod}:flagged" }', "r.toml: "),
         ("r.toml", 'vars = { x = "int" }\nrule = {}', "unknown setting(s): rule"),
         ("r.toml", 'vars = { x = "int" }\nassumptions = "x > 1"', "assumptions must be a list"),
-        ("r.toml", 'vars = { x = "int" }\nrules = { a = 1 }', "[rules] must map names to CEL expressions"),
+        ("r.toml", 'vars = { x = "int" }\nrules = { a = 1 }', "rule a must be a CEL expression or a table"),
         ("r.toml", 'vars = { x = "int" }', "r.toml: no rules to check"),
         ("r.toml", 'vars = { x = "int" }\n[rules]', "r.toml: no rules to check"),
         (

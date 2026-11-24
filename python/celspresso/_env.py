@@ -29,6 +29,9 @@ from ._verdict import Bounds, Difference, Extreme, Stats, Status, Verdict, Witne
 from .schema import Struct, TypeRef, _contains_fixed
 
 if typing.TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ._table import DecisionTable, Row
     from .adapters import TypeAdapter
 
 __all__ = ["Env", "Explanation", "Expr", "Predicate", "Problem", "RuleCheck", "function"]
@@ -649,6 +652,22 @@ class Env:
             return False
         return True
 
+    def decision_table(
+        self,
+        rows: Sequence[Row | tuple[str, str]] | Mapping[str, tuple[str, str]],
+        default: str | None = None,
+        *,
+        unique: bool = False,
+    ) -> DecisionTable:
+        """A first-match decision table: `rows` of `(when, then)` (or `Row`s, or a mapping
+        of row names to pairs), tried in order; the first row whose `when` holds gives
+        the result, else `default`. `table.check(spec)` proves every input is decided,
+        no row is dead, and (with `unique`) no two rows overlap, then checks the whole
+        table against `spec` like `check_rule`."""
+        from ._table import DecisionTable
+
+        return DecisionTable(self, rows, default, unique=unique)
+
     def check_rule(
         self,
         rule: str | Expr[Any],
@@ -878,6 +897,9 @@ ProblemKind = Literal[
     "violates",
     "too_narrow",
     "unverified",
+    "no_match",
+    "shadowed",
+    "overlap",
 ]
 
 
