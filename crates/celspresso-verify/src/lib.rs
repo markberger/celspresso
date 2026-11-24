@@ -5,6 +5,7 @@
 //! (unless the encoding was bounded, in which case it degrades to `Unknown`).
 
 mod encode;
+pub mod sizes;
 pub mod subset;
 mod sym;
 mod zutil;
@@ -22,7 +23,6 @@ use z3::{Config, Optimize, Params, SatResult, Solver};
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub timeout_ms: u64,
-    pub unroll_limit: usize,
     pub schema_constraints: bool,
     /// After a proof, replay the query on this many diverse valid inputs (a soundness
     /// self-check). Any input that replays as a counterexample is returned as one.
@@ -31,7 +31,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { timeout_ms: 5_000, unroll_limit: 5, schema_constraints: true, sample_proofs: 0 }
+        Options { timeout_ms: 5_000, schema_constraints: true, sample_proofs: 0 }
     }
 }
 
@@ -66,7 +66,7 @@ pub enum Status {
 #[derive(Clone, Debug)]
 pub struct Outcome {
     pub status: Status,
-    /// The result relied on the comprehension unroll limit.
+    /// The result relied on a list, map or split the encoding cut off (outside the subset).
     pub bounded: bool,
     pub elapsed_ms: f64,
     /// Where the encoding over-approximated CEL semantics.
@@ -106,7 +106,6 @@ fn goal(enc: &mut Encoder, q: &Query) -> Result<Bool, String> {
     })
 }
 
-/// Whether the assumptions allow a value the encoding cut off at the unroll bound.
 /// Encode the user assumptions. Returns them all, plus the ones that don't read a split:
 /// in a model where a split overflows, its last piece is the unsplit remainder, so facts
 /// about its pieces are false there and must not be used to rule the overflow out.
@@ -147,18 +146,22 @@ fn unknown_reason(r: Option<String>) -> String {
     }
 }
 
-/// Most split slots tried when only a split overflow stands between the query and an answer.
-const MAX_SPLIT_SLOTS: usize = 32;
+/// Why an answer that relied on a cut-off list, map or split is UNKNOWN.
+const TOO_LONG: &str = "a list, map or split may be longer than the verifier encodes; declare max_length on it";
+
+/// Most split slots tried when only a split overflow stands between the query and an answer:
+/// the most pieces the subset lets a split have, so the last retry is exact.
+const MAX_SPLIT_SLOTS: usize = sizes::MAX_PIECES as usize;
 
 fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>) {
     // a split of a bounded string has boundedly many pieces: give it more slots until none
-    // can overflow, rather than answering UNKNOWN at the unroll limit
-    let first = solve_once(q, assumptions, opts, funcs);
-    let mut o = opts;
+    // can overflow. Slots are slow, so most solves are done before all are needed
+    let mut slots = encode::FALLBACK_SLOTS;
+    let first = solve_once(q, assumptions, opts, slots, funcs);
     let mut split_only = first.3;
-    while split_only && o.unroll_limit < MAX_SPLIT_SLOTS {
-        o.unroll_limit = (o.unroll_limit * 2).clamp(1, MAX_SPLIT_SLOTS);
-        let (status, bounded, approximations, again) = solve_once(q, assumptions, o, funcs);
+    while split_only && slots < MAX_SPLIT_SLOTS {
+        slots = (slots * 2).min(MAX_SPLIT_SLOTS);
+        let (status, bounded, approximations, again) = solve_once(q, assumptions, opts, slots, funcs);
         match status {
             // decided, or a real witness: done
             Status::Found(_) | Status::NotFound => return (status, bounded, approximations),
@@ -172,13 +175,20 @@ fn solve(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Fu
 
 /// One solve. The last field is whether the answer was UNKNOWN only because a split might
 /// have more pieces than its slots (no list was truncated), so more slots could decide it.
-fn solve_once(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> (Status, bool, Vec<String>, bool) {
+fn solve_once(
+    q: &Query,
+    assumptions: &[&CheckedExpr],
+    opts: Options,
+    split_slots: usize,
+    funcs: &(dyn Functions + Sync),
+) -> (Status, bool, Vec<String>, bool) {
     let schema = match q {
         Query::Satisfiable(e) | Query::AlwaysTrue(e) | Query::CanError(e) | Query::Implies(e, _) | Query::Equivalent(e, _, _) => {
             e.schema.clone()
         }
     };
-    let mut enc = Encoder::new(schema, opts.unroll_limit, opts.schema_constraints);
+    let mut enc = Encoder::new(schema, opts.schema_constraints);
+    enc.split_slots = split_slots;
     let g = match goal(&mut enc, q) {
         Ok(g) => g,
         Err(why) => return (Status::Unknown(why), false, vec![], false),
@@ -186,7 +196,8 @@ fn solve_once(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(d
     let (user, real) = encode_user(&mut enc, assumptions);
     let mut split_only = false;
     let approximations: Vec<String> = enc.approximations.iter().cloned().collect();
-    // whether the encoding was cut off at the unroll limit; reported only if the result relied on it
+    // whether the encoding cut a list or map off (only outside the subset); reported only if
+    // the result relied on it
     let truncated = enc.bounded;
     let mut bounded = false;
 
@@ -231,10 +242,7 @@ fn solve_once(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(d
                 _ if truncated || overflows(&enc, &real, &params) => {
                     bounded = true;
                     split_only = !truncated;
-                    Status::Unknown(format!(
-                        "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
-                        opts.unroll_limit
-                    ))
+                    Status::Unknown(TOO_LONG.into())
                 }
                 _ => match sample_proofs(&enc, q, assumptions, &user, &params, funcs, opts) {
                     Some(w) => Status::Found(w),
@@ -242,7 +250,11 @@ fn solve_once(q: &Query, assumptions: &[&CheckedExpr], opts: Options, funcs: &(d
                 },
             }
         }
-        SatResult::Unknown => Status::Unknown(unknown_reason(solver.get_reason_unknown())),
+        SatResult::Unknown => {
+            let why = unknown_reason(solver.get_reason_unknown());
+            // with parts left out, the solver may be stuck on those: name them either way
+            Status::Unknown(if enc.misses_parts() { format!("{why}; {}", enc.unreplayed_reason()) } else { why })
+        }
     };
     (status, bounded, approximations, split_only)
 }
@@ -485,7 +497,9 @@ pub fn bounds(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, func
 }
 
 fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, funcs: &(dyn Functions + Sync)) -> BoundsOutcome {
-    let mut enc = Encoder::new(e.schema.clone(), opts.unroll_limit, opts.schema_constraints);
+    let mut enc = Encoder::new(e.schema.clone(), opts.schema_constraints);
+    // bounds() has no retry: every split gets all the slots its static bound allows
+    enc.split_slots = MAX_SPLIT_SLOTS;
     let sv = enc.encode(e);
     let (user, real) = encode_user(&mut enc, assumptions);
     let mut out = BoundsOutcome {
@@ -580,10 +594,7 @@ fn bounds_inner(e: &CheckedExpr, assumptions: &[&CheckedExpr], opts: Options, fu
         }
     }
     if truncated {
-        reasons.push(format!(
-            "a list or map may be longer than the unroll limit ({}); declare max_length or raise unroll_limit",
-            opts.unroll_limit
-        ));
+        reasons.push(TOO_LONG.into());
     }
     let exact = |x: &Option<Extreme>| x.as_ref().is_some_and(|x| x.sound && x.attained);
     if exact(&out.min) && exact(&out.max) {

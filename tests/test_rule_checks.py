@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import BaseModel, Field
 
-from celspresso import Env, Problem, RuleCheck, Spec
+from celspresso import Env, Problem, RuleCheck, Spec, function
 
 
 class Provider(BaseModel):
@@ -22,7 +22,7 @@ class Provider(BaseModel):
     has_collab_agreement: bool
 
 
-env = Env(p=Provider, today=dt.date, m=dict[str, int])
+env = Env(p=Provider, today=dt.date, m=Annotated[dict[str, int], Field(max_length=4)])
 INVARIANTS = {
     "license is current": "p.license_expires >= today",
     "OIG screening passed": "p.oig_cleared",
@@ -84,12 +84,17 @@ def test_assumptions_apply_to_every_check() -> None:
 
 
 def test_unknown_is_never_accepted() -> None:
-    # m has no max_length, so "every entry" can only be checked up to the unroll limit
-    r = env.check_rule("m.all(k, m[k] >= 0)", ["m.all(k, m[k] >= 0)"])
+    # the verifier can't see what an opaque host function returns
+    @function(tabulate=False)
+    def flag(n: int) -> bool:
+        return True
+
+    opaque = Env(n=int).extend(functions=[flag])
+    r = opaque.check_rule("flag(n)", ["flag(n + 1)"])
     assert r.problems
     assert set(kinds(r)) == {"unverified"}
     assert isinstance(r.problems[0], Problem)
-    assert "unroll limit" in r.problems[0].message
+    assert "can't see" in r.problems[0].message
 
 
 def test_diff_returns_one_witness_per_behaviour() -> None:

@@ -7,7 +7,7 @@ from typing import Annotated
 import pytest
 from pydantic import Field
 
-from celspresso import Env, function
+from celspresso import CelSubsetError, Env, function
 
 env = Env(
     s=Annotated[str, Field(max_length=12)],
@@ -15,6 +15,7 @@ env = Env(
     n=int,
     u=Annotated[int, Field(ge=0)],
     xs=Annotated[list[str], Field(max_length=4)],
+    ws=Annotated[list[Annotated[str, Field(max_length=3)]], Field(max_length=4)],
     b=bool,
 )
 
@@ -44,8 +45,8 @@ def test_proved(src: str) -> None:
         "s.lowerAscii() == s",
         "t.upperAscii() == t",
         "string(n) != '-12'",
-        "t.split('aa') != ['', 'a']",  # leftmost matches: 'aaa' splits as ['', 'a']
-        "xs.join(',').split(',') == xs",  # [] joins to '' which splits to ['']
+        "s.split('aa') != ['', 'a']",  # leftmost matches: 'aaa' splits as ['', 'a']
+        "ws.join(',').split(',') == ws",  # [] joins to '' which splits to ['']
         "xs.filter(x, x != '').join('-').size() <= 3",
     ],
 )
@@ -69,32 +70,28 @@ def test_int_parsing_errors_are_found() -> None:
         env.predicate("int(t) > 0").evaluate(v.witness)
 
 
-def test_split_of_a_bounded_string_gets_enough_slots() -> None:
-    # 12 characters can split into 13 pieces, more than the 5 slots: more are added
+def test_a_split_gets_a_slot_for_every_piece_it_can_have() -> None:
+    # 12 characters can split into 13 pieces, more than a first solve's 5 split slots
     v = env.predicate("s.split(',').size() <= 12").always_true()
     assert v.refuted
     assert env.predicate("s.split(',').size() <= 13").always_true().proved
+    assert env.expr("size(s.split(','))", int).bounds().expect() == (1, 13)
 
 
-def test_split_of_an_unbounded_string_is_unknown_not_proved() -> None:
-    v = Env(s=str).predicate("s.split(',').size() <= 40").always_true()
-    assert v.unknown
-    assert v.bounded or "unroll" in v.reason
-    wide = Env(s=Annotated[str, Field(max_length=12)], unroll_limit=13)
-    assert wide.predicate("s.split(',').size() <= 13").always_true().proved
-    assert wide.predicate("s.split(',').size() <= 12").always_true().refuted
+def test_a_split_needs_a_bound_on_its_pieces() -> None:
+    with pytest.raises(CelSubsetError, match="no max_length"):
+        Env(s=str).predicate("s.split(',').size() <= 40")
+    with pytest.raises(CelSubsetError, match="up to 101 pieces"):
+        Env(s=Annotated[str, Field(max_length=100)]).predicate("s.split(',').size() <= 40")
+    # the bound follows concatenation and the pieces of an outer split
+    ok = Env(s=Annotated[str, Field(max_length=6)])
+    assert ok.predicate("(s + ',' + s + s).split(',').size() <= 20").always_true().proved
+    assert ok.predicate("s.split(',').all(p, p.split('a').size() <= 7)").always_true().proved
 
 
 def test_cross_case_mapping_is_proved() -> None:
     slow = Env(s=Annotated[str, Field(max_length=12)], timeout=30.0)
     assert slow.predicate("s.upperAscii().lowerAscii() == s.lowerAscii()").always_true().proved
-
-
-def test_bounds_of_a_split_beyond_the_slots_are_not_exact() -> None:
-    # 'a,b,c,d,e,f' has 6 pieces, more than the 5 slots
-    b = Env(t=str).expr("size(t.split(','))", int).bounds()
-    assert b.bounded
-    assert not (b.max and b.max.sound)
 
 
 def test_a_split_of_each_piece_is_proved_for_bounded_strings() -> None:
@@ -123,14 +120,13 @@ def test_host_overloads_on_builtin_names_run_only_for_their_own_calls() -> None:
     assert env.predicate("upperAscii(s) == s.upperAscii()").always_true().refuted
 
 
-def test_assumptions_about_split_pieces_cannot_hide_an_overflow() -> None:
-    # true of every t, but false of the encoding's truncated last piece
-    env = Env(t=str)
-    v = env.predicate("t != 'a,b,c,d,e,f'").always_true(assuming="t.split(',').all(p, !p.contains(','))")
-    assert not v.proved
+def test_assumptions_about_split_pieces_are_exact() -> None:
+    env = Env(t=Annotated[str, Field(max_length=11)])
+    # every piece of a real split is free of the separator, so this assumes nothing
+    v = env.predicate("t != 'a,b,c,d'").always_true(assuming="t.split(',').all(p, !p.contains(','))")
+    assert v.refuted
     b = env.expr("t.split(',').map(p, p.contains(',') ? 1 / 0 : 1).size()", int).bounds()
-    assert b.bounded
-    assert not (b.max and b.max.sound)
+    assert b.expect() == (1, 12)
 
 
 def test_splits_inside_a_comprehension_ignore_slots_that_dont_exist() -> None:

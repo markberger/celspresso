@@ -41,11 +41,21 @@ def _option_clash(name: str, value: Any) -> TypeError:
     )
 
 
-def _check_options(timeout: Any, unroll_limit: Any) -> None:
+def _check_options(timeout: Any) -> None:
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))):
         raise _option_clash("timeout", timeout)
-    if unroll_limit is not None and (isinstance(unroll_limit, bool) or not isinstance(unroll_limit, int)):
-        raise _option_clash("unroll_limit", unroll_limit)
+
+
+def _reject_removed_options(more_variables: Mapping[str, Any]) -> None:
+    """A removed option passed by keyword would silently declare a variable of that name;
+    their old values were bools and ints, never a type, so say what happened instead."""
+    for gone in ("schema_constraints", "debug_sample_proofs", "unroll_limit"):
+        if isinstance(more_variables.get(gone), (bool, int)):
+            raise TypeError(
+                f"{gone}={more_variables[gone]!r}: '{gone}' is no longer an Env option. "
+                f"To declare a variable named '{gone}', pass variables as a mapping: "
+                f"Env({{'{gone}': ...}})"
+            )
 
 
 def _option_list(name: str, value: Any) -> list[Any]:
@@ -166,7 +176,7 @@ class Env:
     True
 
     Variables are keyword arguments, or a mapping when a name collides with an option
-    (`timeout`, `unroll_limit`, `structs`, ...) or is not a Python keyword-safe name:
+    (`timeout`, `limits`, `structs`, ...) or is not a Python keyword-safe name:
 
     >>> Env({"timeout": int}, timeout=2.0).variables
     {'timeout': 'int'}
@@ -185,28 +195,19 @@ class Env:
         /,
         *,
         timeout: float = 5.0,
-        unroll_limit: int = 5,
         limits: Limits | None = None,
         structs: Iterable[Struct] = (),
         adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> None:
-        _check_options(timeout, unroll_limit)
-        for gone in ("schema_constraints", "debug_sample_proofs"):
-            # their old values were bools and ints, never a type
-            if isinstance(more_variables.get(gone), (bool, int)):
-                raise TypeError(
-                    f"{gone}={more_variables[gone]!r}: '{gone}' is no longer an Env option "
-                    f"(it was for testing the verifier). To declare a variable named '{gone}', "
-                    f"pass variables as a mapping: Env({{'{gone}': ...}})"
-                )
+        _check_options(timeout)
+        _reject_removed_options(more_variables)
         self._sample = 0  # see _debug_options
         if limits is not None and not isinstance(limits, Limits):
             raise _option_clash("limits", limits)
         self._limits = (limits or Limits())._spec()
         variables = _merge_variables(variables, more_variables)
         self._timeout = timeout
-        self._unroll = unroll_limit
         self._schema_constraints = True  # see _debug_options
         self._builder = SchemaBuilder(_option_list("adapters", adapters))
         self._vars: dict[str, tuple[TypeSpec, dict[str, Any] | None]] = {}
@@ -224,7 +225,6 @@ class Env:
         model: type,
         *,
         timeout: float = 5.0,
-        unroll_limit: int = 5,
         limits: Limits | None = None,
         structs: Iterable[Struct] = (),
         adapters: Iterable[TypeAdapter] = (),
@@ -246,7 +246,6 @@ class Env:
         return cls(
             _model_variables(model),
             timeout=timeout,
-            unroll_limit=unroll_limit,
             limits=limits,
             structs=structs,
             adapters=adapters,
@@ -257,7 +256,6 @@ class Env:
     def _clone(self) -> Env:
         e = object.__new__(Env)
         e._timeout = self._timeout
-        e._unroll = self._unroll
         e._schema_constraints = self._schema_constraints
         e._sample = self._sample
         e._limits = self._limits
@@ -322,7 +320,6 @@ class Env:
         *,
         functions: Iterable[Callable[..., Any]] = (),
         timeout: float | None = None,
-        unroll_limit: int | None = None,
         structs: Iterable[Struct] = (),
         adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
@@ -331,7 +328,8 @@ class Env:
 
         As with `Env(...)`, pass a mapping for variables whose names clash with options.
         """
-        _check_options(timeout, unroll_limit)
+        _check_options(timeout)
+        _reject_removed_options(more_variables)
         if isinstance(functions, (str, type)) or not isinstance(functions, Iterable):
             raise _option_clash("functions", functions)
         functions = list(functions)
@@ -355,8 +353,6 @@ class Env:
             e._fns[fn.name] = fn
         if timeout is not None:
             e._timeout = timeout
-        if unroll_limit is not None:
-            e._unroll = unroll_limit
         e._build()
         return e
 
@@ -535,7 +531,6 @@ class Env:
             b._prog if b is not None else None,
             asm,
             int((timeout if timeout is not None else self._timeout) * 1000),
-            self._unroll,
             self._schema_constraints,
             errors,
             self._fn_impls,
@@ -587,7 +582,6 @@ class Env:
             e._prog,
             asm,
             int((timeout if timeout is not None else self._timeout) * 1000),
-            self._unroll,
             self._schema_constraints,
             self._fn_impls,
         )

@@ -6,6 +6,7 @@
 //! opaque or tabulated, which the user chose). The tiers come from probing every builtin:
 //! see `benchmarks/bench_strings.py` and TECH_DEBT.md ("The subset leaves out ...").
 
+use crate::sizes::{is_collection, Sizes};
 use celspresso_check::{display_fn, is_builtin, CelType, CheckedExpr, Reference, Schema};
 use celspresso_syntax::ast::{ops, Expr, ExprKind, Literal};
 use celspresso_syntax::Span;
@@ -72,7 +73,7 @@ const ALLOWED: &[&str] = &[
     "string_upper_ascii",
     "list_join",
     "list_join_string",
-    // lists and maps (bounded by max_length or the unroll limit)
+    // lists and maps (the subset requires a static bound on each: see sizes.rs)
     "add_list",
     "index_list",
     "index_map",
@@ -178,12 +179,33 @@ fn why(id: &str) -> &'static str {
     }
 }
 
-/// Most ranges a character class may have: Unicode classes (`\d`, `\w`, `\p{L}`) have
-/// dozens to hundreds and make Z3 crawl (`^\d{5}$` alone takes seconds).
+/// Most ranges a character class may have: Unicode classes (`\p{L}`, and Unicode `\d`
+/// before `re2::ascii_perl_classes` makes it `[0-9]`) have dozens to hundreds and make Z3
+/// crawl (Unicode `^\d{5}$` alone took seconds).
 const MAX_CLASS_RANGES: usize = 16;
 
 /// Most copies nested repetitions may make of a subpattern (`(a{10}){10}` makes 100).
 const MAX_REPEAT: u32 = 1000;
+
+/// Whether `pattern` turns on the `x` flag, which RE2 doesn't have (and under which the
+/// ASCII rewrite of `\s`, a class holding a space, would change meaning).
+fn verbose_mode(pattern: &str) -> bool {
+    use regex_syntax::ast::{Ast, Flag, Flags, FlagsItemKind, GroupKind};
+    fn has_x(f: &Flags) -> bool {
+        f.items.iter().any(|i| matches!(i.kind, FlagsItemKind::Flag(Flag::IgnoreWhitespace)))
+    }
+    fn walk(a: &Ast) -> bool {
+        match a {
+            Ast::Flags(f) => has_x(&f.flags),
+            Ast::Group(g) => matches!(&g.kind, GroupKind::NonCapturing(f) if has_x(f)) || walk(&g.ast),
+            Ast::Repetition(r) => walk(&r.ast),
+            Ast::Alternation(x) => x.asts.iter().any(walk),
+            Ast::Concat(x) => x.asts.iter().any(walk),
+            _ => false,
+        }
+    }
+    regex_syntax::ast::parse::Parser::new().parse(pattern).is_ok_and(|a| walk(&a))
+}
 
 /// Whether the verifier translates a `matches` pattern exactly and solves it quickly; mirrors
 /// `zutil::translate_search`, which accepts only top-level `^` and `$` anchors.
@@ -192,6 +214,9 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
     let hir = regex_syntax::ParserBuilder::new().build().parse(pattern).map_err(|e| format!("invalid pattern: {e}"))?;
     if let Some(e) = celspresso_eval::validate::pattern_error(pattern) {
         return Err(e);
+    }
+    if verbose_mode(pattern) {
+        return Err("the x (verbose) flag is not RE2 syntax; write the pattern without it".into());
     }
     // `copies`: how many times the enclosing repetitions repeat this node
     fn walk(h: &Hir, copies: u32) -> Result<(), String> {
@@ -202,8 +227,8 @@ pub fn pattern_in_profile(pattern: &str) -> Result<(), String> {
                     Class::Bytes(b) => b.ranges().len(),
                 };
                 if n > MAX_CLASS_RANGES {
-                    return Err("a large Unicode class (\\d, \\w, \\p{..}) is slow to \
-                                solve; spell out ASCII ranges such as [0-9] or [A-Za-z0-9_]"
+                    return Err("a large Unicode class such as \\p{L} is slow to solve; \
+                                spell out ASCII ranges such as [A-Za-z] or [0-9]"
                         .into());
                 }
                 Ok(())
@@ -357,8 +382,19 @@ fn literal(e: &Expr) -> Option<&Literal> {
 
 /// Uses of CEL outside the subset, as (message, span), in source order.
 pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
+    violations_in(c, true)
+}
+
+/// Like `violations`, but for a body whose parameters are bound at each use (a definition
+/// or a contract): their lengths are known only there, and each use is checked as a whole.
+pub fn violations_of_body(c: &CheckedExpr) -> Vec<(String, Span)> {
+    violations_in(c, false)
+}
+
+fn violations_in(c: &CheckedExpr, check_sizes: bool) -> Vec<(String, Span)> {
     let mut out = Vec::new();
     let derived = derived_idents(c);
+    let sizes = Sizes::new(c);
     c.expr.walk(&mut |e: &Expr| {
         // report an unmodeled value where it originates, not at every expression it flows into
         if let Some(why) = bad(c, e) {
@@ -367,6 +403,26 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
             }
             return;
         }
+        let before = out.len();
+        builtin_violations(c, e, &sizes, &mut out);
+        // a list or map past the encoded length can be refuted but never proved; report it
+        // where it originates, and not on top of an unsupported builtin
+        // (a value of unknown type inside is reported as that)
+        let t = c.type_of(e.id);
+        if check_sizes && out.len() == before && is_collection(t) && compares_unmodeled(t, &c.schema, &mut Vec::new()).is_none() {
+            if let Some(why) = sizes.unbounded(e) {
+                if !children(e).iter().any(|k| is_collection(c.type_of(k.id)) && sizes.unbounded(k).is_some()) {
+                    out.push((why, e.span));
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Builtins outside the subset (or used in ways outside it) at the call `e`.
+fn builtin_violations(c: &CheckedExpr, e: &Expr, sizes: &Sizes, out: &mut Vec<(String, Span)>) {
+    {
         let ExprKind::Call { target, function, args } = &e.kind else { return };
         let all: Vec<&Expr> = target.iter().map(|t| &**t).chain(args).collect();
         // an unmodeled operand is reported where it originates; one error is enough
@@ -389,6 +445,12 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
         if let Some(why) = compared.iter().find_map(|t| compares_unmodeled(t, &c.schema, &mut Vec::new())) {
             out.push((format!("{why} (this comparison looks at every element and field; compare the fields you need)"), e.span));
             return;
+        }
+        if matches!(function.as_str(), ops::EQUALS | ops::NOT_EQUALS | ops::IN) {
+            if let Some(why) = all.iter().find_map(|a| sizes.unbounded_inside(a)) {
+                out.push((format!("{why} (this comparison looks at every element and field; compare the fields you need)"), e.span));
+                return;
+            }
         }
         let ids = match c.refs.get(&e.id) {
             Some(Reference::Function(ids)) => ids.clone(),
@@ -414,7 +476,7 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
                 if !ok {
                     out.push((format!("'{}' needs {need} in celspresso's CEL subset", display_fn(function)), span));
                 } else if let (true, Some(Literal::String(p))) = (id.starts_with("matches"), all.get(*at).and_then(|a| literal(a))) {
-                    if let Err(why) = pattern_in_profile(p) {
+                    if let Err(why) = pattern_in_profile(&celspresso_eval::re2::ascii_perl_classes(p)) {
                         out.push((format!("this pattern is outside celspresso's CEL subset: {why}"), span));
                     }
                 }
@@ -422,8 +484,7 @@ pub fn violations(c: &CheckedExpr) -> Vec<(String, Span)> {
             }
             out.push((outside(function, why(id)), e.span));
         }
-    });
-    out
+    }
 }
 
 fn outside(function: &str, why: &str) -> String {
@@ -433,23 +494,91 @@ fn outside(function: &str, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use celspresso_check::{check, CelType, Schema, VarDecl};
+    use celspresso_check::{check, CelType, Constraints, FieldDecl, Schema, StructDecl, VarDecl};
     use std::sync::Arc;
 
     fn outside(src: &str) -> Vec<String> {
+        violations(&checked(src)).into_iter().map(|(m, _)| m).collect()
+    }
+
+    fn checked(src: &str) -> CheckedExpr {
         let mut s = Schema::with_stdlib();
-        for (n, t) in [
-            ("s", CelType::String),
-            ("n", CelType::Int),
-            ("d", CelType::Double),
-            ("xs", CelType::list(CelType::Int)),
-            ("at", CelType::Timestamp),
-            ("day", CelType::Date),
+        let max = |m: u64| Constraints { max_length: Some(m), ..Default::default() };
+        let tags = FieldDecl { name: "tags".into(), ty: CelType::list(CelType::String), constraints: Default::default() };
+        let id = FieldDecl { name: "id".into(), ty: CelType::Int, constraints: Default::default() };
+        s.structs.insert("O".into(), StructDecl { name: "O".into(), fields: vec![id, tags] });
+        for (n, t, c) in [
+            ("s", CelType::String, Default::default()),
+            ("n", CelType::Int, Default::default()),
+            ("d", CelType::Double, Default::default()),
+            ("xs", CelType::list(CelType::Int), max(4)),
+            ("ys", CelType::list(CelType::Int), Default::default()),
+            ("big", CelType::list(CelType::Int), max(1000)),
+            ("m", CelType::map(CelType::String, CelType::Int), Default::default()),
+            ("grid", CelType::list(CelType::list(CelType::Int)), max(3)),
+            ("os", CelType::list(CelType::Struct("O".into())), max(3)),
+            ("o", CelType::Struct("O".into()), Default::default()),
+            ("t", CelType::String, max(20)),
+            ("long", CelType::String, max(200)),
+            ("at", CelType::Timestamp, Default::default()),
+            ("day", CelType::Date, Default::default()),
+            ("ws", CelType::list(CelType::String), Constraints { items: Some(Box::new(max(3))), ..max(4) }),
+            ("mv", CelType::map(CelType::String, CelType::String), Constraints { items: Some(Box::new(max(2))), ..max(4) }),
+            (
+                "code",
+                CelType::String,
+                Constraints { one_of: Some(vec![Literal::String("ab".into()), Literal::String("abcd".into())]), ..Default::default() },
+            ),
         ] {
-            s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: Default::default() });
+            s.vars.insert(n.into(), VarDecl { name: n.into(), ty: t, constraints: c });
         }
-        let checked = check(celspresso_syntax::parse(src).unwrap(), Arc::new(s)).unwrap();
-        violations(&checked).into_iter().map(|(m, _)| m).collect()
+        check(celspresso_syntax::parse(src).unwrap(), Arc::new(s)).unwrap()
+    }
+
+    #[test]
+    fn static_string_lengths() {
+        let len = |src: &str| {
+            let c = checked(src);
+            crate::sizes::Sizes::new(&c).str_len(&c.expr)
+        };
+        for (src, want) in [
+            ("t", Some(20)),
+            ("'abc'", Some(3)),
+            ("t + 'ab'", Some(22)),
+            ("n > 0 ? t : 'x'", Some(20)),
+            ("t.substring(1)", Some(20)),
+            ("t.upperAscii().lowerAscii()", Some(20)),
+            ("t.charAt(0)", Some(1)),
+            ("string(n)", Some(20)),
+            ("[t, 'ab'].join(',')", Some(41)), // each item as long as the longest
+            ("ws.join('--')", Some(18)),
+            ("ws[0]", Some(3)),
+            ("mv['k']", Some(2)),
+            ("code", Some(4)),
+            // the longer of the optional's value and the default
+            ("ws[?0].orValue('abcde')", Some(5)),
+            ("ws[?0].orValue('a')", Some(3)),
+            ("ws[?0].value()", Some(3)),
+            ("s", None),
+            ("s + t", None),
+        ] {
+            assert_eq!(len(src), want, "{src}");
+        }
+    }
+
+    #[test]
+    fn bounds_pass_through_bindings_and_map_values() {
+        for src in [
+            "cel.bind(p, t, p.split(',').size() < 30)",
+            "mv['k'].split(',').size() < 3",
+            "ws.all(w, w.split(',').size() < 5)",
+            "ws[?0].orValue('a,b').split(',').size() < 5",
+            "code.split('b').size() < 5",
+        ] {
+            assert_eq!(outside(src), Vec::<String>::new(), "{src}");
+        }
+        let unbounded = outside("cel.bind(p, s, p.split(',').size() < 3)");
+        assert!(unbounded.iter().any(|m| m.contains("no max_length")), "{unbounded:?}");
     }
 
     #[test]
@@ -493,7 +622,9 @@ mod tests {
             "(n < 10 ? '0' : '') + string(n) + '.' + string(n % 100)",
             "[s, 'x'].join(' ') == s + ' x' && int('12') == 12 && s.matches('^[0-9]+$')",
             r"s.matches(r'(?i)^[a-z]{2}\s*[0-9]{5}(-[0-9]{4})?$') && s.matches('.*') && s.matches('^(x+)?$')",
-            "s.split(',').size() > 1 && xs.all(x, x > 0) && xs.sum() < math.greatest(n, 3)",
+            "t.split(',').size() > 1 && xs.all(x, x > 0) && xs.sum() < math.greatest(n, 3)",
+            "(t + '-').split('-').size() > 1 && [1, 2].exists(x, x in xs + [n])",
+            "grid.size() < 2 && os.all(p, p.id > 0) && [xs, [1]].size() == 2 && o.id == 1",
             "at.getFullYear() == 2024 && at < timestamp('2025-01-01T00:00:00Z') && day.year() > 1900",
             "n * 2 < 10 && n < 3 ? 1u < 2u : -n < 7",
             "optional.of(s).orValue('') == s && {'a': n}['a'] == n",
@@ -515,16 +646,30 @@ mod tests {
             ("math.bitAnd(n, 3) == 1", "math function"),
             ("[3, 1].sort() == [1, 3]", "list function"),
             ("type(n) == int", "not part of celspresso's CEL subset"),
-            ("s.split(s).size() == 1", "literal, non-empty separator"),
-            ("s.split('').size() == 1", "literal, non-empty separator"),
+            ("t.split(s).size() == 1", "literal, non-empty separator"),
+            ("t.split('').size() == 1", "literal, non-empty separator"),
             ("s.matches(s)", "literal pattern"),
-            ("s.matches(r'^\\d{5}$')", "[0-9]"),
+            ("s.matches(r'^\\p{L}{5}$')", "[A-Za-z]"),
             ("s.matches('a(?=b)')", "invalid pattern"),
             ("s.matches('[')", "invalid pattern"),
             ("s.matches('a\\\\bb')", "start and end"),
             ("s.matches('a{2000}')", "repetition"),
             ("s.matches('^(a{100}){100}$')", "multiply"),
             ("timestamp(s) < at", "literal timestamp"),
+            ("ys.all(y, y > 0)", "'ys': it has no max_length"),
+            ("size(ys) > 10", "'ys': it has no max_length"),
+            ("1 in ys", "'ys'"),
+            ("'a' in m", "'m': it has no max_length"),
+            ("big.exists(x, x == 1)", "max_length 1000 is above 64"),
+            ("grid.all(r, r.size() < 9)", "'r': it has no max_length"),
+            ("grid[0][1] == 2", "'grid[..]': it has no max_length"),
+            ("os.exists(p, 'x' in p.tags)", "'p.tags'"),
+            ("o.tags.size() == 1", "'o.tags'"),
+            ("os.exists(p, p == o)", "field 'O.tags'"),
+            ("grid == [[1]]", "the items of 'grid'"),
+            ("s.split(',').size() == 1", "no max_length"),
+            ("long.split(',').size() == 1", "201 pieces"),
+            ("long.split(',,').size() == 1", "101 pieces"),
         ] {
             let errs = outside(src);
             assert!(!errs.is_empty(), "{src}");

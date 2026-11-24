@@ -57,6 +57,9 @@ SCHEMA: dict[str, Any] = {
     "xs": Annotated[list[Digit], Field(max_length=3)],
     "ws": Annotated[list[Word], Field(max_length=3)],
 }
+# the same names with no lengths: what uses them must be rejected (lists, maps and splits need
+# a known length), and whatever still compiles must be decided like anything else
+UNBOUNDED: dict[str, Any] = {**SCHEMA, "s": str, "t": str, "xs": list[Digit], "ws": list[str]}
 VARS = {"I": ["n", "k", "m"], "S": ["s", "t"], "B": ["b"], "LI": ["xs"], "LS": ["ws"]}
 ALPHABET = "ab-A1 "
 PATTERNS = ["^[a-z]+$", "^[0-9]{2}$", "^a", "b$", "^[A-Za-z ]*$", "^(ab)+$", "-"]
@@ -380,13 +383,16 @@ def fuzz(
     *,
     gate: bool = False,
     depth: int = 3,
+    unbounded: bool = False,
 ) -> list[Outcome]:
     """Ask every question of `count` random expressions. Each expression draws from its own
     generator, so a verdict that changes (a timeout near the limit) never changes the rest.
     In gate mode a timeout is retried at 4x the limit before it counts as UNKNOWN, and
     nothing is shrunk: outcomes are keyed by the generated source, never a timing-dependent
-    shrink."""
-    env = Env(**SCHEMA)
+    shrink. With `unbounded`, strings and lists have no declared length: rejections for that
+    are expected and dropped, and the questions are keyed apart ("unbounded:always_true")."""
+    env = Env(**(UNBOUNDED if unbounded else SCHEMA))
+    tag = "unbounded:" if unbounded else ""
     outs: list[Outcome] = []
     for i in range(count):
         rng = random.Random(seed * 1_000_003 + i)
@@ -399,7 +405,7 @@ def fuzz(
         for q in QUESTIONS["B"] if ty == "B" else QUESTIONS["*"]:
             other = mutate(g, node, depth) if q == "equivalent" else None
             key_src = node.text() if other is None else f"{node.text()}  <=>  {other.text()}"
-            if skip_known and f"{q}\t{key_src}" in known:
+            if skip_known and f"{tag}{q}\t{key_src}" in known:
                 continue
             out = ask(env, q, node, other, timeout)
             if gate and out.status == "UNKNOWN" and "timeout" in out.detail:
@@ -422,6 +428,9 @@ def fuzz(
                         out.ms,
                         out.detail + f"  (shrunk from: {key_src})",
                     )
+            if unbounded and out.status == "REJECTED" and "max_length" in out.detail:
+                continue
+            out.question = tag + out.question
             outs.append(out)
     return outs
 
@@ -455,8 +464,11 @@ def main(argv: list[str] | None = None) -> int:
         "--budget", type=float, default=1000.0, help="report decided questions slower than this (ms)"
     )
     ap.add_argument("--samples", type=int, default=40, help="random inputs per decided verdict")
+    ap.add_argument("--unbounded", action="store_true", help="explore the schema without declared lengths")
     ap.add_argument(
-        "--gate", action="store_true", help="fixed seeds (3 x 40); fail on WRONG or a new UNKNOWN"
+        "--gate",
+        action="store_true",
+        help="fixed seeds (3 x 40, plus 40 unbounded); fail on WRONG or a new UNKNOWN",
     )
     ap.add_argument("--update", action="store_true", help="with --gate: write the current UNKNOWNs as known")
     ap.add_argument("--recheck", action="store_true", help="with --gate: retry known failures too")
@@ -464,13 +476,32 @@ def main(argv: list[str] | None = None) -> int:
     known = set(KNOWN.read_text().splitlines()) - {""} if KNOWN.exists() else set()
     known = {k for k in known if not k.startswith("#")}
     if not a.gate:
-        report(fuzz(a.seed, a.count, a.timeout, a.budget, a.samples, known, skip_known=False))
+        report(
+            fuzz(
+                a.seed,
+                a.count,
+                a.timeout,
+                a.budget,
+                a.samples,
+                known,
+                skip_known=False,
+                unbounded=a.unbounded,
+            )
+        )
         return 0
     outs = [
         o
-        for seed in (1, 2, 3)
+        for seed, unbounded in ((1, False), (2, False), (3, False), (4, True))
         for o in fuzz(
-            seed, 40, a.timeout, a.budget, a.samples, known, skip_known=not (a.recheck or a.update), gate=True
+            seed,
+            40,
+            a.timeout,
+            a.budget,
+            a.samples,
+            known,
+            skip_known=not (a.recheck or a.update),
+            gate=True,
+            unbounded=unbounded,
         )
     ]
     report(outs)

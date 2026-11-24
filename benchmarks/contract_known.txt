@@ -1,6 +1,9 @@
 # Contract fuzzer: in-subset questions that are still UNKNOWN (see benchmarks/fuzz_contract.py).
 # Each is a contract bug to fix; the gate fails on any UNKNOWN not listed here.
+equivalent	(b ? s : ' ').lowerAscii().upperAscii()  <=>  (b ? s : s).lowerAscii().upperAscii()
 equivalent	(b ? s : s).split(' ').join('')  <=>  (!(b) ? s : s).split(' ').join('')
 satisfiable	((s.matches('-') && (k in xs)) && t.lowerAscii().endsWith('1b '))
-equivalent	(b ? s : ' ').lowerAscii().upperAscii()  <=>  (b ? s : s).lowerAscii().upperAscii()
 satisfiable	s.upperAscii().upperAscii().endsWith(' A')
+unbounded:never_errors	math.least((s.indexOf('a') + n), m)
+unbounded:satisfiable	(s.upperAscii().lowerAscii() == (t + s).substring(2))
+always_true	ws.join('').startsWith(t.split(' ').join(' a1'))

@@ -15,20 +15,6 @@ the validator and the Z3 encoding read them as such. The Pydantic path converts 
   ints through unconverted.
 - *Found:* review of `celspresso.schema` (M1).
 
-### Pydantic bounds on date, datetime and timedelta fields crash
-`Annotated[date, Field(ge=date(2020, 1, 1))]` raises `TypeError: float() argument must
-be ... not 'datetime.date'` while the Env is built. `_metadata_constraints` calls
-`float()` on every bound.
-- *Fix:* map temporal bounds to day numbers or epoch times in the encoding, or else reject
-  them with a clear message naming the field.
-
-### Constraints on top-level variables aren't checked against their type
-`Env(x=Annotated[str, annotated_types.Ge(3)])` is accepted. The bound is silently ignored
-by the prover. Struct fields (declared, or from an adapter) are checked by
-`_check_constraints`, but variables never go through it.
-- *Fix:* run `_check_constraints` on the result of `SchemaBuilder.convert` for variables,
-  `define` params and function signatures.
-
 ### Witnesses for Pydantic models with field aliases fail to decode
 `full_name: str = Field(alias="fullName")` gives UNKNOWN with "witness fails model
 validation", because `PydanticAdapter.decode` passes `model_validate` the field names.
@@ -107,12 +93,6 @@ first entry), which are exact only up to 2**53.
 
 ## Verifier
 
-### Comprehensions over a nullable list are not modeled
-`s.c == null || s.c.all(x, x.startsWith('x'))` with `c: list(string)?` returns UNKNOWN,
-with "comprehension over this range is not yet modeled". The same comprehension over a
-non-nullable list works.
-- *Fix:* in the encoder, unwrap a nullable range under the guard that it isn't null.
-
 ### The subset leaves out some useful formatting builtins
 Every `Env` accepts only celspresso's CEL subset (`crates/celspresso-verify/src/subset.rs`): builtins are
 allowed by overload id after probing, and everything else is a compile error. Left out
@@ -176,7 +156,7 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   under the same bindings), so `a <=> a` and shared subterms are free; a cheaper split
   encoding for a literal one-character separator; the case-mapping fix above.
 - *Found:* contract fuzzer (fuzzer milestone). The fuzzer also found that split used
-  `unroll_limit` slots on bounded strings (now grown up to 32 slots until no overflow is
+  the fixed unroll limit's slots on bounded strings (now grown up to 32 slots until no overflow is
   possible) and that overflowing split models gave witnesses that never replayed (now
   excluded from the solve).
 - Contract (`ensures`, `total=True`) facts were asserted for every encoded call, even
@@ -188,20 +168,15 @@ still UNKNOWN in `benchmarks/contract_known.txt`; each is a contract bug. Curren
   UNKNOWN, so a question that needs about that long passes on a fast laptop and fails on a CI
   runner. `(b ? s : ' ').lowerAscii().upperAscii() <=> (b ? s : s).lowerAscii().upperAscii()`
   took 10.5 s locally, passed the local gate, failed CI's, and is now listed as known.
+  `ws.join('').startsWith(t.split(' ').join(' a1'))` (always_true) likewise: 0.8 s locally,
+  3 s then >12 s on CI's Linux runner, and 0.8-9 s locally under trivial rewrites (`true && `,
+  `(n == n) && `). split + join solve times are heavy-tailed (M1).
   *Fix:* give the gate a deterministic budget with Z3's `rlimit` (resource units) instead of
   wall-clock time, so a verdict is the same on any machine; keep the timeout as a backstop.
   *Found:* first CI run (PR #1).
-- `bounds()` has neither the split retry nor the no-overflow assertion, so bounds of a
-  split are never marked sound: `s.split(',').size()` with max_length 8 gives an unproven
-  `[1, 5]` where the true max is 9 (review of the fuzzer milestone).
-
-### `\d`, `\w`, `\s` and `\b` are Unicode-aware, unlike RE2
-CEL regexes are RE2, where the Perl classes are ASCII-only. The evaluator (`regex` crate)
-and the verifier (`regex-syntax`) both use Unicode classes, so they agree with each other
-but not with cel-go on non-ASCII input (`'٣'.matches('\\d')` is true here, false in cel-go).
-Fixing it would also make `\d` fast to verify (one range).
-- *Fix:* rewrite Perl classes to their ASCII forms in the regex AST before both the
-  evaluator and the verifier see them; add conformance-style tests.
+- On strings with no `max_length` (the gate's unbounded pass): `math.least(s.indexOf('a') + n, m)`
+  can't be shown error-free ("reached max unfolding": the index has no bound, so `+ n` might
+  overflow as far as Z3 can tell).
 
 ### Some string functions are still not modeled
 `trim`, `replace`, `format`, `substring`-free `charAt` loops, `split` with a limit or an
@@ -212,14 +187,13 @@ Remaining limits of those:
 - `lowerAscii`/`upperAscii` pin only the first 4 characters of a non-literal string
   (each extra character costs solver time). Facts about longer strings that depend on
   later characters may be UNKNOWN; counterexamples are always replayed, so never wrong.
-- `split` uses `unroll_limit` slots. If the assumptions allow more pieces (an unbounded
-  string, or `max_length` above the limit), a proof is UNKNOWN even when it holds for
-  any number of pieces (`size(t.split(',')) >= 1`).
-- `split` always uses `unroll_limit` slots, even when `max_length` bounds the string;
-  sizing the slots from the bound (as list inputs do) would avoid raising the limit by hand.
-- Overflow conditions are not guarded by whether a split is reached (an inactive
-  comprehension step, a filtered-out piece), and assumptions that read a split are left
-  out of the overflow check. Both only turn provable results into UNKNOWN.
+- A split inside a contract (`ensures`) reads a parameter with no declared length, so it
+  has no static piece count: it gets the retry's slots (up to 32) and may overflow (UNKNOWN, never wrong). Contract bodies
+  skip the size check (each use passes bounded arguments), but contracts aren't expanded at
+  the use, so nothing checks the split: `ensures="p.split(',').size() <= 40"` with an
+  argument of max_length 60 takes 10-20 s to come back UNKNOWN (review of M1).
+  *Fix:* carry the signature's constraints into the contract's variables and size-check the
+  body, or encode the contract's split with the argument's bound at the call.
 - Proofs and UNSATs about `int(t)` on an unbounded `t` often run to the timeout (Z3's
   `str.to_int` is weak); asserting `t ∈ [0-9]+` on success may help, unmeasured.
 - A review fuzz run saw one nested-split query run far past its timeout; not reproduced.

@@ -31,8 +31,9 @@ pub fn validate(v: &Value, ty: &CelType, cons: &Constraints, schema: &Schema, pa
             }
         }
         (Value::Map(m), CelType::Map(_, vt)) => {
+            let ic = cons.items.as_deref().unwrap_or(&none);
             for (k, x) in m.iter() {
-                validate(x, vt, &none, schema, &format!("{path}[{}]", key_label(k)))?;
+                validate(x, vt, ic, schema, &format!("{path}[{}]", key_label(k)))?;
             }
         }
         (Value::Struct(s), CelType::Struct(name)) => {

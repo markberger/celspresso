@@ -3,6 +3,7 @@
 pub mod date;
 pub mod ext;
 pub mod net;
+pub mod re2;
 pub mod time;
 pub mod validate;
 pub mod value;
@@ -354,7 +355,7 @@ impl<'a> Evaluator<'a> {
         if let Some(r) = self.regex_cache.borrow().get(pattern) {
             return Ok(r.clone());
         }
-        let r = regex::RegexBuilder::new(pattern)
+        let r = regex::RegexBuilder::new(&re2::ascii_perl_classes(pattern))
             .size_limit(self.limits.max_regex_size)
             .build()
             .map_err(|er| err(e, format!("invalid regex: {er}")))?;

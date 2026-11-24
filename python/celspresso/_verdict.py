@@ -248,7 +248,7 @@ class Verdict:
         if self.reason:
             lines.append(f"  reason: {self.reason}")
         if self.bounded:
-            lines.append("  (result relied on the unroll limit)")
+            lines.append("  (result relied on a list, map or split the verifier cut off)")
         if self.assumptions:
             lines.append("  assuming: " + " && ".join(f"({a})" for a in self.assumptions))
         return "\n".join(lines)

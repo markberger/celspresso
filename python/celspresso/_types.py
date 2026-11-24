@@ -206,7 +206,12 @@ def lower(spec: TypeSpec, cons: dict[str, Any] | None) -> tuple[TypeSpec, dict[s
             out["items"] = ic
         return ("list", elem), (out or None)
     if kind == "map":
-        return ("map", lower(spec[1], None)[0], lower(spec[2], None)[0]), cons
+        vals, vc = lower(spec[2], (cons or {}).get("items"))
+        out = dict(cons or {})
+        out.pop("items", None)
+        if vc:
+            out["items"] = vc
+        return ("map", lower(spec[1], None)[0], vals), (out or None)
     return spec, cons
 
 
@@ -302,6 +307,8 @@ class SchemaBuilder:
         cons: dict[str, Any] = {}
         spec = self._convert(tp, cons, where)
         cons = _public(cons)  # drop unused precision
+        if cons:
+            _check_constraints(spec, _constraints_of(cons), where)
         return spec, (cons or None)
 
     # -- adapter support ----------------------------------------------------
@@ -438,7 +445,7 @@ class SchemaBuilder:
         origin = get_origin(tp)
         args = get_args(tp)
         if origin is typing.Annotated:
-            _metadata_constraints(args[1:], cons)
+            _metadata_constraints(args[1:], cons, where)
             return self._convert(args[0], cons, where)
         if origin is typing.Literal:
             kinds = {type(a) for a in args}
@@ -468,9 +475,12 @@ class SchemaBuilder:
             return ("list", elem)
         if origin in (dict, Mapping):
             k = self._convert(args[0], {}, f"{where} key") if args else "dyn"
-            v = self._convert(args[1], {}, f"{where} value") if args else "dyn"
+            val_cons: dict[str, Any] = {}
+            v = self._convert(args[1], val_cons, f"{where} value") if args else "dyn"
             _check_map_value(k, f"{where} key")
             _check_map_value(v, f"{where} value")
+            if val_cons:
+                cons["items"] = val_cons  # the constraints of every value
             return ("map", k, v)
         if tp in (list, tuple, set, frozenset):
             return ("list", "dyn")
@@ -608,12 +618,12 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
         else:
             raise bad("one_of with ints", "int or uint")
     if c.items is not None:
-        if kind != "list":
-            raise bad("items", "list")
-        _check_constraints(spec[1], c.items, f"{where}[]")
+        if kind not in ("list", "map"):
+            raise bad("items", "list or map")
+        _check_constraints(spec[-1], c.items, f"{where}[]")
 
 
-def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None:
+def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: str = "annotation") -> None:
     for m in metadata:
         # Pydantic's Decimal precision; consumed by _decimal_spec, dropped elsewhere
         for key, slot in (("max_digits", "_digits"), ("decimal_places", "_places")):
@@ -625,6 +635,12 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None
             if val is not None and not callable(val):
                 if key in ("ge", "gt", "le", "lt"):
                     # a Decimal stays exact until its field's type is known (_decimal_spec)
+                    if isinstance(val, bool) or not isinstance(val, (int, float, decimal.Decimal)):
+                        raise TypeError(
+                            f"{where}: the bound {key}={val!r} isn't supported; only numeric fields"
+                            " take ge/gt/le/lt (state a bound on a date, time or duration as an"
+                            " assumption: env.assume(...))"
+                        )
                     val = val if isinstance(val, decimal.Decimal) else float(val)
                 elif key == "pattern" and not isinstance(val, str):
                     val = getattr(val, "pattern", val)  # a compiled re.Pattern
@@ -632,7 +648,7 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any]) -> None
         # pydantic FieldInfo nested in Annotated[..., Field(...)]
         inner = getattr(m, "metadata", None)
         if isinstance(inner, list) and inner is not metadata:
-            _metadata_constraints(inner, cons)
+            _metadata_constraints(inner, cons, where)
 
 
 def _from_units(units: int, places: int) -> decimal.Decimal:

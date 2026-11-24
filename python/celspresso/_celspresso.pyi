@@ -54,7 +54,6 @@ def bounds(
     a: Program,
     assumptions: list[Program],
     timeout_ms: int,
-    unroll_limit: int,
     schema_constraints: bool,
     functions: dict[str, Any] | None = None,
 ) -> dict[str, Any]: ...
@@ -64,7 +63,6 @@ def verify(
     b: Program | None,
     assumptions: list[Program],
     timeout_ms: int,
-    unroll_limit: int,
     schema_constraints: bool,
     errors: str,
     functions: dict[str, Any] | None = None,

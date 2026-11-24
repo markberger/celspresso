@@ -137,10 +137,10 @@ fn refuted(src: &str) -> BTreeMap<String, Value> {
 }
 #[track_caller]
 fn exact(src: &str) {
-    // proved without relying on the unroll bound
+    // proved without relying on a cut-off list
     let o = run(Query::AlwaysTrue(&c(src)));
     assert!(matches!(o.status, Status::NotFound), "{src}: expected PROVED, got {:?}", o.status);
-    assert!(!o.bounded, "{src}: proof relied on the unroll bound");
+    assert!(!o.bounded, "{src}: proof relied on a cut-off list");
 }
 
 #[test]
@@ -548,7 +548,7 @@ fn bounds_of_numeric_expressions() {
     assert!(r.min.is_some_and(|m| m.sound));
     // unbounded collections: the bound is not sound, and the reason says why
     let r = b("size(xs)");
-    assert!(!r.max.unwrap().sound && r.reason.unwrap().contains("unroll"));
+    assert!(!r.max.unwrap().sound && r.reason.unwrap().contains("declare max_length"));
     assert!(b("s").reason.unwrap().contains("integer-valued"));
     assert!(b("1 / 0").reason.unwrap().contains("errors on every"));
 }
@@ -635,7 +635,7 @@ fn unknown_reasons_name_unmodeled_builtins() {
 #[test]
 fn operator_names_in_reasons_are_as_written() {
     // a builtin operator on unmodeled operands is named as in the source, never '_>_'
-    match run(Query::Satisfiable(&c("[1] + [2] == [3] && s.split(' ').size() > 1"))).status {
+    match run(Query::Satisfiable(&c("[1] + [2] != [3] && s.trim().size() > 1"))).status {
         Status::Unknown(r) => assert!(!r.contains("'_"), "{r}"),
         st => panic!("{st:?}"),
     }

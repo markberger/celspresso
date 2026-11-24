@@ -329,7 +329,10 @@ def test_context_refs_can_be_wrapped_and_passed_back() -> None:
             line = ctx.convert(tp.lines)[0]
             return ctx.struct(
                 tp,
-                lambda: [ctx.field("lines", T.list(line)), ctx.field("first", T.nullable(line))],
+                lambda: [
+                    ctx.field("lines", T.list(line), Constraints(max_length=8)),
+                    ctx.field("first", T.nullable(line)),
+                ],
                 name=tp.name,
             )
 

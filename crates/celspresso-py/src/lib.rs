@@ -546,7 +546,15 @@ fn compile_err(kind: &str, src: &str, diags: Vec<(String, Span)>) -> PyErr {
 
 /// Reject uses of CEL outside celspresso's subset (what the verifier decides exactly and fast).
 fn in_subset(checked: &CheckedExpr, src: &str) -> PyResult<()> {
-    let outside = celspresso_verify::subset::violations(checked);
+    subset_result(celspresso_verify::subset::violations(checked), src)
+}
+
+/// `in_subset` for a body whose parameters are bound at each use (checked there, expanded).
+fn body_in_subset(checked: &CheckedExpr, src: &str) -> PyResult<()> {
+    subset_result(celspresso_verify::subset::violations_of_body(checked), src)
+}
+
+fn subset_result(outside: Vec<(String, Span)>, src: &str) -> PyResult<()> {
     if outside.is_empty() {
         Ok(())
     } else {
@@ -672,7 +680,7 @@ impl Core {
                 cs.vars.insert(n.clone(), VarDecl { name: n.clone(), ty: t, constraints: Constraints::default() });
             }
             let ensures = compile_source(&Arc::new(cs), &BTreeMap::new(), &src)?;
-            in_subset(&ensures, &src)?;
+            body_in_subset(&ensures, &src)?;
             if *ensures.output_type() != CelType::Bool {
                 return Err(PyValueError::new_err(format!("ensures for '{id}' must be a bool expression, not {}", ensures.output_type())));
             }
@@ -702,7 +710,7 @@ impl Core {
                         types.push(ty);
                     }
                     let checked = compile_source(&Arc::new(ds), &defmap, &src)?;
-                    in_subset(&checked, &src)?;
+                    body_in_subset(&checked, &src)?;
                     let result = checked.output_type().clone();
                     s.add_function(FunctionDecl {
                         name: name.clone(),
@@ -887,7 +895,7 @@ impl Program {
 
 /// kind: satisfiable | always_true | equivalent | implies | can_error
 #[pyfunction]
-#[pyo3(signature = (kind, a, b, assumptions, timeout_ms, unroll_limit, schema_constraints, errors, functions=None, sample_proofs=0))]
+#[pyo3(signature = (kind, a, b, assumptions, timeout_ms, schema_constraints, errors, functions=None, sample_proofs=0))]
 #[allow(clippy::too_many_arguments)]
 fn verify<'py>(
     py: Python<'py>,
@@ -896,7 +904,6 @@ fn verify<'py>(
     b: Option<PyRef<'py, Program>>,
     assumptions: Vec<PyRef<'py, Program>>,
     timeout_ms: u64,
-    unroll_limit: usize,
     schema_constraints: bool,
     errors: &str,
     functions: Option<&Bound<'py, PyDict>>,
@@ -914,7 +921,7 @@ fn verify<'py>(
     let kind_owned = kind.to_string();
     let bb = if matches!(kind, "equivalent" | "implies") { Some(need_b()?) } else { None };
     let funcs = PyFunctions::from_dict(functions)?;
-    let opts = Options { timeout_ms, unroll_limit, schema_constraints, sample_proofs };
+    let opts = Options { timeout_ms, schema_constraints, sample_proofs };
     let out = py.detach(|| {
         let refs: Vec<&CheckedExpr> = asm.iter().map(|x| x.as_ref()).collect();
         let q = match kind_owned.as_str() {
@@ -958,13 +965,12 @@ fn verify<'py>(
 
 /// The range of a numeric expression: {min, max: {value, witness, attained, sound} | None, reason, ...}.
 #[pyfunction]
-#[pyo3(signature = (a, assumptions, timeout_ms, unroll_limit, schema_constraints, functions=None))]
+#[pyo3(signature = (a, assumptions, timeout_ms, schema_constraints, functions=None))]
 fn bounds<'py>(
     py: Python<'py>,
     a: PyRef<'py, Program>,
     assumptions: Vec<PyRef<'py, Program>>,
     timeout_ms: u64,
-    unroll_limit: usize,
     schema_constraints: bool,
     functions: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -972,7 +978,7 @@ fn bounds<'py>(
     let ae = a.checked.clone();
     let asm: Vec<Arc<CheckedExpr>> = assumptions.iter().map(|p| p.checked.clone()).collect();
     let funcs = PyFunctions::from_dict(functions)?;
-    let opts = Options { timeout_ms, unroll_limit, schema_constraints, sample_proofs };
+    let opts = Options { timeout_ms, schema_constraints, sample_proofs };
     let out = py.detach(|| {
         let refs: Vec<&CheckedExpr> = asm.iter().map(|x| x.as_ref()).collect();
         run_bounds(&ae, &refs, opts, &funcs)

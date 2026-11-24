@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from celspresso import (
     CelEvaluationError,
+    CelSubsetError,
     CelSyntaxError,
     CelTypeError,
     Env,
@@ -263,13 +264,14 @@ def test_lists_bounded_by_max_length(env: Env) -> None:
     v = env.predicate("user.roles.all(r, r == 'a') && size(user.roles) > 10").satisfiable()
     assert v.refuted
     assert not v.bounded
-    unbounded = Env(xs=list[int])
-    w = unbounded.predicate("xs.all(x, x > 0)").implies("xs.exists(x, x > 0) || size(xs) == 0")
-    assert w.unknown
-    assert w.bounded
-    assert "max_length" in (w.reason or "")
-    # SAT witnesses are always real, even for unbounded lists
-    assert unbounded.predicate("xs.exists(x, x > 5)").satisfiable().proved
+    # past its declared length a list could be refuted but never proved: a list with no
+    # max_length is outside the subset, wherever it is used
+    unbounded = Env(xs=list[int], m=dict[str, int])
+    for src in ["xs.all(x, x > 0)", "size(xs) > 10", "1 in xs", "xs + [1] != xs", "'a' in m"]:
+        with pytest.raises(CelSubsetError, match="no max_length"):
+            unbounded.predicate(src)
+    with pytest.raises(CelSubsetError, match="above 64"):
+        Env(xs=Annotated[list[int], Field(max_length=65)]).predicate("1 in xs")
     bounded = Env(xs=Annotated[list[int], Field(max_length=4)])
     assert bounded.predicate("xs.all(x, x > 0)").implies("xs.exists(x, x > 0) || size(xs) == 0").proved
 
@@ -401,15 +403,15 @@ def test_evaluate_enforces_schema_constraints() -> None:
 def test_limits_cap_evaluation_cost() -> None:
     from celspresso import Limits
 
-    env = Env(xs=list[int], limits=Limits(max_iterations=10))
+    env = Env(xs=Annotated[list[int], Field(max_length=64)], limits=Limits(max_iterations=10))
     p = env.predicate("xs.all(x, x > 0)")
     assert p.evaluate({"xs": [1, 2, 3]}) is True
     with pytest.raises(CelEvaluationError, match="iteration limit"):
-        p.evaluate({"xs": list(range(1, 100))})
+        p.evaluate({"xs": list(range(1, 30))})
     # limits survive extending the env
     wider = env.assume("size(xs) >= 0")
     with pytest.raises(CelEvaluationError, match="iteration limit"):
-        wider.predicate("xs.all(x, x > 0)").evaluate({"xs": list(range(1, 100))})
+        wider.predicate("xs.all(x, x > 0)").evaluate({"xs": list(range(1, 30))})
     with pytest.raises(ValueError, match="positive int"):
         Limits(max_cost=0)
     with pytest.raises(TypeError, match="limits"):

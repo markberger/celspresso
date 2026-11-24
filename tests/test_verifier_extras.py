@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import BaseModel, Field
 
-from celspresso import Bounds, CelTypeError, Env, RuleSet, VerificationFailed, function
+from celspresso import Bounds, CelSubsetError, CelTypeError, Env, RuleSet, function
 from celspresso._env import _debug_options
 
 
@@ -45,12 +45,8 @@ def test_bounds_respect_assumptions_and_max_length() -> None:
 
 
 def test_bounds_explain_what_is_missing() -> None:
-    b = env.expr("size(order.notes)").bounds()
-    assert not b.proved
-    assert "unroll limit" in (b.reason or "")
-    assert str(b).startswith("[0?, 5?] (not proved")
-    with pytest.raises(VerificationFailed):
-        b.expect()
+    with pytest.raises(CelSubsetError, match=r"'order\.notes': it has no max_length"):
+        env.expr("size(order.notes)")
     assert "integer-valued" in (env.expr("order.tier").bounds().reason or "")
     assert env.expr("order.days / 0").bounds().min is None
 
@@ -126,3 +122,21 @@ def test_ruleset_verify_all() -> None:
     assert set(checks) == {"small", "gold"}
     assert checks["small"].ok
     assert not checks["gold"].ok
+
+
+def test_comprehensions_over_a_nullable_list() -> None:
+    class Tagged(BaseModel):
+        tags: Annotated[list[str], Field(max_length=3)] | None = None
+
+    e = Env(t=Tagged)
+    guarded = e.predicate("t.tags == null || t.tags.all(x, x.startsWith('x'))")
+    assert guarded.never_errors().proved
+    assert guarded.always_true().refuted
+    # iterating a null is an error, as in the evaluator
+    bare = e.predicate("t.tags.all(x, x.startsWith('x'))")
+    v = bare.never_errors()
+    assert v.refuted
+    assert v.counterexample is not None
+    assert v.counterexample.relevant == {"t.tags": None}
+    found = e.predicate("t.tags != null && t.tags.exists(x, x == 'y') && size(t.tags) == 2").satisfiable()
+    assert found.proved

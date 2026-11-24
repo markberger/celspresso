@@ -126,7 +126,11 @@ class Person(BaseModel):
 
 
 def test_optionals_and_presence_are_inside_the_subset() -> None:
-    env = Env(p=Person, m=dict[str, int], xs=list[int])
+    env = Env(
+        p=Person,
+        m=Annotated[dict[str, int], Field(max_length=4)],
+        xs=Annotated[list[int], Field(max_length=4)],
+    )
     env.compile("p.?nick.orValue('') + string(m[?'k'].orValue(0)) + string(xs[?0].orValue(1))")
     env.compile("has(p.nick) && 'k' in m")
     env.compile("[?m[?'a'], 3] == [3] && {?'k': m[?'a']} == {}")
@@ -135,7 +139,7 @@ def test_optionals_and_presence_are_inside_the_subset() -> None:
 @pytest.mark.parametrize(
     ("src", "hint"),
     [
-        (r"s.matches(r'^\d{5}$')", "[0-9]"),
+        (r"s.matches(r'^\p{L}{5}$')", "[A-Za-z]"),
         ("s.matches('a(?=b)')", "invalid pattern"),
         ("s.matches('[')", "invalid"),
     ],
@@ -265,10 +269,64 @@ def test_comparisons_that_reach_dyn_values_are_rejected(src: str) -> None:
 )
 def test_macros_report_each_bad_value_once(src: str, errors: int) -> None:
     with pytest.raises(CelTypeError) as exc:
-        Env(ds=list[float], ns=list[int]).compile(src)
+        Env(ds=list[float], ns=Annotated[list[int], Field(max_length=3)]).compile(src)
     assert len(exc.value.diagnostics) == errors
 
 
 def test_macros_over_dyn_lists_still_catch_the_element() -> None:
     with pytest.raises(CelTypeError, match="unknown type"):
         Env(xs=Annotated[list[Any], Field(max_length=3)]).compile("xs.exists(q, q == 1)")
+
+
+def test_perl_classes_are_ascii_as_in_re2() -> None:
+    env = Env(s=Annotated[str, Field(max_length=6)])
+    # cel-go: '\d' is [0-9], '\w' is [0-9A-Za-z_], '\s' is [\t\n\f\r ]
+    for src, want in [
+        (r"'٣'.matches('\\d')", False),
+        (r"'7'.matches('\\d')", True),
+        (r"'é'.matches('^\\w$')", False),
+        (r"'é'.matches('^\\W$')", True),
+        ("' '.matches('\\\\s')", False),
+    ]:
+        assert env.predicate(src).evaluate({"s": ""}) is want, src
+    # the verifier sees the same small classes, so these are in the subset and decided
+    assert env.predicate(r"!s.matches('^\\d{3}$') || int(s) < 1000").always_true().proved
+    assert env.predicate(r"s.matches('^[\\w-]+$') && s.contains('é')").satisfiable().refuted
+
+
+def test_or_value_bounds_its_result_by_the_default_too() -> None:
+    # review of M1: the bound of xs[?0].orValue(d) once ignored d, so a split of it was
+    # treated as shorter than it is and gave a false PROVED
+    one = Annotated[str, Field(max_length=1)]
+    env = Env(xs=Annotated[list[one], Field(max_length=3)])
+    for src in [
+        "xs[?0].orValue('a,b,c').split(',').size() < 3",
+        "[xs[?0].orValue('a,b,c,d')].join(';').split(',').size() < 3",
+    ]:
+        p = env.predicate(src)
+        v = p.always_true()
+        assert v.refuted, (src, v)
+        assert p.evaluate({"xs": []}) is False
+    assert (
+        env.predicate("xs.size() > 0 || xs[?0].orValue('a,b,c').split(',').size() == 3").always_true().proved
+    )
+
+
+def test_bound_and_defined_names_keep_their_bounds() -> None:
+    env = Env(t=Annotated[str, Field(max_length=3)])
+    assert env.predicate("cel.bind(p, t, p.split(',').size() < 5)").always_true().proved
+    f = env.define("f", "p.split(',').size() < 5", params={"p": str})
+    assert f.predicate("f(t)").always_true().proved
+
+
+def test_map_values_take_constraints() -> None:
+    one = Annotated[str, Field(max_length=1)]
+    env = Env(m=Annotated[dict[str, one], Field(max_length=4)])
+    assert env.predicate("!('k' in m) || m['k'].split(',').size() < 3").always_true().proved
+    with pytest.raises(ValueError, match="length"):
+        env.predicate("true").evaluate({"m": {"k": "long"}})
+
+
+def test_verbose_patterns_are_not_re2() -> None:
+    with pytest.raises(CelSubsetError, match="verbose"):
+        Env(s=Name).compile(r"s.matches('(?x)a\\sb')")
