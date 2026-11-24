@@ -696,9 +696,15 @@ class Env:
         problems: list[Problem] = [Problem("suspicious", w.rendered) for w in expr.warnings]
         for i, (data, expected) in enumerate(spec.examples):
             try:
-                got: Any = expr.evaluate(data)
+                raw = expr._evaluate_raw(data)
             except CelEvaluationError as e:
                 why = f"example {i} should give {expected!r}, but evaluation fails: {e}"
+                problems.append(Problem("wrong_example", why))
+                continue
+            try:
+                got: Any = expr._to_python(raw)
+            except Exception as e:  # noqa: BLE001 - e.g. a value its class's validation rejects
+                why = f"example {i} should give {expected!r}, but its result can't be built: {e}"
                 problems.append(Problem("wrong_example", why))
                 continue
             if not _same_result(got, expected):
@@ -746,6 +752,8 @@ class Env:
                     undecided(f"that it allows '{name}'", v, name)
         if spec.ensures:
             problems += self._check_ensures(expr, spec.ensures, assuming, timeout)
+        if not isinstance(expr, Predicate):
+            problems += self._check_fits(expr, spec, assuming, timeout)
         return RuleCheck(src, expr, tuple(problems))
 
     def _check_ensures(
@@ -757,35 +765,13 @@ class Env:
     ) -> list[Problem]:
         """Each `ensures` condition, over the inputs and `result` (the rule's value), holds
         on every valid input on which the rule doesn't fail."""
-        if "result" in self._vars:
-            raise ValueError(
-                "ensures refers to the rule's value as 'result', but this Env has a variable named 'result'"
-            )
-        # `result`, typed as the rule's value, to compile the conditions with clear errors
-        with_result = self._clone()
-        with_result._vars["result"] = (expr._result_spec, None)
-        with_result._build()
-        # where the rule has a value (cel.bind computes it up front, so this is false
-        # exactly where the rule fails)
-        has_value = self.predicate(f"cel.bind(result, ({expr.source}), true)")
         problems: list[Problem] = []
-        for name, cond in ensures.items():
-            cond_src = cond if isinstance(cond, str) else cond.source
-            try:
-                holds = self.predicate(f"cel.bind(result, ({expr.source}), ({cond_src}))")
-            except CelError as bound:
-                # report the condition's own error (its spans are in its own text), unless
-                # only the bound form fails
-                e: CelError = bound
-                try:
-                    with_result.predicate(cond_src)
-                except CelError as own:
-                    e = own
-                msg = f"ensures '{name}' doesn't apply to this rule's result ({expr.output_type}): {e}"
+        conds = {n: c if isinstance(c, str) else c.source for n, c in ensures.items()}
+        for name, v in self._results_meet(expr, conds, assuming, timeout).items():
+            if isinstance(v, CelError):
+                msg = f"ensures '{name}' doesn't apply to this rule's result ({expr.output_type}): {v}"
                 problems.append(Problem("invalid", msg, name))
-                continue
-            v = has_value.implies(holds, assuming=assuming, timeout=timeout)
-            if v.refuted:
+            elif v.refuted:
                 msg = f"violates ensures '{name}' when {v.counterexample}{_result_note(expr, v)}"
                 problems.append(Problem("violates", msg, name, v))
             elif v.unknown:
@@ -793,6 +779,84 @@ class Env:
                     Problem("unverified", f"could not verify ensures '{name}': {v.reason}", name, v)
                 )
         return problems
+
+    def _check_fits(
+        self, expr: Expr[Any], spec: Spec, assuming: Iterable[str | Predicate], timeout: float | None
+    ) -> list[Problem]:
+        """The rule's value meets the constraints of its declared type (and of the structs
+        it builds), so it can become a Python value: the verifier assumes them of inputs,
+        not of values a rule builds."""
+        if spec.returns is not None:
+            want, cons = self._builder.copy().convert(spec.returns, "returns")
+        else:
+            want, cons = expr._result_spec, None
+        try:
+            fits = _fits("result", "the result", want, cons, self._builder.structs)
+        except _Unchecked as e:
+            msg = f"could not verify that the result is a valid {type_name(want)}: {e} is recursive"
+            return [Problem("unverified", msg)]
+        if not fits:
+            return []
+        conds = dict(fits)
+        problems: list[Problem] = []
+        for what, v in self._results_meet(expr, conds, assuming, timeout).items():
+            if isinstance(v, CelError):
+                # e.g. a list field of a struct inside a list the rule built: its size isn't
+                # known statically
+                why = "the verifier can't bound the size of that value where the rule builds it"
+                problems.append(Problem("unverified", f"could not verify that {what}: {why}"))
+            elif v.refuted:
+                msg = (
+                    f"gives a result that isn't a valid {type_name(want)} when {v.counterexample}: "
+                    f"{what} fails"
+                )
+                problems.append(Problem("violates", msg, None, v))
+            elif v.unknown:
+                problems.append(Problem("unverified", f"could not verify that {what}: {v.reason}", None, v))
+        return problems
+
+    def _results_meet(
+        self,
+        expr: Expr[Any],
+        conds: Mapping[str, str],
+        assuming: Iterable[str | Predicate],
+        timeout: float | None,
+    ) -> dict[str, Verdict | CelError]:
+        """For each named condition over `result` (the rule's value) and the inputs: the
+        verdict that it holds wherever the rule has a value, or the condition's compile
+        error."""
+        if "result" in self._vars or any(n == "result" for n, _, _ in self._defs):
+            raise ValueError(
+                "ensures refers to the rule's value as 'result', but this Env has a variable "
+                "or definition named 'result'"
+            )
+        # `result`, typed as the rule's value, to compile the conditions with clear errors
+        with_result = self._clone()
+        with_result._vars["result"] = (expr._result_spec, None)
+        with_result._build()
+
+        # the rule's value bound to `result` (cel.bind computes it up front, so with `true`
+        # this is false exactly where the rule fails); newlines end any `//` comment
+        def bound(cond: str) -> Predicate:
+            return self.predicate(f"cel.bind(result, (\n{expr.source}\n), (\n{cond}\n))")
+
+        has_value = bound("true")
+        out: dict[str, Verdict | CelError] = {}
+        for name, cond in conds.items():
+            try:
+                holds = bound(cond)
+            except CelError as e:
+                # report the condition's own error (its spans are in its own text), unless
+                # only the bound form fails
+                err: CelError = e
+                try:
+                    with_result.predicate(cond)
+                except CelError as own:
+                    err = own
+                out[name] = err
+                continue
+            out[name] = has_value.implies(holds, assuming=assuming, timeout=timeout)
+        return out
 
     def _as_predicate(self, p: str | Predicate) -> Predicate:
         return self.predicate(p) if isinstance(p, str) else p
@@ -844,25 +908,102 @@ def _result_note(expr: Expr[Any], v: Verdict) -> str:
 
 
 def _same_result(got: Any, expected: Any) -> bool:
-    """Whether a rule's value is the expected one. Booleans must match exactly (True is
-    not 1), and a struct result matches a mapping of its fields."""
+    """Whether a rule's value is the expected one, at every level: booleans must match
+    exactly (True is not 1), and a struct matches an instance or a mapping of its fields."""
+    got, expected = _plain(got), _plain(expected)
     if isinstance(got, bool) or isinstance(expected, bool):
         return isinstance(got, bool) and isinstance(expected, bool) and got == expected
-    if isinstance(expected, Mapping) and not isinstance(got, Mapping):
-        got = _fields_of(got)
+    if isinstance(got, Mapping) and isinstance(expected, Mapping):
+        return got.keys() == expected.keys() and all(_same_result(got[k], expected[k]) for k in got)
+    if isinstance(got, (list, tuple)) and isinstance(expected, (list, tuple)):
+        return len(got) == len(expected) and all(
+            _same_result(a, b) for a, b in zip(got, expected, strict=True)
+        )
     return bool(got == expected)
 
 
-def _fields_of(value: Any) -> Any:
-    """A model or dataclass instance as a dict of its fields (anything else as is)."""
+def _plain(value: Any) -> Any:
+    """A model or dataclass instance as a dict of its fields, one level down (anything
+    else as is): `_same_result` recurses into the fields."""
     import dataclasses
 
-    dump = getattr(value, "model_dump", None)
-    if callable(dump):
-        return dump()
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return dataclasses.asdict(value)
+    if isinstance(value, type):
+        return value
+    fields = getattr(type(value), "model_fields", None)
+    if isinstance(fields, Mapping):
+        return {k: getattr(value, k) for k in fields}
+    if dataclasses.is_dataclass(value):
+        return {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
     return value
+
+
+class _Unchecked(Exception):
+    """A result type whose constraints can't all be written as CEL conditions."""
+
+
+def _fits(
+    x: str,
+    shown: str,
+    spec: TypeSpec,
+    cons: Mapping[str, Any] | None,
+    structs: Mapping[str, list[tuple[str, TypeSpec, dict[str, Any] | None]]],
+    seen: tuple[str, ...] = (),
+    depth: int = 0,
+) -> list[tuple[str, str]]:
+    """(what, CEL condition) for each declared constraint that a value `x` (shown to
+    people as `shown`) of `spec` must meet to become a Python value: the field
+    constraints of the structs in it, and `cons`. The verifier assumes them of inputs,
+    but a value a rule builds must be shown to meet them. Raises _Unchecked for a
+    recursive struct, which has no finite set of conditions."""
+    spec, low = lower(spec, dict(cons) if cons else None)
+    c = dict(low or {})
+    out: list[tuple[str, str]] = []
+
+    def sizes() -> None:
+        if "min_length" in c:
+            out.append((f"{shown} has size >= {c['min_length']}", f"size({x}) >= {c['min_length']}"))
+        if "max_length" in c:
+            out.append((f"{shown} has size <= {c['max_length']}", f"size({x}) <= {c['max_length']}"))
+
+    if isinstance(spec, str):
+        u = "u" if spec == "uint" else ""
+        if spec in ("int", "uint"):
+            for key, op in (("ge", ">="), ("gt", ">"), ("le", "<="), ("lt", "<")):
+                if key in c:
+                    b = float(c[key])
+                    n = int(math.ceil(b) if op in (">=", ">") else math.floor(b))
+                    if not b.is_integer() and op in (">", "<"):
+                        op = ">=" if op == ">" else "<="
+                    out.append((f"{shown} {op} {n}", f"{x} {op} {n}{u}"))
+        if "one_of" in c:
+            vals = ", ".join(cel_literal(v) + (u if isinstance(v, int) else "") for v in c["one_of"])
+            out.append((f"{shown} is one of {vals}", f"{x} in [{vals}]"))
+        sizes()
+        if "pattern" in c:
+            pat = cel_literal(c["pattern"])
+            out.append((f"{shown} matches {pat}", f"{x}.matches({pat})"))
+        return out
+    kind = spec[0]
+    if kind == "nullable":
+        inner = _fits(x, shown, spec[1], low, structs, seen, depth)
+        return [(w, f"{x} == null || ({cond})") for w, cond in inner]
+    if kind in ("list", "map"):
+        sizes()
+        v = f"_r{depth}"
+        if kind == "list":
+            item, item_shown, elem = v, f"each item of {shown}", spec[1]
+        else:
+            item, item_shown, elem = f"{x}[{v}]", f"each value of {shown}", spec[2]
+        for w, cond in _fits(item, item_shown, elem, c.get("items"), structs, seen, depth + 1):
+            out.append((w, f"{x}.all({v}, {cond})"))
+        return out
+    if kind == "struct":
+        name = spec[1]
+        if name in seen:
+            raise _Unchecked(name)
+        for f, fspec, fcons in structs.get(name, []):
+            out += _fits(f"{x}.{f}", f"{shown}.{f}", fspec, fcons, structs, (*seen, name), depth)
+    return out
 
 
 def _joint_env(env: Env, other: Predicate | str) -> Env:
@@ -1159,13 +1300,19 @@ class Expr(Generic[T]):
         data, so fields are read by name, not by their custom readers (`schema.Field`).
         Pass the Witness itself: `dict(w)` or `w.to_python()` is treated as host data,
         and readers run on it."""
+        return self._to_python(self._evaluate_raw(data))
+
+    def _evaluate_raw(self, data: Mapping[str, Any] | None) -> Any:
+        """The CEL value `e` gives for `data`, before conversion to the result type."""
         try:
-            raw = self._prog.evaluate(
+            return self._prog.evaluate(
                 self._host(data), self._env._fn_impls, self._env._limits, self._readers(data)
             )
         except _core.EvalError as exc:
             msg, eid, a, b, rendered = exc.args
             raise CelEvaluationError(msg, eid, (a, b), rendered) from None
+
+    def _to_python(self, raw: Any) -> T:
         return from_cel(raw, self._result_spec, self._env._builder)
 
     def explain(self, data: Mapping[str, Any] | None = None) -> Explanation:

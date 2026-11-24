@@ -633,6 +633,12 @@ def test_rule_file_structs_with_an_env(project: tuple[Path, str], capsys: pytest
     code, _, err = run(capsys, "check", bad)
     assert code == 2
     assert "returns must be a type" in err
+    bad = write(
+        d / "bad.toml", text.replace('returns = "{mod}:Decision"', 'returns = "{mod}:not_an_env"'), mod
+    )
+    code, _, err = run(capsys, "check", bad)
+    assert code == 2
+    assert "is not a type celspresso can check" in err
 
 
 def test_diff_rules_that_compute_a_value(project: tuple[Path, str], capsys: pytest.CaptureFixture[str]):
@@ -652,3 +658,7 @@ def test_diff_rules_that_compute_a_value(project: tuple[Path, str], capsys: pyte
     _, out, _ = run(capsys, "diff", old, new, "--format", "markdown")
     assert "#### ensures `capped`: changed" in out
     assert "#### returns: removed" in out
+    # a rule whose result type changed is changed, not undecided
+    new = write(d / "new.toml", DECISIONS.replace("label = \"'refund'\"", "label = 'order.cents'"), mod)
+    _, out, _ = run(capsys, "diff", old, new)
+    assert "label: changed\n  it now gives int, not string" in out, out

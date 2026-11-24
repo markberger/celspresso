@@ -20,6 +20,7 @@ must satisfy with `ensures`, over the inputs and `result`::
     vars = { order = "refunds:Order" }
     structs = ["refunds:Decision"]           # classes the rules may build: Decision{...}
     returns = "refunds:Decision"             # optional: the type every rule must give
+    # (a file's rules share its spec: give true/false and value rules separate files)
 
     [rules]
     refund = '''order.status == 'lost'
@@ -354,6 +355,13 @@ def load(path: str, *, text: str | None = None, env: Env | None = None, validate
         returns=returns,
         returns_type=None if returns is None else _import(returns, f"{path}: returns"),
     )
+    if rf.returns_type is not None:
+        try:
+            rf.env._builder.copy().convert(rf.returns_type, "returns")
+        except (TypeError, ValueError) as e:
+            raise UsageError(
+                f"{path}: returns = {returns!r} is not a type celspresso can check: {e}"
+            ) from None
     if validate:
         conditions = [
             *((f"[{s}] {k}", v) for s in ("invariants", "require") for k, v in getattr(rf, s).items()),
@@ -502,6 +510,9 @@ def _rule_change(
         return Change(name, "added", a, b, reason=f"the old version didn't compile: {old_error}")
     if pa.canonical == pb.canonical:
         return Change(name, "unchanged", a, b)
+    if "dyn" not in (pa.output_type, pb.output_type) and pa.output_type != pb.output_type:
+        why = f"it now gives {pb.output_type}, not {pa.output_type}"
+        return Change(name, "changed", a, b, reason=why)
     v = pa.equivalent(pb, assuming=assuming, timeout=timeout)
     if v.proved:
         return Change(name, "unchanged", a, b, reason="rewritten, but proved equivalent")

@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import BaseModel, Field
 
-from celspresso import CelSubsetError, Env, RuleCheck, Spec
+from celspresso import CelSubsetError, Env, RuleCheck, Spec, function
 from celspresso.schema import T
 
 
@@ -157,7 +157,7 @@ def test_fixed_point_results() -> None:
 
 def test_result_is_reserved_when_ensures_are_given() -> None:
     clash = Env(result=int)
-    with pytest.raises(ValueError, match="variable named 'result'"):
+    with pytest.raises(ValueError, match="variable or definition named 'result'"):
         clash.check_rule("result + 1", Spec(ensures=["result > 0"]))
     assert clash.check_rule("result / 2", Spec(returns=int)).ok
 
@@ -187,3 +187,82 @@ def test_a_struct_literal_sets_every_field() -> None:
         env.compile("Route{}")
     r = env.check_rule("Decision{action: 'deny'}", DECISION_SPEC)
     assert kinds(r) == ["invalid"]
+
+
+class Tight(BaseModel):
+    action: Literal["refund", "deny"]
+    amount: Annotated[int, Field(ge=0)]
+    tags: Annotated[list[Annotated[str, Field(max_length=3)]], Field(max_length=2)]
+
+
+def test_a_built_result_must_meet_its_class_constraints() -> None:
+    # inputs are assumed to meet their constraints, but a value the rule builds is checked,
+    # or the rule would pass every check and then fail to become a Python value
+    tight = Env(o=Order, structs=[Tight])
+    spec = Spec(returns=Tight, examples=[(LOST, {"action": "deny", "amount": 10, "tags": ["a"]})])
+    ok = "Tight{action: o.status == 'lost' ? 'deny' : 'refund', amount: o.total, tags: ['a']}"
+    assert tight.check_rule(ok, spec).ok
+    for bad, what in [
+        ("Tight{action: 'oops', amount: 0, tags: []}", "the result.action is one of"),
+        ("Tight{action: 'deny', amount: o.total - 1, tags: []}", "the result.amount >= 0"),
+        ("Tight{action: 'deny', amount: 0, tags: [o.status]}", "each item of the result.tags has size <= 3"),
+        ("Tight{action: 'deny', amount: 0, tags: o.items.map(x, 'a')}", "the result.tags has size <= 2"),
+    ]:
+        r = tight.check_rule(bad, Spec(returns=Tight))
+        assert kinds(r) == ["violates"], (bad, str(r))
+        assert "isn't a valid Tight" in str(r)
+        assert what in str(r), (bad, str(r))
+    # an example on such a rule reports the failure instead of raising
+    r = tight.check_rule("Tight{action: 'oops', amount: 0, tags: []}", spec)
+    assert "wrong_example" in kinds(r)
+    assert "can't be built" in str(r)
+    # the constraints of returns itself, and in a list of structs
+    nonneg = Spec(returns=Annotated[int, Field(ge=0)])
+    assert kinds(env.check_rule("o.total - 1", nonneg)) == ["violates"]
+    assert env.check_rule("o.total", nonneg).ok
+    many = "o.items.map(x, Tight{action: 'deny', amount: x - 1, tags: []})"
+    r = tight.check_rule(many, Spec(returns=list[Tight]))
+    assert "each item of the result.amount >= 0 fails" in str(r)
+    # the size of a list inside a struct inside a list isn't known statically: unverified
+    assert kinds(r) == ["violates", "unverified", "unverified"]
+    assert "can't bound the size" in str(r)
+
+
+def test_rules_and_conditions_may_end_in_a_comment() -> None:
+    r = env.check_rule("o.total // the whole order", Spec(ensures=["result <= o.total // capped"]))
+    assert r.ok, str(r)
+
+
+def test_examples_compare_nested_values_exactly() -> None:
+    assert kinds(env.check_rule("[o.total > 0]", Spec(examples=[(LOST, [1])], returns=list[bool]))) == [
+        "wrong_example"
+    ]
+    rule = "[Decision{action: 'deny', amount: 0}]"
+    spec = Spec(returns=list[Decision], examples=[(LOST, [{"action": "deny", "amount": 0}])])
+    assert env.check_rule(rule, spec).ok, str(env.check_rule(rule, spec))
+    spec = Spec(returns=list[Decision], examples=[(LOST, [Decision(action="deny", amount=0)])])
+    assert env.check_rule(rule, spec).ok
+
+
+def test_result_may_not_be_a_definition_either() -> None:
+    with pytest.raises(ValueError, match="variable or definition named 'result'"):
+        env.define("result", "1").check_rule("o.total", Spec(ensures=["result > 0"]))
+
+
+def test_fields_of_a_built_struct_are_bounded_by_what_built_them() -> None:
+    tight = Env(o=Order, structs=[Tight])
+    built = "Tight{action: 'deny', amount: 0, tags: o.items.map(x, 'a')}"
+    assert tight.predicate(f"size({built}.tags) <= 4").always_true().proved
+    assert (
+        tight.predicate(f"cel.bind(t, o.total > 5 ? {built} : {built}, size(t.tags) <= 4)")
+        .always_true()
+        .proved
+    )
+
+    # a struct from a function has no known size: its list fields stay unbounded
+    @function
+    def make(n: int) -> Tight:
+        return Tight(action="deny", amount=n, tags=[])
+
+    with pytest.raises(CelSubsetError, match="can't bound"):
+        tight.extend(functions=[make]).predicate("size(make(1).tags) <= 4")

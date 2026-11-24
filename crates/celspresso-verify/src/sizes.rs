@@ -24,9 +24,18 @@ const INT_CHARS: u64 = 20;
 pub struct Sizes<'a> {
     c: &'a CheckedExpr,
     cons: HashMap<ExprId, Constraints>,
-    /// Reads of comprehension accumulators, which hold what the comprehension built.
+    /// Reads of comprehension accumulators, which hold what the comprehension built, and
+    /// of fields of structs the expression built: values made of parts checked where they
+    /// appear.
     accus: HashSet<ExprId>,
+    /// Expressions that give a struct the expression itself builds (a literal, a choice
+    /// between such, or a `cel.bind` variable holding one).
+    built: HashSet<ExprId>,
 }
+
+/// A name in scope: its constraints, whether it's an accumulator, and whether it holds a
+/// struct the expression built.
+type Scope = Vec<(String, Option<Constraints>, bool, bool)>;
 
 /// `t` without nullable and optional wrappers.
 fn strip(t: &CelType) -> &CelType {
@@ -74,15 +83,20 @@ fn join(a: &Constraints, b: &Constraints) -> Constraints {
 
 impl<'a> Sizes<'a> {
     pub fn new(c: &'a CheckedExpr) -> Self {
-        let mut s = Sizes { c, cons: HashMap::new(), accus: HashSet::new() };
+        let mut s = Sizes { c, cons: HashMap::new(), accus: HashSet::new(), built: HashSet::new() };
         s.visit(&c.expr, &mut Vec::new());
         s
     }
 
-    fn visit(&mut self, e: &Expr, scope: &mut Vec<(String, Option<Constraints>, bool)>) {
+    fn visit(&mut self, e: &Expr, scope: &mut Scope) {
         if let ExprKind::Ident(n) = &e.kind {
-            if scope.iter().rev().find(|(m, ..)| m == n).is_some_and(|(_, _, accu)| *accu) {
-                self.accus.insert(e.id);
+            if let Some((_, _, accu, built)) = scope.iter().rev().find(|(m, ..)| m == n) {
+                if *accu {
+                    self.accus.insert(e.id);
+                }
+                if *built {
+                    self.built.insert(e.id);
+                }
             }
         }
         if let ExprKind::Comprehension(k) = &e.kind {
@@ -97,15 +111,16 @@ impl<'a> Sizes<'a> {
                 Some(_) => (None, items),
             };
             let depth = scope.len();
-            scope.push((k.iter_var.clone(), first, false));
+            scope.push((k.iter_var.clone(), first, false, false));
             if let Some(v2) = &k.iter_var2 {
-                scope.push((v2.clone(), second, false));
+                scope.push((v2.clone(), second, false, false));
             }
             // `cel.bind` (and an expanded definition) is a comprehension that never loops: its
             // variable is its initial value
             let binds = matches!(k.loop_condition.kind, ExprKind::Literal(Literal::Bool(false)));
             let init = if binds { self.cons.get(&k.accu_init.id).cloned() } else { None };
-            scope.push((k.accu_var.clone(), init, true));
+            let built = binds && self.built.contains(&k.accu_init.id);
+            scope.push((k.accu_var.clone(), init, true, built));
             for x in [&k.loop_condition, &k.loop_step, &k.result] {
                 self.visit(x, scope);
             }
@@ -114,6 +129,23 @@ impl<'a> Sizes<'a> {
             for k in children(e) {
                 self.visit(k, scope);
             }
+        }
+        match &e.kind {
+            ExprKind::Struct { .. } => {
+                self.built.insert(e.id);
+            }
+            ExprKind::Call { target: None, function, args } if function == ops::CONDITIONAL => {
+                if let [_, a, b] = args.as_slice() {
+                    if self.built.contains(&a.id) && self.built.contains(&b.id) {
+                        self.built.insert(e.id);
+                    }
+                }
+            }
+            // a field of a built struct holds a value checked where the struct was built
+            ExprKind::Select { operand, test_only: false, .. } if self.built.contains(&operand.id) => {
+                self.accus.insert(e.id);
+            }
+            _ => {}
         }
         if let Some(c) = self.own(e, scope) {
             self.cons.insert(e.id, c);
@@ -136,13 +168,13 @@ impl<'a> Sizes<'a> {
         }
     }
 
-    fn own(&self, e: &Expr, scope: &[(String, Option<Constraints>, bool)]) -> Option<Constraints> {
+    fn own(&self, e: &Expr, scope: &Scope) -> Option<Constraints> {
         // a qualified name (`a.b`) can resolve to a variable at a Select node
         if let Some(Reference::Var(v)) = self.c.refs.get(&e.id) {
             return self.c.schema.vars.get(v).map(|d| d.constraints.clone());
         }
         match &e.kind {
-            ExprKind::Ident(n) => scope.iter().rev().find(|(m, ..)| m == n).and_then(|(_, c, _)| c.clone()),
+            ExprKind::Ident(n) => scope.iter().rev().find(|(m, ..)| m == n).and_then(|(_, c, ..)| c.clone()),
             ExprKind::Select { operand, field, test_only: false } => self.field(operand, field),
             ExprKind::Call { target: None, function, args } => match (function.as_str(), args.as_slice()) {
                 (ops::INDEX | ops::OPT_INDEX, [x, _]) => self.items(x),
