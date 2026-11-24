@@ -205,3 +205,71 @@ def test_celspresso_constraints_as_metadata_keep_keys() -> None:
     assert "each key of the result.m" in str(
         Env(structs=[Bag]).check_rule("Bag{m: {'z': 1}}", Spec(returns=Bag))
     )
+
+
+def test_review_round_two_cases() -> None:
+    import re
+
+    import pydantic.dataclasses as pdc
+    from pydantic import conint
+
+    class Con(BaseModel):  # conint's None placeholders aren't unmodelled metadata
+        n: conint(ge=0, le=10)  # type: ignore[valid-type]
+        d: Annotated[int, "a doc string"]
+
+    assert check(Con, "Con{n: 3, d: 1}").ok
+
+    @pdc.dataclass
+    class PD:
+        s: str
+
+    @pdc.dataclass(config=ConfigDict(str_to_lower=True))
+    class Lower:
+        s: str
+
+    assert check(PD, "PD{s: 'a'}").ok
+    assert "str_to_lower" in str(check(Lower, "Lower{s: 'ABC'}"))
+
+    @dataclasses.dataclass(init=False)
+    class OwnInit:
+        n: int
+
+        def __init__(self, n: int) -> None:
+            self.n = n * 2
+
+    @dataclasses.dataclass
+    class Later:
+        n: int
+        m: int = dataclasses.field(default=7, init=False)
+
+    class Flagged(BaseModel):
+        s: Annotated[str, Field(pattern=re.compile("abc", re.I))]
+
+    class Hooked(BaseModel):
+        n: int
+
+        @classmethod
+        def model_validate(cls, *a: object, **k: object) -> "Hooked":  # type: ignore[override]
+            return cls(n=2)
+
+    for cls, rule, why in [
+        (OwnInit, "OwnInit{n: 3}", "__init__"),
+        (Later, "Later{n: 1, m: 99}", "init=False"),
+        (Flagged, "Flagged{s: 'abc'}", "pattern"),
+        (Hooked, "Hooked{n: 1}", "model_validate"),
+    ]:
+        r = check(cls, rule)
+        assert kinds(r) == ["unverified"], (cls, str(r))
+        assert why in str(r)
+    # a compiled pattern isn't assumed of inputs (Pydantic runs it with Python's flags)
+    assert "fails model validation" in str(Env(f=Flagged).predicate("f.s == 'x'").satisfiable())
+
+    class Inner(BaseModel):
+        model_config = ConfigDict(frozen=True)
+        k: int
+
+    class Uniq(BaseModel):
+        s: Annotated[frozenset[Inner], Field(max_length=3)]
+
+    assert check(Uniq, "Uniq{s: [Inner{k: 1}, Inner{k: 2}]}").ok
+    assert "has no duplicates" in str(check(Uniq, "Uniq{s: [Inner{k: 1}, Inner{k: 1}]}"))

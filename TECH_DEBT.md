@@ -241,3 +241,33 @@ holds vacuously. Scalar bounds raise "no value satisfies" for this.
 "unhashable type: 'Not'" from the `tp in _SCALARS` lookup.
 - *Fix:* catch `TypeError` there, or test hashability first.
 - *Found:* review of the result-boundary change.
+
+### Sub-microsecond durations and timestamps are truncated when decoded
+`E{d: duration('1ns')}` with `ensures result.d > duration('0s')` is accepted, but the
+Python value is `timedelta(0)`.
+- *Fix:* have `_fits` require whole microseconds of a built duration or timestamp.
+- *Found:* review of the result-boundary change.
+
+### IntFlag fields are assumed to be one of their single flags
+An `IntFlag` field is lowered as `one_of` its members, so `p != 3` is PROVED although
+`R|W == 3` is a valid value: a false input assumption.
+- *Fix:* lower IntFlag as an int in `[0, OR of all flags]` (or with a bitmask check).
+- *Found:* review of the result-boundary change (predates it).
+
+### Patterns under `regex_engine="python-re"` are still assumed of inputs
+Pydantic then runs patterns with Python's `re` (`$` also matches before a final newline),
+so assuming them with CEL's semantics can exclude valid inputs. Results of such a class
+are already unverified.
+- *Fix:* don't assume string patterns of a class configured with the python-re engine.
+- *Found:* review of the result-boundary change.
+
+### Custom adapters' `decode` is trusted to accept any fitting value
+`_fits` can't see validation inside a third-party `TypeAdapter.decode`.
+- *Fix:* let an adapter declare a class unverifiable, or document the contract.
+- *Found:* review of the result-boundary change.
+
+### Two Decimal `multiple_of` steps can't be merged
+`_intersect` uses `math.lcm`, which raises TypeError for Decimal steps (only reachable by
+merging `constraints_from` with Annotated metadata).
+- *Fix:* take the lcm in units after scaling, or mark the field unverified.
+- *Found:* review of the result-boundary change.

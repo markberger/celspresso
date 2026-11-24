@@ -694,6 +694,8 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
 
 def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: str = "annotation") -> None:
     for m in metadata:
+        if m is None or isinstance(m, str):  # conint()'s placeholders; a doc string
+            continue
         if isinstance(m, Constraints):  # celspresso's own, all of it (items, keys, one_of too)
             merged = _intersect(cons, m._spec() or {})
             cons.clear()
@@ -717,7 +719,10 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: 
                         )
                     val = val if isinstance(val, (decimal.Decimal, int)) else float(val)
                 elif key == "pattern" and not isinstance(val, str):
-                    val = getattr(val, "pattern", val)  # a compiled re.Pattern
+                    # Pydantic runs a compiled re.Pattern with Python's engine and its flags,
+                    # whose meaning differs from CEL's: neither assumed nor checked
+                    cons["unchecked"] = f"pattern={val!r}"
+                    continue
                 cons[key] = val
         mult = getattr(m, "multiple_of", None)
         if isinstance(mult, (int, decimal.Decimal)) and not isinstance(mult, bool) and mult > 0:
@@ -744,6 +749,15 @@ _MODELLED = {
     ("pydantic.types", "Strict"),  # decode is lenient: a CEL value is already the right type
     ("pydantic.types", "AllowInfNan"),
     ("pydantic.types", "StringConstraints"),
+    # no effect on validation
+    ("pydantic.functional_serializers", "PlainSerializer"),
+    ("pydantic.functional_serializers", "WrapSerializer"),
+    ("pydantic.functional_serializers", "SerializeAsAny"),
+    ("pydantic.json_schema", "WithJsonSchema"),
+    ("pydantic.json_schema", "SkipJsonSchema"),
+    ("pydantic.json_schema", "Examples"),
+    ("typing_extensions", "Doc"),
+    ("typing", "Doc"),
 }
 _STRING_TRANSFORMS = ("strip_whitespace", "to_lower", "to_upper")
 

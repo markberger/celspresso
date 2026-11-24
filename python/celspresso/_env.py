@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import enum
 import fractions
 import inspect
@@ -967,11 +968,11 @@ def _plain(value: Any) -> Any:
 def _validated_by(cls: Any) -> str | None:
     """The validation code a class runs on construction, beyond its declared constraints."""
     decorators = getattr(cls, "__pydantic_decorators__", None)
-    if decorators is not None:
+    if decorators is not None:  # a Pydantic model or Pydantic dataclass
         for kind in ("validators", "field_validators", "root_validators", "model_validators"):
             if getattr(decorators, kind, None):
                 return kind.replace("_", " ")
-        config = getattr(cls, "model_config", {})
+        config = getattr(cls, "model_config", None) or getattr(cls, "__pydantic_config__", None) or {}
         for key in (
             "str_strip_whitespace",
             "str_to_lower",
@@ -980,18 +981,38 @@ def _validated_by(cls: Any) -> str | None:
             "str_max_length",
         ):
             if config.get(key):
-                return f"model_config {key}={config[key]!r}"
-        from pydantic import BaseModel  # pydantic is installed: cls is a model
+                return f"config {key}={config[key]!r}"
+        if config.get("regex_engine") == "python-re":
+            return "config regex_engine='python-re'"
+        from pydantic import BaseModel
         from pydantic._internal._model_construction import init_private_attributes
 
-        post = getattr(cls, "model_post_init", None)
-        if post not in (BaseModel.model_post_init, init_private_attributes):
-            return "a model_post_init"
-        if cls.__init__ is not BaseModel.__init__:
+        if isinstance(cls, type) and issubclass(cls, BaseModel):
+            if getattr(cls, "model_post_init", None) not in (
+                BaseModel.model_post_init,
+                init_private_attributes,
+            ):
+                return "a model_post_init"
+            if cls.__init__ is not BaseModel.__init__:
+                return "its own __init__"
+            for hook in ("__get_pydantic_core_schema__", "model_validate"):
+                if getattr(cls, hook).__func__ is not getattr(BaseModel, hook).__func__:
+                    return f"its own {hook}"
+    if dataclasses.is_dataclass(cls):
+        if any(not f.init for f in dataclasses.fields(cls)):
+            return "a field with init=False (decoding replaces it)"
+        if decorators is None and not _generated_init(cls):
             return "its own __init__"
     if callable(getattr(cls, "__post_init__", None)):
         return "a __post_init__"
     return None
+
+
+def _generated_init(cls: type) -> bool:
+    """Whether a dataclass's `__init__` is the one `@dataclass` wrote (it is compiled from
+    a string), not one the class or a base defines."""
+    code = getattr(cls.__init__, "__code__", None)
+    return code is not None and code.co_filename == "<string>"
 
 
 class _Unchecked(Exception):
@@ -1017,8 +1038,14 @@ def _fits(
     out: list[tuple[str, str]] = []
     if "unchecked" in c:
         raise _Unchecked(f"{shown} has {c['unchecked']}, which celspresso can't check")
-    if c.get("distinct") and c.get("min_length", 0) > 1:
-        raise _Unchecked(f"{shown} is a set with min_length (duplicates collapse)")
+    if c.get("distinct"):
+        if c.get("min_length", 0) > 1:
+            raise _Unchecked(f"{shown} is a set with min_length (duplicates collapse)")
+        # else the Python set would differ from the list the rule built (and was proved about)
+        a, b = f"_d{depth}", f"_e{depth}"
+        out.append(
+            (f"{shown} has no duplicates (it is a set)", f"{x}.all({a}, {x}.exists_one({b}, {b} == {a}))")
+        )
     if "bool_is" in c:
         out.append((f"{shown} is {cel_literal(c['bool_is'])}", f"{x} == {cel_literal(c['bool_is'])}"))
 
