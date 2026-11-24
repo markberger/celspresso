@@ -32,8 +32,28 @@ class Item(BaseModel):
     name: str
     tags: Annotated[dict[str, int], Field(max_length=4)]
 
+class Decision(BaseModel):
+    action: Literal["refund", "deny"]
+    cents: int
+
 env = Env(order=Order).extend(functions=[flagged])
 not_an_env = 3
+"""
+
+DECISIONS = """
+vars = { order = "{mod}:Order" }
+structs = ["{mod}:Decision"]
+returns = "{mod}:Decision"
+
+[rules]
+good = \"\"\"order.status == 'lost'
+    ? Decision{action: 'refund', cents: order.cents}
+    : Decision{action: 'deny', cents: 0}\"\"\"
+over = "Decision{action: 'refund', cents: order.cents + 1}"
+label = "'refund'"
+
+[ensures]
+capped = "result.cents <= order.cents"
 """
 
 OLD = """
@@ -405,7 +425,7 @@ def test_diff_reports_edits_to_the_checks(project: tuple[Path, str], capsys: pyt
         "assumption: added",
         "  + order.days <= 200",
     ]
-    assert "checks on every rule (invariants, require entries or assumptions changed):" in out
+    assert "checks on every rule (the spec or assumptions changed):" in out
     assert f"{new}:6: lost: rejected" in out
     assert f"{new}:7: other: rejected" in out
     assert run(capsys, "diff", old, new, "--no-check")[0] == 0
@@ -422,7 +442,7 @@ def test_diff_reports_edits_to_the_checks(project: tuple[Path, str], capsys: pyt
     }
 
     _, out, _ = run(capsys, "diff", old, new, "--format", "markdown", "--no-check")
-    assert "2 unchanged, **5 invariant, require or assumption edits**" in out
+    assert "2 unchanged, **5 spec or assumption edits**" in out
     assert (
         "#### invariant `capped`: changed\n\n```diff\n- order.cents <= 50000\n+ order.cents <= 10000" in out
     )
@@ -580,3 +600,55 @@ def test_line_of_in_each_format():
     rf = RuleFile("r.json", js, env, {})
     assert [rf.line_of(n, s) for n, s in [("a", "rules"), ("b", "rules"), ("a", "invariants")]] == [3, 4, 5]
     assert (rf.line_of("a", "require"), rf.line_of("zz", "rules")) == (1, 2)
+
+
+def test_check_rules_that_compute_a_value(project: tuple[Path, str], capsys: pytest.CaptureFixture[str]):
+    d, mod = project
+    f = write(d / "decisions.toml", DECISIONS, mod)
+    code, out, _ = run(capsys, "check", f)
+    assert code == 1
+    assert "good: ok" in out
+    assert "violates ensures 'capped' when order.cents = 0" in out
+    assert "the result is Decision(action='refund', cents=1)" in out
+    assert "expression has type string, expected Decision" in out
+    # json names the broken condition
+    code, out, _ = run(capsys, "check", f, "--format", "json")
+    over = json.loads(out)["rules"]["over"]["problems"][0]
+    assert (over["kind"], over["condition"], over["example"]) == ("violates", "capped", {"order.cents": 0})
+
+
+def test_rule_file_structs_with_an_env(project: tuple[Path, str], capsys: pytest.CaptureFixture[str]):
+    d, mod = project
+    text = DECISIONS.replace('vars = { order = "{mod}:Order" }', 'env = "{mod}:env"')
+    f = write(d / "decisions.toml", text, mod)
+    code, out, _ = run(capsys, "check", f, "--rule", "good")
+    assert code == 0, out
+    bad = write(
+        d / "bad.toml", text.replace('structs = ["{mod}:Decision"]', 'structs = "{mod}:Decision"'), mod
+    )
+    code, _, err = run(capsys, "check", bad)
+    assert code == 2
+    assert "structs must be a list" in err
+    bad = write(d / "bad.toml", text.replace('returns = "{mod}:Decision"', "returns = 3"), mod)
+    code, _, err = run(capsys, "check", bad)
+    assert code == 2
+    assert "returns must be a type" in err
+
+
+def test_diff_rules_that_compute_a_value(project: tuple[Path, str], capsys: pytest.CaptureFixture[str]):
+    d, mod = project
+    old = write(d / "old.toml", DECISIONS, mod)
+    new_text = (
+        DECISIONS.replace("cents: order.cents}", "cents: order.cents / 2}")
+        .replace('capped = "result.cents <= order.cents"', 'capped = "result.cents * 2 <= order.cents"')
+        .replace('returns = "{mod}:Decision"\n', "")
+    )
+    new = write(d / "new.toml", new_text, mod)
+    _, out, _ = run(capsys, "diff", old, new)
+    assert "good: changed" in out
+    assert "cents=1) -> Decision(action='refund', cents=0)" in out
+    assert "ensures capped: changed" in out
+    assert "\nreturns: removed\n" in out
+    _, out, _ = run(capsys, "diff", old, new, "--format", "markdown")
+    assert "#### ensures `capped`: changed" in out
+    assert "#### returns: removed" in out

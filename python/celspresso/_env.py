@@ -196,7 +196,7 @@ class Env:
         *,
         timeout: float = 5.0,
         limits: Limits | None = None,
-        structs: Iterable[Struct] = (),
+        structs: Iterable[Struct | type] = (),
         adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> None:
@@ -226,7 +226,7 @@ class Env:
         *,
         timeout: float = 5.0,
         limits: Limits | None = None,
-        structs: Iterable[Struct] = (),
+        structs: Iterable[Struct | type] = (),
         adapters: Iterable[TypeAdapter] = (),
     ) -> Env:
         """An Env whose variables are the fields of a Pydantic model or dataclass, with
@@ -320,7 +320,7 @@ class Env:
         *,
         functions: Iterable[Callable[..., Any]] = (),
         timeout: float | None = None,
-        structs: Iterable[Struct] = (),
+        structs: Iterable[Struct | type] = (),
         adapters: Iterable[TypeAdapter] = (),
         **more_variables: Any,
     ) -> Env:
@@ -437,15 +437,19 @@ class Env:
     def expr(self, source: str, type: Any = None) -> Expr[Any]:
         """Compile an expression, optionally asserting its result type."""
         e = self.compile(source)
-        if type is not None:
-            want, _ = self._builder.copy().convert(type, "expected type")
-            got = e._prog.output_type
-            if got != "dyn" and got != lower(want, None)[0]:
-                _type_mismatch(source, e, type_name(want))
-            if want == "bool" and not isinstance(e, Predicate):
-                e = Predicate(self, e._prog)
-            elif _contains_fixed(want):
-                e = Expr(self, e._prog, want)
+        return e if type is None else self._typed(e, type)
+
+    def _typed(self, e: Expr[Any], type: Any) -> Expr[Any]:
+        """`e`, checked to give `type` (CelTypeError if not), and carrying it when it says
+        more than CEL's type (a fixed-point Decimal is an int in CEL)."""
+        want, _ = self._builder.copy().convert(type, "expected type")
+        got = e._prog.output_type
+        if got != "dyn" and got != lower(want, None)[0]:
+            _type_mismatch(e.source, e, type_name(want))
+        if want == "bool" and not isinstance(e, Predicate):
+            return Predicate(self, e._prog)
+        if _contains_fixed(want):
+            return Expr(self, e._prog, want)
         return e
 
     # -- introspection ----------------------------------------------------
@@ -639,7 +643,7 @@ class Env:
 
     def check_rule(
         self,
-        rule: str | Predicate,
+        rule: str | Expr[Any],
         spec: Spec | Mapping[str, str | Predicate] | Iterable[str | Predicate] = (),
         *,
         timeout: float | None = None,
@@ -647,73 +651,148 @@ class Env:
         """Vet a rule you didn't write (from a customer, an admin UI or an LLM) before accepting it.
 
         `spec` is a `Spec`, or just the invariants (a mapping or list of conditions).
-        Checks, in order: it compiles to a predicate; nothing in it is a likely mistake
-        (see `Expr.warnings`); it gives the expected answer on every labelled example;
-        it can fire at all; it can't fail at runtime; it implies every invariant (what it
-        must never allow); and every `require` case implies it (what it must allow).
-        Invariants keep a rule safe, `require` and `examples` keep it useful: without them
-        a rule that allows almost nothing passes. A check that comes back UNKNOWN is a
-        problem too, so `.ok` means *proved*.
+        Checks, in order: it compiles (to the spec's `returns` type, if it names one);
+        nothing in it is a likely mistake (see `Expr.warnings`); it gives the expected
+        result on every example; a true/false rule can fire at all; it can't fail at
+        runtime; it implies every invariant (what it must never allow); every `require`
+        case implies it (what it must allow); and its result meets every `ensures`
+        condition. Invariants and `ensures` keep a rule safe, `require` and `examples`
+        keep it useful: without them a rule that allows almost nothing passes. A check
+        that comes back UNKNOWN is a problem too, so `.ok` means *proved*.
+
+        A rule may compute any value, not just true or false: an amount, a label, or a
+        struct such as `Decision{action: 'refund', amount: ...}` (declare its class with
+        `Env(structs=[Decision])`). Invariants and `require` apply only to true/false
+        rules; say what any other result must satisfy with `ensures`.
         """
         if not isinstance(spec, Spec):
             spec = Spec(spec)
-        # this env's own assumptions apply even to a Predicate compiled in a sibling Env
+        # this env's own assumptions apply even to a rule compiled in a sibling Env
         assuming = (*self._assumptions, *spec.assumptions)
         src = rule if isinstance(rule, str) else rule.source
-        if isinstance(rule, Predicate) and rule._env._fingerprint != self._fingerprint:
-            raise ValueError("check_rule was given a Predicate from a different Env")
+        if isinstance(rule, Expr) and rule._env._fingerprint != self._fingerprint:
+            raise ValueError("check_rule was given a rule compiled in a different Env")
         try:
-            pred = self.predicate(rule) if isinstance(rule, str) else rule
+            expr = self.compile(rule) if isinstance(rule, str) else rule
+            if spec.returns is not None:
+                expr = self._typed(expr, spec.returns)
         except CelError as e:
             return RuleCheck(src, None, (Problem("invalid", str(e)),))
-        problems: list[Problem] = [Problem("suspicious", w.rendered) for w in pred.warnings]
+        if not isinstance(expr, Predicate):
+            # a rule that computes a value is accepted only by a spec that speaks of values,
+            # so a gate written for true/false rules never passes one by accident
+            if spec.invariants or spec.require:
+                msg = (
+                    f"the rule gives {expr.output_type}, not true or false: invariants and require "
+                    "apply only to true/false rules (say what its result must satisfy with ensures)"
+                )
+                return RuleCheck(src, expr, (Problem("invalid", msg),))
+            if not spec.ensures and spec.returns is None:
+                msg = (
+                    f"the rule gives {expr.output_type}, not true or false; to check a rule that "
+                    "computes a value, give the spec its type (returns) or conditions on it (ensures)"
+                )
+                return RuleCheck(src, expr, (Problem("invalid", msg),))
+        problems: list[Problem] = [Problem("suspicious", w.rendered) for w in expr.warnings]
         for i, (data, expected) in enumerate(spec.examples):
             try:
-                got: Any = pred.evaluate(data)
+                got: Any = expr.evaluate(data)
             except CelEvaluationError as e:
-                why = f"example {i} should give {expected}, but evaluation fails: {e}"
+                why = f"example {i} should give {expected!r}, but evaluation fails: {e}"
                 problems.append(Problem("wrong_example", why))
                 continue
-            if got is not expected:
-                why = f"example {i} should give {expected}, but the rule gives {got}"
+            if not _same_result(got, expected):
+                why = f"example {i} should give {expected!r}, but the rule gives {got!r}"
                 problems.append(Problem("wrong_example", why))
 
         def undecided(what: str, v: Verdict, invariant: str | None = None) -> None:
             problems.append(Problem("unverified", f"could not verify {what}: {v.reason}", invariant, v))
 
-        v = pred.satisfiable(assuming=assuming, timeout=timeout)
+        if isinstance(expr, Predicate):
+            v = expr.satisfiable(assuming=assuming, timeout=timeout)
+            if v.refuted:
+                # never true: often because it fails instead (division by zero, overflow, ...)
+                err = expr.never_errors(assuming=assuming, timeout=timeout)
+                if err.refuted:
+                    msg = f"the rule is never true for any valid input: evaluation {_failure(expr, err)}"
+                    problems.append(Problem("never_fires", msg, None, err))
+                else:
+                    problems.append(
+                        Problem("never_fires", "the rule can never be true for any valid input", None, v)
+                    )
+                return RuleCheck(src, expr, tuple(problems))
+            if v.unknown:
+                undecided("that the rule can fire", v)
+        v = expr.never_errors(assuming=assuming, timeout=timeout)
         if v.refuted:
-            # never true: often because it fails instead (division by zero, overflow, ...)
-            err = pred.never_errors(assuming=assuming, timeout=timeout)
-            if err.refuted:
-                msg = f"the rule is never true for any valid input: evaluation {_failure(pred, err)}"
-                problems.append(Problem("never_fires", msg, None, err))
-            else:
-                problems.append(
-                    Problem("never_fires", "the rule can never be true for any valid input", None, v)
-                )
-            return RuleCheck(src, pred, tuple(problems))
-        if v.unknown:
-            undecided("that the rule can fire", v)
-        v = pred.never_errors(assuming=assuming, timeout=timeout)
-        if v.refuted:
-            problems.append(Problem("may_error", f"evaluation {_failure(pred, v)}", None, v))
+            problems.append(Problem("may_error", f"evaluation {_failure(expr, v)}", None, v))
         elif v.unknown:
             undecided("that the rule never errors", v)
-        for name, inv in spec.invariants.items():
-            v = pred.implies(inv, assuming=assuming, timeout=timeout)
+        if isinstance(expr, Predicate):
+            for name, inv in spec.invariants.items():
+                v = expr.implies(inv, assuming=assuming, timeout=timeout)
+                if v.refuted:
+                    problems.append(
+                        Problem("violates", f"violates '{name}' when {v.counterexample}", name, v)
+                    )
+                elif v.unknown:
+                    undecided(f"'{name}'", v, name)
+            for name, req in spec.require.items():
+                v = self._as_predicate(req).implies(expr, assuming=assuming, timeout=timeout)
+                if v.refuted:
+                    msg = f"too narrow: doesn't allow '{name}', e.g. when {v.counterexample}"
+                    problems.append(Problem("too_narrow", msg, name, v))
+                elif v.unknown:
+                    undecided(f"that it allows '{name}'", v, name)
+        if spec.ensures:
+            problems += self._check_ensures(expr, spec.ensures, assuming, timeout)
+        return RuleCheck(src, expr, tuple(problems))
+
+    def _check_ensures(
+        self,
+        expr: Expr[Any],
+        ensures: Mapping[str, str | Predicate],
+        assuming: Iterable[str | Predicate],
+        timeout: float | None,
+    ) -> list[Problem]:
+        """Each `ensures` condition, over the inputs and `result` (the rule's value), holds
+        on every valid input on which the rule doesn't fail."""
+        if "result" in self._vars:
+            raise ValueError(
+                "ensures refers to the rule's value as 'result', but this Env has a variable named 'result'"
+            )
+        # `result`, typed as the rule's value, to compile the conditions with clear errors
+        with_result = self._clone()
+        with_result._vars["result"] = (expr._result_spec, None)
+        with_result._build()
+        # where the rule has a value (cel.bind computes it up front, so this is false
+        # exactly where the rule fails)
+        has_value = self.predicate(f"cel.bind(result, ({expr.source}), true)")
+        problems: list[Problem] = []
+        for name, cond in ensures.items():
+            cond_src = cond if isinstance(cond, str) else cond.source
+            try:
+                holds = self.predicate(f"cel.bind(result, ({expr.source}), ({cond_src}))")
+            except CelError as bound:
+                # report the condition's own error (its spans are in its own text), unless
+                # only the bound form fails
+                e: CelError = bound
+                try:
+                    with_result.predicate(cond_src)
+                except CelError as own:
+                    e = own
+                msg = f"ensures '{name}' doesn't apply to this rule's result ({expr.output_type}): {e}"
+                problems.append(Problem("invalid", msg, name))
+                continue
+            v = has_value.implies(holds, assuming=assuming, timeout=timeout)
             if v.refuted:
-                problems.append(Problem("violates", f"violates '{name}' when {v.counterexample}", name, v))
+                msg = f"violates ensures '{name}' when {v.counterexample}{_result_note(expr, v)}"
+                problems.append(Problem("violates", msg, name, v))
             elif v.unknown:
-                undecided(f"'{name}'", v, name)
-        for name, req in spec.require.items():
-            v = self._as_predicate(req).implies(pred, assuming=assuming, timeout=timeout)
-            if v.refuted:
-                msg = f"too narrow: doesn't allow '{name}', e.g. when {v.counterexample}"
-                problems.append(Problem("too_narrow", msg, name, v))
-            elif v.unknown:
-                undecided(f"that it allows '{name}'", v, name)
-        return RuleCheck(src, pred, tuple(problems))
+                problems.append(
+                    Problem("unverified", f"could not verify ensures '{name}': {v.reason}", name, v)
+                )
+        return problems
 
     def _as_predicate(self, p: str | Predicate) -> Predicate:
         return self.predicate(p) if isinstance(p, str) else p
@@ -741,7 +820,7 @@ def _reader_key(reader: Callable[[Any], Any]) -> tuple[int, ...]:
     return (id(code), *(id(c.cell_contents) for c in cells))
 
 
-def _failure(pred: Predicate, v: Verdict) -> str:
+def _failure(pred: Expr[Any], v: Verdict) -> str:
     """'fails (division by zero) when x = 0': the witness, and the error it really raises."""
     cause = ""
     if v.witness is not None:
@@ -752,6 +831,38 @@ def _failure(pred: Predicate, v: Verdict) -> str:
         except Exception:  # noqa: BLE001 - the cause is a nicety; the witness is the evidence
             cause = ""
     return f"fails{cause} when {v.witness}"
+
+
+def _result_note(expr: Expr[Any], v: Verdict) -> str:
+    """': the result is X' for a counterexample, when the rule can be replayed on it."""
+    if v.witness is None:
+        return ""
+    try:
+        return f": the result is {expr.evaluate(v.witness)!r}"
+    except Exception:  # noqa: BLE001 - the value is a nicety; the witness is the evidence
+        return ""
+
+
+def _same_result(got: Any, expected: Any) -> bool:
+    """Whether a rule's value is the expected one. Booleans must match exactly (True is
+    not 1), and a struct result matches a mapping of its fields."""
+    if isinstance(got, bool) or isinstance(expected, bool):
+        return isinstance(got, bool) and isinstance(expected, bool) and got == expected
+    if isinstance(expected, Mapping) and not isinstance(got, Mapping):
+        got = _fields_of(got)
+    return bool(got == expected)
+
+
+def _fields_of(value: Any) -> Any:
+    """A model or dataclass instance as a dict of its fields (anything else as is)."""
+    import dataclasses
+
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump()
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
+    return value
 
 
 def _joint_env(env: Env, other: Predicate | str) -> Env:
@@ -861,7 +972,7 @@ class RuleCheck:
     """The result of `Env.check_rule`. `str()` is a report fit for a person or an LLM."""
 
     source: str
-    rule: Predicate | None
+    rule: Expr[Any] | None
     problems: tuple[Problem, ...]
 
     @property
