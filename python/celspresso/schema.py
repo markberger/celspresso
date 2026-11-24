@@ -142,7 +142,7 @@ def _contains_fixed(spec: Any) -> bool:
 
 
 def _check_map_value(spec: Any, where: str) -> None:
-    # a map's keys and values carry no constraints, so a fixed-point scale has nowhere to go
+    # a fixed-point scale applies to a field or list element; map keys and values have none
     if _contains_fixed(spec):
         raise TypeError(f"{where}: fixed-point map keys and values are not supported; use a list of structs")
 
@@ -219,9 +219,9 @@ class Constraints:
     """Facts about a field's values. The verifier assumes them; `evaluate` enforces them.
 
     Bounds apply to numbers, lengths to strings (in characters), bytes, lists and maps,
-    `pattern` (an unanchored regex) to strings, `one_of` to strings and ints, and
-    `items` to each element of a list. Declaring a struct checks each constraint
-    against its field's type.
+    `pattern` (an unanchored regex) to strings, `one_of` to strings and ints,
+    `items` to each element of a list (or value of a map), and `keys` to each key of a
+    map. Declaring a struct checks each constraint against its field's type.
     """
 
     ge: float | None = None
@@ -233,6 +233,10 @@ class Constraints:
     pattern: str | None = None
     one_of: tuple[Any, ...] | None = None
     items: Constraints | None = None
+    keys: Constraints | None = None
+    # what a class's own validation also requires of a value (multiple_of, Literal[True], ...):
+    # checked on results a rule builds, never assumed of inputs (see _types.CHECK_ONLY)
+    _checks: Any = field(default=None, repr=False, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         for key in ("ge", "gt", "le", "lt"):
@@ -266,6 +270,8 @@ class Constraints:
             object.__setattr__(self, "one_of", values)
         if self.items is not None and not isinstance(self.items, Constraints):
             raise TypeError(f"Constraints(items=...) must be Constraints, got {self.items!r}")
+        if self.keys is not None and not isinstance(self.keys, Constraints):
+            raise TypeError(f"Constraints(keys=...) must be Constraints, got {self.keys!r}")
 
     def _spec(self) -> dict[str, Any] | None:
         out: dict[str, Any] = {}
@@ -281,6 +287,10 @@ class Constraints:
             out["one_of"] = list(self.one_of)
         if self.items is not None and (inner := self.items._spec()):
             out["items"] = inner
+        if self.keys is not None and (inner := self.keys._spec()):
+            out["keys"] = inner
+        if self._checks:
+            out.update(self._checks)
         return out or None
 
 

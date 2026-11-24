@@ -152,18 +152,42 @@ def _key_of(key: Any) -> Any:
     return key
 
 
+# Constraints a class's own validation enforces that the verifier doesn't model. They are
+# checked on a result a rule builds (so it can become a Python value), but never assumed
+# of inputs, and never reach the core: `multiple_of` (an int), `distinct` (a set:
+# duplicates collapse), `bool_is` (`Literal[True]`), and
+# `unchecked` (why a value can't be checked at all, e.g. a validator function).
+CHECK_ONLY = ("multiple_of", "distinct", "bool_is", "unchecked")
+
+
+def core_view(cons: dict[str, Any] | None) -> dict[str, Any] | None:
+    """`cons` as the core sees it: without the CHECK_ONLY keys, at every level."""
+    if not cons:
+        return cons
+    out = {k: v for k, v in cons.items() if k not in CHECK_ONLY}
+    for nested in ("items", "keys"):
+        if isinstance(out.get(nested), dict):
+            out[nested] = core_view(out[nested])
+            if out[nested] is None:
+                del out[nested]
+    return out or None
+
+
 def _constraints_of(d: dict[str, Any] | None) -> Constraints:
     if not d:
         return Constraints()
     plain: dict[str, Any] = {
         k: float(v) if isinstance(v, decimal.Decimal) else v  # a Decimal bound on a non-Decimal
         for k, v in d.items()
-        if k not in ("one_of", "items") and not k.startswith("_")
+        if k not in ("one_of", "items", "keys", *CHECK_ONLY) and not k.startswith("_")
     }
+    checks = {k: d[k] for k in CHECK_ONLY if k in d}
     return Constraints(
         **plain,
         one_of=tuple(d["one_of"]) if "one_of" in d else None,
         items=_constraints_of(d["items"]) if "items" in d else None,
+        keys=_constraints_of(d["keys"]) if "keys" in d else None,
+        _checks=checks or None,
     )
 
 
@@ -211,7 +235,10 @@ def lower(spec: TypeSpec, cons: dict[str, Any] | None) -> tuple[TypeSpec, dict[s
         out.pop("items", None)
         if vc:
             out["items"] = vc
-        return ("map", lower(spec[1], None)[0], vals), (out or None)
+        key, kc = lower(spec[1], out.pop("keys", None))
+        if kc:
+            out["keys"] = kc
+        return ("map", key, vals), (out or None)
     return spec, cons
 
 
@@ -470,6 +497,8 @@ class SchemaBuilder:
                 cons["one_of"] = list(args)
                 return "int"
             if kinds == {bool}:
+                if len(set(args)) == 1:
+                    cons["bool_is"] = args[0]
                 return "bool"
             raise TypeError(f"{where}: Literal values must be all str or all int")
         if origin in (Union, types.UnionType):
@@ -491,9 +520,14 @@ class SchemaBuilder:
             elem = self._convert(args[0], item_cons, f"{where}[]") if args else "dyn"
             if item_cons:
                 cons["items"] = item_cons
+            if origin in (set, frozenset, AbstractSet):
+                cons["distinct"] = True
             return ("list", elem)
         if origin in (dict, Mapping):
-            k = self._convert(args[0], {}, f"{where} key") if args else "dyn"
+            key_cons: dict[str, Any] = {}
+            k = self._convert(args[0], key_cons, f"{where} key") if args else "dyn"
+            if key_cons:
+                cons["keys"] = key_cons
             val_cons: dict[str, Any] = {}
             v = self._convert(args[1], val_cons, f"{where} value") if args else "dyn"
             _check_map_value(k, f"{where} key")
@@ -512,10 +546,11 @@ _NUMERIC = {"int", "uint", "double", "fixed"}
 
 
 def _public(cons: dict[str, Any]) -> dict[str, Any]:
-    """`cons` without internal `_` keys, at every level of `items`."""
+    """`cons` without internal `_` keys, at every level of `items` and `keys`."""
     out = {k: v for k, v in cons.items() if not k.startswith("_")}
-    if isinstance(out.get("items"), dict):
-        out["items"] = _public(out["items"])
+    for nested in ("items", "keys"):
+        if isinstance(out.get(nested), dict):
+            out[nested] = _public(out[nested])
     return out
 
 
@@ -534,8 +569,13 @@ def _intersect(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
             out[key] = pick(a[key], b[key])
     if "one_of" in a and "one_of" in b:
         out["one_of"] = [v for v in a["one_of"] if v in b["one_of"]]
-    if isinstance(a.get("items"), dict) and isinstance(b.get("items"), dict):
-        out["items"] = _intersect(a["items"], b["items"])
+    for nested in ("items", "keys"):
+        if isinstance(a.get(nested), dict) and isinstance(b.get(nested), dict):
+            out[nested] = _intersect(a[nested], b[nested])
+    if "bool_is" in a and "bool_is" in b and a["bool_is"] != b["bool_is"]:
+        out["unchecked"] = "contradictory Literal values"
+    if "multiple_of" in a and "multiple_of" in b:
+        out["multiple_of"] = math.lcm(a["multiple_of"], b["multiple_of"])
     return out
 
 
@@ -581,6 +621,12 @@ def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
             val = max(val, cons[new_key]) if new_key in ("ge", "gt") else min(val, cons[new_key])
         lim = 10**digits  # beyond the digit bound a bound adds nothing (and may not fit a float)
         cons[new_key] = float(max(-lim, min(lim, val)))
+    if "multiple_of" in cons:  # a step in the field's own terms, e.g. Decimal("0.05"): to units
+        step = _scaled(decimal.Decimal(cons.pop("multiple_of")), places)
+        if step.denominator == 1:
+            cons["multiple_of"] = step.numerator
+        else:
+            cons["unchecked"] = f"a multiple_of finer than its {places} decimal places"
     return ("fixed", digits, places)
 
 
@@ -640,10 +686,21 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
         if kind not in ("list", "map"):
             raise bad("items", "list or map")
         _check_constraints(spec[-1], c.items, f"{where}[]")
+    if c.keys is not None:
+        if kind != "map":
+            raise bad("keys", "map")
+        _check_constraints(spec[1], c.keys, f"{where} key")
 
 
 def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: str = "annotation") -> None:
     for m in metadata:
+        if m is None or isinstance(m, str):  # conint()'s placeholders; a doc string
+            continue
+        if isinstance(m, Constraints):  # celspresso's own, all of it (items, keys, one_of too)
+            merged = _intersect(cons, m._spec() or {})
+            cons.clear()
+            cons.update(merged)
+            continue
         # Pydantic's Decimal precision; consumed by _decimal_spec, dropped elsewhere
         for key, slot in (("max_digits", "_digits"), ("decimal_places", "_places")):
             val = getattr(m, key, None)
@@ -662,12 +719,58 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: 
                         )
                     val = val if isinstance(val, (decimal.Decimal, int)) else float(val)
                 elif key == "pattern" and not isinstance(val, str):
-                    val = getattr(val, "pattern", val)  # a compiled re.Pattern
+                    # Pydantic runs a compiled re.Pattern with Python's engine and its flags,
+                    # whose meaning differs from CEL's: neither assumed nor checked
+                    cons["unchecked"] = f"pattern={val!r}"
+                    continue
                 cons[key] = val
+        mult = getattr(m, "multiple_of", None)
+        if isinstance(mult, (int, decimal.Decimal)) and not isinstance(mult, bool) and mult > 0:
+            cons["multiple_of"] = mult  # an int, or a Decimal step for a fixed-point field
+        elif mult is not None:
+            cons["unchecked"] = f"multiple_of={mult!r}"
+        if (why := _unmodelled(m)) is not None:
+            cons["unchecked"] = why
         # pydantic FieldInfo nested in Annotated[..., Field(...)]
         inner = getattr(m, "metadata", None)
         if isinstance(inner, list) and inner is not metadata:
             _metadata_constraints(inner, cons, where)
+
+
+# Metadata whose whole effect the constraints above capture. Anything else (a validator
+# function, annotated_types.Predicate, GetPydanticSchema, a string transform, ...) may
+# reject or change a value in ways no proof sees, so a result carrying it is unverified.
+_MODELLED = {
+    ("annotated_types", n)
+    for n in ("Gt", "Ge", "Lt", "Le", "Interval", "MultipleOf", "MinLen", "MaxLen", "Len")
+} | {
+    ("pydantic.fields", "FieldInfo"),
+    ("pydantic._internal._fields", "_PydanticGeneralMetadata"),
+    ("pydantic.types", "Strict"),  # decode is lenient: a CEL value is already the right type
+    ("pydantic.types", "AllowInfNan"),
+    ("pydantic.types", "StringConstraints"),
+    # no effect on validation
+    ("pydantic.functional_serializers", "PlainSerializer"),
+    ("pydantic.functional_serializers", "WrapSerializer"),
+    ("pydantic.functional_serializers", "SerializeAsAny"),
+    ("pydantic.json_schema", "WithJsonSchema"),
+    ("pydantic.json_schema", "SkipJsonSchema"),
+    ("pydantic.json_schema", "Examples"),
+    ("typing_extensions", "Doc"),
+    ("typing", "Doc"),
+}
+_STRING_TRANSFORMS = ("strip_whitespace", "to_lower", "to_upper")
+
+
+def _unmodelled(m: Any) -> str | None:
+    """Why metadata `m` may do more than its constraints say, or None."""
+    key = (type(m).__module__, type(m).__name__)
+    if key not in _MODELLED:
+        return f"its {type(m).__name__}"
+    for t in _STRING_TRANSFORMS:
+        if getattr(m, t, None):
+            return f"{t}={getattr(m, t)!r}"
+    return None
 
 
 def _from_units(units: int, places: int) -> decimal.Decimal:

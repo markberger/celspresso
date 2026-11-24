@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import enum
 import fractions
 import inspect
@@ -18,6 +19,7 @@ from ._types import (
     TypeSpec,
     cel_literal,
     contains_fixed,
+    core_view,
     from_cel,
     lower,
     type_name,
@@ -269,10 +271,14 @@ class Env:
         return e
 
     def _build(self) -> None:
+        def core(spec: TypeSpec, cons: dict[str, Any] | None) -> tuple[TypeSpec, dict[str, Any] | None]:
+            low, c = lower(spec, cons)
+            return low, core_view(c)
+
         structs = [
-            (n, [(f, *lower(s, c)) for f, s, c in fields]) for n, fields in self._builder.structs.items()
+            (n, [(f, *core(s, c)) for f, s, c in fields]) for n, fields in self._builder.structs.items()
         ]
-        variables = [(n, *lower(spec, cons)) for n, (spec, cons) in self._vars.items()]
+        variables = [(n, *core(spec, cons)) for n, (spec, cons) in self._vars.items()]
         fns = [
             (
                 f.name,
@@ -793,9 +799,9 @@ class Env:
         else:
             want, cons = expr._result_spec, None
         try:
-            fits = _fits("result", "the result", want, cons, self._builder.structs)
+            fits = _fits("result", "the result", want, cons, self._builder)
         except _Unchecked as e:
-            msg = f"could not verify that the result is a valid {type_name(want)}: {e} is recursive"
+            msg = f"could not verify that the result is a valid {type_name(want)}: {e}"
             return [Problem("unverified", msg)]
         if not fits:
             return []
@@ -959,6 +965,56 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def _validated_by(cls: Any) -> str | None:
+    """The validation code a class runs on construction, beyond its declared constraints."""
+    decorators = getattr(cls, "__pydantic_decorators__", None)
+    if decorators is not None:  # a Pydantic model or Pydantic dataclass
+        for kind in ("validators", "field_validators", "root_validators", "model_validators"):
+            if getattr(decorators, kind, None):
+                return kind.replace("_", " ")
+        config = getattr(cls, "model_config", None) or getattr(cls, "__pydantic_config__", None) or {}
+        for key in (
+            "str_strip_whitespace",
+            "str_to_lower",
+            "str_to_upper",
+            "str_min_length",
+            "str_max_length",
+        ):
+            if config.get(key):
+                return f"config {key}={config[key]!r}"
+        if config.get("regex_engine") == "python-re":
+            return "config regex_engine='python-re'"
+        from pydantic import BaseModel
+        from pydantic._internal._model_construction import init_private_attributes
+
+        if isinstance(cls, type) and issubclass(cls, BaseModel):
+            if getattr(cls, "model_post_init", None) not in (
+                BaseModel.model_post_init,
+                init_private_attributes,
+            ):
+                return "a model_post_init"
+            if cls.__init__ is not BaseModel.__init__:
+                return "its own __init__"
+            for hook in ("__get_pydantic_core_schema__", "model_validate"):
+                if getattr(cls, hook).__func__ is not getattr(BaseModel, hook).__func__:
+                    return f"its own {hook}"
+    if dataclasses.is_dataclass(cls):
+        if any(not f.init for f in dataclasses.fields(cls)):
+            return "a field with init=False (decoding replaces it)"
+        if decorators is None and not _generated_init(cls):
+            return "its own __init__"
+    if callable(getattr(cls, "__post_init__", None)):
+        return "a __post_init__"
+    return None
+
+
+def _generated_init(cls: type) -> bool:
+    """Whether a dataclass's `__init__` is the one `@dataclass` wrote (it is compiled from
+    a string), not one the class or a base defines."""
+    code = getattr(cls.__init__, "__code__", None)
+    return code is not None and code.co_filename == "<string>"
+
+
 class _Unchecked(Exception):
     """A result type whose constraints can't all be written as CEL conditions."""
 
@@ -968,18 +1024,30 @@ def _fits(
     shown: str,
     spec: TypeSpec,
     cons: Mapping[str, Any] | None,
-    structs: Mapping[str, list[tuple[str, TypeSpec, dict[str, Any] | None]]],
+    builder: SchemaBuilder,
     seen: tuple[str, ...] = (),
     depth: int = 0,
 ) -> list[tuple[str, str]]:
     """(what, CEL condition) for each declared constraint that a value `x` (shown to
     people as `shown`) of `spec` must meet to become a Python value: the field
     constraints of the structs in it, and `cons`. The verifier assumes them of inputs,
-    but a value a rule builds must be shown to meet them. Raises _Unchecked for a
-    recursive struct, which has no finite set of conditions."""
+    but a value a rule builds must be shown to meet them. Raises _Unchecked (with why)
+    for what has no such conditions: a recursive struct, a validator function, ..."""
     spec, low = lower(spec, dict(cons) if cons else None)
     c = dict(low or {})
     out: list[tuple[str, str]] = []
+    if "unchecked" in c:
+        raise _Unchecked(f"{shown} has {c['unchecked']}, which celspresso can't check")
+    if c.get("distinct"):
+        if c.get("min_length", 0) > 1:
+            raise _Unchecked(f"{shown} is a set with min_length (duplicates collapse)")
+        # else the Python set would differ from the list the rule built (and was proved about)
+        a, b = f"_d{depth}", f"_e{depth}"
+        out.append(
+            (f"{shown} has no duplicates (it is a set)", f"{x}.all({a}, {x}.exists_one({b}, {b} == {a}))")
+        )
+    if "bool_is" in c:
+        out.append((f"{shown} is {cel_literal(c['bool_is'])}", f"{x} == {cel_literal(c['bool_is'])}"))
 
     def sizes() -> None:
         if "min_length" in c:
@@ -1007,6 +1075,11 @@ def _fits(
                     continue  # every value of the type meets it
                 cond = "false" if not lo <= n <= hi else f"{x} {op} {n}{u}"
                 out.append((f"{shown} {op} {n}", cond))
+            if "multiple_of" in c:
+                m = c["multiple_of"]
+                if not isinstance(m, int):
+                    raise _Unchecked(f"{shown} has multiple_of={m!r}, which celspresso can't check")
+                out.append((f"{shown} is a multiple of {m}", f"{x} % {m}{u} == 0{u}"))
         if "one_of" in c:
             vals = ", ".join(f"{v}{u}" if isinstance(v, int) else cel_literal(v) for v in c["one_of"])
             out.append((f"{shown} is one of {vals}", f"{x} in [{vals}]"))
@@ -1017,7 +1090,7 @@ def _fits(
         return out
     kind = spec[0]
     if kind == "nullable":
-        inner = _fits(x, shown, spec[1], low, structs, seen, depth)
+        inner = _fits(x, shown, spec[1], low, builder, seen, depth)
         return [(w, f"{x} == null || ({cond})") for w, cond in inner]
     if kind in ("list", "map"):
         sizes()
@@ -1026,15 +1099,21 @@ def _fits(
             item, item_shown, elem = v, f"each item of {shown}", spec[1]
         else:
             item, item_shown, elem = f"{x}[{v}]", f"each value of {shown}", spec[2]
-        for w, cond in _fits(item, item_shown, elem, c.get("items"), structs, seen, depth + 1):
+        for w, cond in _fits(item, item_shown, elem, c.get("items"), builder, seen, depth + 1):
             out.append((w, f"{x}.all({v}, {cond})"))
+        if kind == "map":
+            for w, cond in _fits(v, f"each key of {shown}", spec[1], c.get("keys"), builder, seen, depth + 1):
+                out.append((w, f"{x}.all({v}, {cond})"))
         return out
     if kind == "struct":
         name = spec[1]
         if name in seen:
-            raise _Unchecked(name)
-        for f, fspec, fcons in structs.get(name, []):
-            out += _fits(f"{x}.{f}", f"{shown}.{f}", fspec, fcons, structs, (*seen, name), depth)
+            raise _Unchecked(f"{name} is recursive")
+        owner = builder.owners.get(name)
+        if owner is not None and (why := _validated_by(owner[0])):
+            raise _Unchecked(f"{name} has {why}, which celspresso can't check")
+        for f, fspec, fcons in builder.structs.get(name, []):
+            out += _fits(f"{x}.{f}", f"{shown}.{f}", fspec, fcons, builder, (*seen, name), depth)
     return out
 
 

@@ -146,7 +146,7 @@ print(env.check_rule("""
 
 How the checks treat a rule that computes a value:
 - `returns` makes a result of the wrong type a rejection. For a fixed-point result, `returns=T.fixed(...)` also makes examples and reports use `Decimal`s.
-- A result must meet the constraints its class declares: `Literal` and enum values, `ge`/`gt`/`le`/`lt`, `min_length`/`max_length`, `pattern`, and tuple lengths, through lists, maps, optional fields and nested structs. The verifier assumes these of inputs, but checks a value the rule builds. Custom validators, `multiple_of`, map-key constraints and `Literal[True]` are not checked.
+- A result must meet the constraints its class declares: `Literal` and enum values (`Literal[True]` too), `ge`/`gt`/`le`/`lt`, `multiple_of`, `min_length`/`max_length`, `pattern`, tuple lengths and map-key constraints, through lists, maps, optional fields and nested structs. The verifier assumes these of inputs (except `multiple_of` and `Literal[True]`), but checks a value the rule builds. What it can't check makes the result `unverified`, not passed: validator functions (field or model validators, `AfterValidator`, `annotated_types.Predicate`, `model_post_init`, `__post_init__`, a custom `__init__`), string transforms (`strip_whitespace`, `to_lower`, `str_*` model config), metadata it doesn't know, a `multiple_of` finer than a Decimal's places, or a set with a `min_length` above 1 (duplicates collapse).
 - `examples` take the expected result: a value, a model instance, or a dict of its fields.
 - Inputs on which the rule fails are reported once, as a runtime failure. The `ensures` checks cover only the inputs where the rule has a value.
 - Invariants and `require` apply only to true/false rules.

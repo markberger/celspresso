@@ -334,11 +334,12 @@ impl Encoder {
                 }
                 self.soft.push(len.le(Int::from_i64(2)));
                 let val_cons = cons.and_then(|c| c.items.as_deref());
+                let key_cons = cons.and_then(|c| c.keys.as_deref());
                 let mut slots = Vec::with_capacity(n);
                 for i in 0..n {
                     let live = len.gt(Int::from_i64(i as i64));
                     let from = self.assumptions.len();
-                    let k = self.mk_input(kt, &format!("{path}{{key{i}}}"), None, depth + 1);
+                    let k = self.mk_input(kt, &format!("{path}{{key{i}}}"), key_cons, depth + 1);
                     let v = self.mk_input(vt, &format!("{path}{{val{i}}}"), val_cons, depth + 1);
                     self.guard_since(from, &live);
                     self.pin_dead(&live, &[&k, &v]);

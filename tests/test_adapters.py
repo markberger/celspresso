@@ -296,7 +296,11 @@ def test_compiled_patterns_in_metadata() -> None:
     class M(pydantic.BaseModel):
         code: Annotated[str, pydantic.StringConstraints(pattern=re.compile(r"^[A-Z]{3}$"))]
 
-    assert Env(m=M).predicate("m.code == 'abc'").satisfiable().refuted
+    # Pydantic runs a compiled pattern with Python's re (where `$` also matches before a
+    # final newline), so it isn't assumed: a witness that breaks it is reported, not trusted
+    v = Env(m=M).predicate("m.code == 'abc'").satisfiable()
+    assert v.unknown
+    assert "fails model validation" in (v.reason or "")
 
 
 def test_local_class_names_survive_pickling() -> None:
