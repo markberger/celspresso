@@ -971,6 +971,24 @@ def _validated_by(cls: Any) -> str | None:
         for kind in ("validators", "field_validators", "root_validators", "model_validators"):
             if getattr(decorators, kind, None):
                 return kind.replace("_", " ")
+        config = getattr(cls, "model_config", {})
+        for key in (
+            "str_strip_whitespace",
+            "str_to_lower",
+            "str_to_upper",
+            "str_min_length",
+            "str_max_length",
+        ):
+            if config.get(key):
+                return f"model_config {key}={config[key]!r}"
+        from pydantic import BaseModel  # pydantic is installed: cls is a model
+        from pydantic._internal._model_construction import init_private_attributes
+
+        post = getattr(cls, "model_post_init", None)
+        if post not in (BaseModel.model_post_init, init_private_attributes):
+            return "a model_post_init"
+        if cls.__init__ is not BaseModel.__init__:
+            return "its own __init__"
     if callable(getattr(cls, "__post_init__", None)):
         return "a __post_init__"
     return None
@@ -999,7 +1017,7 @@ def _fits(
     out: list[tuple[str, str]] = []
     if "unchecked" in c:
         raise _Unchecked(f"{shown} has {c['unchecked']}, which celspresso can't check")
-    if c.get("distinct") and c.get("min_length"):
+    if c.get("distinct") and c.get("min_length", 0) > 1:
         raise _Unchecked(f"{shown} is a set with min_length (duplicates collapse)")
     if "bool_is" in c:
         out.append((f"{shown} is {cel_literal(c['bool_is'])}", f"{x} == {cel_literal(c['bool_is'])}"))
@@ -1032,6 +1050,8 @@ def _fits(
                 out.append((f"{shown} {op} {n}", cond))
             if "multiple_of" in c:
                 m = c["multiple_of"]
+                if not isinstance(m, int):
+                    raise _Unchecked(f"{shown} has multiple_of={m!r}, which celspresso can't check")
                 out.append((f"{shown} is a multiple of {m}", f"{x} % {m}{u} == 0{u}"))
         if "one_of" in c:
             vals = ", ".join(f"{v}{u}" if isinstance(v, int) else cel_literal(v) for v in c["one_of"])

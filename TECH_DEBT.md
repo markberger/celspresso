@@ -217,3 +217,27 @@ works. Neither defines `__reduce__`, and the Rust `Core` and `Program` can't be 
 ### The CLI's `vars = {...}` can't declare structs
 Rule files with inline `vars` accept only type names, so declared structs and adapters
 need `env = "module:attr"`. This is acceptable for now.
+
+### A set result with max_length is checked before duplicates collapse
+`Annotated[set[int], Field(max_length=2)]` built from `[1, 1, 1]` is reported `violates`,
+but Pydantic accepts it as `{1}`. The check is sound (sufficient), only too strict.
+- *Fix:* report a failed size check on a set as `unverified`, not `violates`.
+- *Found:* review of the result-boundary change.
+
+### Check-only constraints are invisible on `Constraints`
+`multiple_of`, `Literal[True]` and validator markers live in `Constraints._checks`, which
+is left out of `repr` and equality, so two constraint sets that check differently compare
+equal.
+- *Fix:* make them public fields once they are also assumed of inputs.
+- *Found:* review of the result-boundary change.
+
+### Map constraints no map can meet are accepted
+`dict[Literal["a"], int]` with `min_length=2` declares fine; every proof over it then
+holds vacuously. Scalar bounds raise "no value satisfies" for this.
+- *Fix:* check key `one_of` size (and bool keys) against `min_length` when declaring.
+- *Found:* review of the result-boundary change.
+
+### `annotated_types.Not(...)` crashes type conversion
+"unhashable type: 'Not'" from the `tp in _SCALARS` lookup.
+- *Fix:* catch `TypeError` there, or test hashability first.
+- *Found:* review of the result-boundary change.

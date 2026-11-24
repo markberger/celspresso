@@ -142,7 +142,7 @@ def _contains_fixed(spec: Any) -> bool:
 
 
 def _check_map_value(spec: Any, where: str) -> None:
-    # a map's keys and values carry no constraints, so a fixed-point scale has nowhere to go
+    # a fixed-point scale applies to a field or list element; map keys and values have none
     if _contains_fixed(spec):
         raise TypeError(f"{where}: fixed-point map keys and values are not supported; use a list of structs")
 
@@ -234,7 +234,7 @@ class Constraints:
     one_of: tuple[Any, ...] | None = None
     items: Constraints | None = None
     keys: Constraints | None = None
-    # what a class's own validation also requires of a value (multiple_of, map keys, ...):
+    # what a class's own validation also requires of a value (multiple_of, Literal[True], ...):
     # checked on results a rule builds, never assumed of inputs (see _types.CHECK_ONLY)
     _checks: Any = field(default=None, repr=False, compare=False, hash=False)
 

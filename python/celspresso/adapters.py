@@ -44,6 +44,7 @@ reads a relation that isn't itself a list. See `schema.Field`.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import typing
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -80,6 +81,13 @@ def constraints_from(metadata: Iterable[Any]) -> Constraints:
     return _constraints_of(cons)
 
 
+@functools.cache
+def _has_by_name() -> bool:
+    import pydantic
+
+    return tuple(int(p) for p in pydantic.VERSION.split(".")[:2]) >= (2, 11)
+
+
 class PydanticAdapter:
     """Pydantic models, as structs of their fields; witnesses via `model_validate`."""
 
@@ -103,15 +111,15 @@ class PydanticAdapter:
     def decode(self, tp: Any, data: dict[str, Any]) -> Any:
         # `data` is keyed by field name, not alias, and holds CEL values (an enum as its
         # value), so validate by name and leniently
-        try:
+        if _has_by_name():
             return tp.model_validate(data, strict=False, by_name=True)
-        except TypeError:  # Pydantic < 2.11 has no by_name
-            aliased = {}
-            for name, value in data.items():
-                info = tp.model_fields.get(name)
-                alias = getattr(info, "validation_alias", None) or getattr(info, "alias", None)
-                aliased[alias if isinstance(alias, str) else name] = value
-            return tp.model_validate(aliased, strict=False)
+        aliased = {}  # Pydantic < 2.11 has no by_name
+        for name, value in data.items():
+            info = tp.model_fields.get(name)
+            alias = getattr(info, "validation_alias", None)
+            alias = alias if isinstance(alias, str) else getattr(info, "alias", None)
+            aliased[alias if isinstance(alias, str) else name] = value
+        return tp.model_validate(aliased, strict=False)
 
 
 class DataclassAdapter:

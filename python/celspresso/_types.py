@@ -572,6 +572,8 @@ def _intersect(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     for nested in ("items", "keys"):
         if isinstance(a.get(nested), dict) and isinstance(b.get(nested), dict):
             out[nested] = _intersect(a[nested], b[nested])
+    if "bool_is" in a and "bool_is" in b and a["bool_is"] != b["bool_is"]:
+        out["unchecked"] = "contradictory Literal values"
     if "multiple_of" in a and "multiple_of" in b:
         out["multiple_of"] = math.lcm(a["multiple_of"], b["multiple_of"])
     return out
@@ -619,6 +621,12 @@ def _decimal_spec(cons: dict[str, Any], where: str) -> TypeSpec:
             val = max(val, cons[new_key]) if new_key in ("ge", "gt") else min(val, cons[new_key])
         lim = 10**digits  # beyond the digit bound a bound adds nothing (and may not fit a float)
         cons[new_key] = float(max(-lim, min(lim, val)))
+    if "multiple_of" in cons:  # a step in the field's own terms, e.g. Decimal("0.05"): to units
+        step = _scaled(decimal.Decimal(cons.pop("multiple_of")), places)
+        if step.denominator == 1:
+            cons["multiple_of"] = step.numerator
+        else:
+            cons["unchecked"] = f"a multiple_of finer than its {places} decimal places"
     return ("fixed", digits, places)
 
 
@@ -686,6 +694,11 @@ def _check_constraints(spec: TypeSpec, c: Constraints, where: str) -> None:
 
 def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: str = "annotation") -> None:
     for m in metadata:
+        if isinstance(m, Constraints):  # celspresso's own, all of it (items, keys, one_of too)
+            merged = _intersect(cons, m._spec() or {})
+            cons.clear()
+            cons.update(merged)
+            continue
         # Pydantic's Decimal precision; consumed by _decimal_spec, dropped elsewhere
         for key, slot in (("max_digits", "_digits"), ("decimal_places", "_places")):
             val = getattr(m, key, None)
@@ -707,17 +720,43 @@ def _metadata_constraints(metadata: Sequence[Any], cons: dict[str, Any], where: 
                     val = getattr(val, "pattern", val)  # a compiled re.Pattern
                 cons[key] = val
         mult = getattr(m, "multiple_of", None)
-        if isinstance(mult, int) and not isinstance(mult, bool) and mult > 0:
-            cons["multiple_of"] = mult
+        if isinstance(mult, (int, decimal.Decimal)) and not isinstance(mult, bool) and mult > 0:
+            cons["multiple_of"] = mult  # an int, or a Decimal step for a fixed-point field
         elif mult is not None:
             cons["unchecked"] = f"multiple_of={mult!r}"
-        # Pydantic's AfterValidator, BeforeValidator, ...: a function no proof can see into
-        if type(m).__module__.startswith("pydantic.functional_validators"):
-            cons["unchecked"] = f"its {type(m).__name__}"
+        if (why := _unmodelled(m)) is not None:
+            cons["unchecked"] = why
         # pydantic FieldInfo nested in Annotated[..., Field(...)]
         inner = getattr(m, "metadata", None)
         if isinstance(inner, list) and inner is not metadata:
             _metadata_constraints(inner, cons, where)
+
+
+# Metadata whose whole effect the constraints above capture. Anything else (a validator
+# function, annotated_types.Predicate, GetPydanticSchema, a string transform, ...) may
+# reject or change a value in ways no proof sees, so a result carrying it is unverified.
+_MODELLED = {
+    ("annotated_types", n)
+    for n in ("Gt", "Ge", "Lt", "Le", "Interval", "MultipleOf", "MinLen", "MaxLen", "Len")
+} | {
+    ("pydantic.fields", "FieldInfo"),
+    ("pydantic._internal._fields", "_PydanticGeneralMetadata"),
+    ("pydantic.types", "Strict"),  # decode is lenient: a CEL value is already the right type
+    ("pydantic.types", "AllowInfNan"),
+    ("pydantic.types", "StringConstraints"),
+}
+_STRING_TRANSFORMS = ("strip_whitespace", "to_lower", "to_upper")
+
+
+def _unmodelled(m: Any) -> str | None:
+    """Why metadata `m` may do more than its constraints say, or None."""
+    key = (type(m).__module__, type(m).__name__)
+    if key not in _MODELLED:
+        return f"its {type(m).__name__}"
+    for t in _STRING_TRANSFORMS:
+        if getattr(m, t, None):
+            return f"{t}={getattr(m, t)!r}"
+    return None
 
 
 def _from_units(units: int, places: int) -> decimal.Decimal:

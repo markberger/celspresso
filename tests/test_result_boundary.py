@@ -131,3 +131,77 @@ def test_aliased_and_strict_models_decode() -> None:
     assert v.proved
     assert v.witness is not None
     assert v.witness.to_python()["a"] == Aliased(Action="x")
+
+
+def test_review_round_one_cases_are_unverified_or_checked() -> None:
+    import decimal
+
+    import annotated_types as at
+    from pydantic import GetPydanticSchema, StringConstraints
+    from pydantic_core import core_schema
+
+    class Cents(BaseModel):
+        d: Annotated[decimal.Decimal, Field(max_digits=6, decimal_places=2, multiple_of=5)]
+
+    class Nickel(BaseModel):
+        d: Annotated[
+            decimal.Decimal, Field(max_digits=6, decimal_places=2, multiple_of=decimal.Decimal("0.05"))
+        ]
+
+    # 5 means 5.00, i.e. 500 units; 0.05 is 5 units
+    assert "multiple of 500" in str(check(Cents, "Cents{d: 100}"))
+    assert check(Cents, "Cents{d: 500}").ok
+    assert check(Nickel, "Nickel{d: o.total * 5}").ok
+    assert "multiple of 5 fails" in str(check(Nickel, "Nickel{d: 101}"))
+
+    class Pred(BaseModel):
+        n: Annotated[int, at.Predicate(lambda v: v > 10)]
+
+    class Schemed(BaseModel):
+        n: Annotated[
+            int, GetPydanticSchema(lambda t, h: core_schema.no_info_after_validator_function(int, h(t)))
+        ]
+
+    class Stripped(BaseModel):
+        s: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+    class Short(BaseModel):
+        model_config = ConfigDict(str_max_length=2)
+        s: str
+
+    class Posted(BaseModel):
+        n: int
+
+        def model_post_init(self, context: object) -> None:
+            raise ValueError("no")
+
+    for cls, rule, why in [
+        (Pred, "Pred{n: 1}", "Predicate"),
+        (Schemed, "Schemed{n: 1}", "GetPydanticSchema"),
+        (Stripped, "Stripped{s: ' '}", "strip_whitespace"),
+        (Short, "Short{s: 'abc'}", "str_max_length"),
+        (Posted, "Posted{n: 1}", "model_post_init"),
+    ]:
+        r = check(cls, rule)
+        assert kinds(r) == ["unverified"], (cls, str(r))
+        assert why in str(r)
+
+    class Private(BaseModel):  # private attributes alone don't make a model unverifiable
+        n: int
+        _cache: int = 0
+
+    assert check(Private, "Private{n: 1}").ok
+
+
+def test_celspresso_constraints_as_metadata_keep_keys() -> None:
+    from celspresso.schema import Constraints
+
+    @dataclasses.dataclass
+    class Bag:
+        m: Annotated[dict[str, int], Constraints(max_length=2, keys=Constraints(one_of=("a", "b")))]
+
+    env = Env(b=Bag)
+    assert env.predicate("!('z' in b.m)").always_true().proved
+    assert "each key of the result.m" in str(
+        Env(structs=[Bag]).check_rule("Bag{m: {'z': 1}}", Spec(returns=Bag))
+    )
